@@ -1,4 +1,5 @@
 use index_core::catalog::Catalog;
+use index_core::keyword_catalog::KeywordCatalog;
 use index_core::merge::{merge_indexes, MergeOptions};
 use roaring::RoaringBitmap;
 use serde_json::json;
@@ -160,5 +161,40 @@ fn merge_overlap_group_interleaves_families_and_preserves_set_for_decode() {
     assert!(bmp_m1.contains(3));
     assert!(bmp_m1.contains(7));
     assert_eq!(bmp_m1.len(), 3);
+}
+
+#[test]
+fn merge_unions_keyword_catalogs_in_set_order() {
+    let index_dir = tempfile::tempdir().expect("index tempdir");
+    let merged_root = tempfile::tempdir().expect("merge out root");
+
+    make_set_index(index_dir.path(), "COREKS", &[("AX", "04", 3)], &[(90, &[0])]);
+    make_set_index(index_dir.path(), "ALIZE", &[("BR", "01", 2)], &[(90, &[1])]);
+    write_json(
+        &index_dir.path().join("COREKS/keywords.json"),
+        json!({ "keywords": { "FLEETING": { "en_US": "Fleeting", "fr_FR": "Fugace" } } }),
+    );
+    write_json(
+        &index_dir.path().join("ALIZE/keywords.json"),
+        json!({ "keywords": {
+            "FLEETING": { "en_US": "Ignored", "it_IT": "Fugace" },
+            "RESUPPLY_LOW": { "fr_FR": "Ravitaillez" }
+        } }),
+    );
+
+    let out = merged_root.path().join("ALL_SETS");
+    merge_indexes(
+        index_dir.path(),
+        "COREKS,ALIZE",
+        &out,
+        MergeOptions::default(),
+    )
+    .expect("merge");
+
+    let merged = KeywordCatalog::load_from_dir(&out).expect("merged keywords.json");
+    assert_eq!(merged.name("FLEETING", "en_US"), Some("Fleeting"));
+    assert_eq!(merged.name("FLEETING", "fr_FR"), Some("Fugace"));
+    assert_eq!(merged.name("FLEETING", "it_IT"), Some("Fugace"));
+    assert_eq!(merged.name("RESUPPLY_LOW", "fr_FR"), Some("Ravitaillez"));
 }
 

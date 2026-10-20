@@ -1,5 +1,5 @@
 use axum::extract::{RawQuery, State};
-use axum::http::{header, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
@@ -13,13 +13,48 @@ use crate::index::build_bitmap;
 use super::filtered::{other_two_buckets, parse_editing, union_on_line, MAIN_LINES, SUPPORT_LINES};
 use super::models::{EffectsFilteredResponse, Region};
 
-pub async fn get_effects_v2(IndexSnapshot(index): IndexSnapshot) -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        index.effects_body().as_ref().clone(),
-    )
-        .into_response()
+pub async fn get_effects_v2(IndexSnapshot(index): IndexSnapshot, headers: HeaderMap) -> Response {
+    let gzip = index.effects_body_gzip().filter(|_| accepts_gzip(&headers));
+    match gzip {
+        Some(body) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CONTENT_ENCODING, "gzip"),
+                (header::VARY, "accept-encoding"),
+            ],
+            body.as_ref().clone(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::VARY, "accept-encoding"),
+            ],
+            index.effects_body().as_ref().clone(),
+        )
+            .into_response(),
+    }
+}
+
+/// `Accept-Encoding` lists `gzip` (or `*`) without `q=0`.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|item| {
+            let mut parts = item.split(';').map(str::trim);
+            let coding = parts.next().unwrap_or_default();
+            let refused = parts.any(|p| {
+                p.strip_prefix("q=")
+                    .and_then(|q| q.parse::<f32>().ok())
+                    .is_some_and(|q| q == 0.0)
+            });
+            (coding.eq_ignore_ascii_case("gzip") || coding == "*") && !refused
+        })
 }
 
 pub async fn get_effects_filtered(
@@ -135,4 +170,25 @@ pub async fn get_effects_filtered(
         editing: editing.to_string(),
         id_gds,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(accept_encoding: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::ACCEPT_ENCODING, accept_encoding.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn accepts_gzip_parses_accept_encoding() {
+        assert!(accepts_gzip(&headers("gzip")));
+        assert!(accepts_gzip(&headers("br, gzip;q=0.8, deflate")));
+        assert!(accepts_gzip(&headers("*")));
+        assert!(!accepts_gzip(&headers("br, deflate")));
+        assert!(!accepts_gzip(&headers("gzip;q=0")));
+        assert!(!accepts_gzip(&HeaderMap::new()));
+    }
 }

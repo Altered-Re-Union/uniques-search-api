@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::http::api::effect_text::FormattedText;
+
 // --- Response bodies ---
 
 /// `GET /api/v2/effects` response body (see `docs/api-spec.md`).
@@ -17,6 +19,8 @@ pub struct EffectsListResponse {
 pub struct EffectPartWithRegion {
     pub id_gd: u32,
     pub text: BTreeMap<String, String>,
+    /// Readable version of `text` in Markdown, per locale (see `effect_text::format_effect_part`).
+    pub formatted_text: BTreeMap<String, FormattedText>,
     pub is_echo: bool,
     pub is_main: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]

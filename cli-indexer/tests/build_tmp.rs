@@ -1,5 +1,6 @@
 use index_core::build;
 use index_core::catalog::Catalog;
+use index_core::keyword_catalog::KeywordCatalog;
 use index_core::query;
 use std::fs;
 use std::path::PathBuf;
@@ -95,6 +96,12 @@ fn build_query_decode_tmp_fixtures() {
     assert_eq!(sample_24["m1"]["card_count"].as_u64(), Some(1));
     assert_eq!(sample_24["m2"]["card_count"].as_u64(), Some(1));
     assert!(sample_24.get("m3").is_none() || sample_24["m3"].is_null());
+
+    // Keyword printed names come from `cardEffectElementDisplays[].cardKeyword` of the fixtures.
+    let keywords = KeywordCatalog::load_from_dir(&summary.output_dir).expect("keywords.json");
+    assert_eq!(keywords.name("FLEETING", "fr_FR"), Some("Fugace"));
+    assert_eq!(keywords.name("ETERNAL", "en_US"), Some("Eternal"));
+    assert!(!keywords.keywords.contains_key(""), "`[]` is not a keyword");
 
     let stats_summary_path = summary.output_dir.join("stats_summary.json");
     assert!(stats_summary_path.is_file(), "stats_summary.json missing");

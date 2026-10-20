@@ -116,6 +116,34 @@ pub struct CardEffectElement {
     pub text: Option<String>,
     #[serde(default)]
     pub translations: Option<BTreeMap<String, LocaleText>>,
+    /// Keywords referenced by this element's text (`[FLEETING]`), with their printed names.
+    #[serde(default)]
+    pub card_effect_element_displays: Option<Vec<CardEffectElementDisplay>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardEffectElementDisplay {
+    #[serde(default)]
+    pub card_keyword: Option<CardKeywordJson>,
+}
+
+/// `cardKeyword`: `reference` is the code used in effect texts (`FLEETING` in `[FLEETING]`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardKeywordJson {
+    #[serde(default)]
+    pub reference: Option<String>,
+    #[serde(default)]
+    pub translations: Option<BTreeMap<String, CardKeywordLocale>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardKeywordLocale {
+    /// Printed keyword name in this locale (`Fugace`, `Fleeting`, ...).
+    #[serde(default)]
+    pub display_web: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

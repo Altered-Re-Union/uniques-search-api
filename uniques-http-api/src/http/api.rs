@@ -1,5 +1,6 @@
 pub mod cards;
 pub mod collections;
+pub mod effect_text;
 pub(crate) mod error;
 pub mod effects;
 

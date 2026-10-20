@@ -6,6 +6,7 @@ use crate::crawl::{discover_card_files, CardFile, DiscoverOptions};
 use crate::faction_index::{FactionIndex, FactionIndexBuilder};
 use crate::idgd_catalog::IdGdCatalogBuilder;
 use crate::idgd_collapse::apply_build_collapse;
+use crate::keyword_catalog::KeywordCatalog;
 use crate::profile::{profile_enabled, BuildProfile};
 use crate::progress::{BuildProgress, DiscoveryProgress, WriteProgress};
 use crate::stat_index::{StatIndex, StatIndexBuilder};
@@ -92,6 +93,7 @@ pub fn build(
     let mut compact_cards: Vec<(u32, CompactCardFields)> = Vec::with_capacity(total_files);
     let mut stat_index = StatIndexBuilder::new();
     let mut faction_index = FactionIndexBuilder::new();
+    let mut keywords = KeywordCatalog::default();
 
     for file in &files {
         let phases = index_one_card(
@@ -103,6 +105,7 @@ pub fn build(
             &mut compact_cards,
             &mut stat_index,
             &mut faction_index,
+            &mut keywords,
             profile.as_mut(),
             measure_phases,
         )?;
@@ -144,6 +147,7 @@ pub fn build(
                     compact_cards,
                     stat_index,
                     faction_index,
+                    &keywords,
                 )
             });
             p.write_ns = ns;
@@ -162,6 +166,7 @@ pub fn build(
                 compact_cards,
                 stat_index,
                 faction_index,
+                &keywords,
             )?;
         }
     }
@@ -194,6 +199,7 @@ fn index_one_card(
     compact_cards: &mut Vec<(u32, CompactCardFields)>,
     stat_index: &mut StatIndexBuilder,
     faction_index: &mut FactionIndexBuilder,
+    keywords: &mut KeywordCatalog,
     mut profile: Option<&mut BuildProfile>,
     measure_phases: bool,
 ) -> Result<Option<(u64, u64, u64)>> {
@@ -203,6 +209,7 @@ fn index_one_card(
         measure_phases,
     )?;
     let card_index = catalog_builder.on_card(&file.parsed, &card)?;
+    keywords.record_card(&card);
 
     let mut process = || {
         apply_card_index(
@@ -278,6 +285,7 @@ fn write_index_outputs(
     compact_cards: Vec<(u32, CompactCardFields)>,
     stat_index: StatIndexBuilder,
     faction_index: FactionIndexBuilder,
+    keywords: &KeywordCatalog,
 ) -> Result<()> {
     let id_gd_dir = set_out.join("id_gd");
     fs_create_dir_all(set_out)?;
@@ -292,6 +300,8 @@ fn write_index_outputs(
         &per_line_bitmap_bytes,
     );
     IdGdCatalogBuilder::save(&idgd_catalog, &set_out.join("idgd_catalog.json"))?;
+
+    keywords.save_in(set_out)?;
 
     write_compact_records(&set_out.join("cards.bin"), catalog.total_bit_span, &compact_cards)?;
 

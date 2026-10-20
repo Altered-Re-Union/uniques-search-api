@@ -285,7 +285,33 @@ GET /api/v2/card/ALT_COREKS_B_AX_05_U_161
 
 This endpoint takes no parameters.
 
-It returns a list of the Effect parts available for filtering.
+It returns a list of the Effect parts available for filtering. Each part has its raw `text` and a
+readable `formattedText` for the trigger / condition / output pickers, both keyed by locale. The
+body is built once when the index loads, and also gzipped once then: it is sent gzipped when the
+request has `Accept-Encoding: gzip`.
+
+`formattedText` is a [Markdown](#formatted-text-markdown) string per locale, built from `text` as follows:
+
+| Raw `text` | `formattedText` (`fr_FR`) | `formattedText` (`en_US`) |
+| ---------- | ------------------------- | ------------------------- |
+| `[]` (condition) | `Sans condition` | `No condition` |
+| `[]` (trigger or output) | `""` (empty) | `""` (empty) |
+| `{H}` | `Joué depuis la Main` | `Played from Hand` |
+| `{R}` | `Joué depuis la Réserve` | `Played from Reserve` |
+| `{J}` | `Joué de partout` | `Played from anywhere` |
+| `{T}` | `Épuisez-moi` | `Exhaust me` |
+| `{D}` or `{D} :` | `Défaussez-moi de la Réserve` | `Discard me from Reserve` |
+| `{I} À Midi —` | `À Midi —` (leading `{I}` removed) | `At Noon —` |
+| `[RESUPPLY_LOW].` | `**Ravitaillez**.` | `**Resupply**.` |
+| `Si j'ai au moins 1 boost :` | `Si j'ai au moins 1 boost` | `If I have at least 1 boost` |
+
+- Symbol labels exist in `de_DE`, `en_US`, `es_ES`, `fr_FR` and `it_IT`; other locales get English.
+- `[CODE]` keywords are printed from the index's `keywords.json` (see
+  [ALL_SETS index format](ALL_SETS-index-format.md#keywordsjson)). A code missing in a locale
+  falls back to its `en_US` name; a code missing from the file is left as written (`[CODE]`).
+- Non-breaking and repeated spaces become one space, including inside keyword names
+  (`Tough\u00a01` → `Tough 1`); trailing spaces and `:` are removed.
+  Symbols inside a sentence (`{J} Piochez une carte.`) are kept.
 
 ```
 {
@@ -298,6 +324,11 @@ It returns a list of the Effect parts available for filtering.
         de_DE: ...
         es_ES: ...
         it_IT: ...
+      },
+      formattedText: {
+        en_US: "Played from Reserve",
+        fr_FR: "Joué depuis la Réserve",
+        ...
       },
       isEcho: false,
       isMain: true,
@@ -349,6 +380,11 @@ It returns a list of the Effect parts available for filtering.
         es_ES: ...
         it_IT: ...
       },
+      formattedText: {
+        en_US: "**After You**.",
+        fr_FR: "**Après vous**.",
+        ...
+      },
       isEcho: false,
       isMain: true,
     },
@@ -356,6 +392,22 @@ It returns a list of the Effect parts available for filtering.
   ]
 }
 ```
+
+### Formatted text Markdown
+
+`formattedText` values are [CommonMark](https://commonmark.org/) strings on one line, ready to
+pass to a Markdown renderer:
+
+```json
+"Lancez un dé. Sur 4+, **Ravitaillez**."
+```
+
+- Keywords are the only formatting, in bold (`**Ravitaillez**`).
+- Characters that Markdown would interpret are escaped with a backslash so the text displays as
+  written: `\`, `*`, `_`, `` ` ``, `[`, `]`, `<`, `>`, `~` anywhere, and a line start read as a
+  heading or a list item (`# `, `- `, `+ `, `1. `, `1) `). A keyword code missing from
+  `keywords.json` is sent as `\[CODE\_NAME\]` and displayed as `[CODE_NAME]`.
+- Symbols (`{J}`, `{1}`...) are plain text.
 
 ## `GET /api/v2/effects/filtered`
 

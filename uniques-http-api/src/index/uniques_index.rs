@@ -41,6 +41,8 @@ pub struct UniquesIndex {
     pub family_span_groups: Vec<FamilySpanGroup>,
     /// Pre-serialized `GET /api/v2/effects` JSON body.
     pub effects_body: Arc<Bytes>,
+    /// `effects_body` gzipped once at load; `None` serves the plain body.
+    pub effects_body_gzip: Option<Arc<Bytes>>,
 }
 
 #[derive(Debug)]
@@ -124,6 +126,10 @@ impl UniquesIndex {
 
     pub fn effects_body(&self) -> &Arc<Bytes> {
         &self.effects_body
+    }
+
+    pub fn effects_body_gzip(&self) -> Option<&Arc<Bytes>> {
+        self.effects_body_gzip.as_ref()
     }
 
     pub fn card_view(&self, card_index: u32) -> Option<CompactCardView<'_>> {

@@ -10,6 +10,7 @@ use index_core::compact::{encode_record, CompactCardFields, RECORD_SIZE};
 use index_core::faction_index::Faction;
 use index_core::idgd_catalog::{IdGdCatalog, IdGdCatalogEntry};
 use index_core::idgd_collapse::IdGdAliasMap;
+use index_core::keyword_catalog::KeywordCatalog;
 use index_core::stat_index::StatField;
 use roaring::RoaringBitmap;
 
@@ -201,7 +202,7 @@ pub(crate) fn test_state() -> AppState {
     }
 
     let effects_list =
-        crate::http::api::effects::build_effects_list(&idgd_catalog);
+        crate::http::api::effects::build_effects_list(&idgd_catalog, &KeywordCatalog::default());
     let effects_body = Arc::new(
         crate::http::api::effects::serialize_effects_list(&effects_list).unwrap(),
     );
@@ -264,6 +265,7 @@ pub(crate) fn test_state() -> AppState {
         name_search_index,
         family_lookup_index,
         family_span_groups,
+        effects_body_gzip: None,
     };
 
     AppState::new_with_index(index)
@@ -361,6 +363,7 @@ pub(crate) fn test_state_with_sets() -> AppState {
         name_search_index,
         family_lookup_index,
         family_span_groups,
+        effects_body_gzip: None,
     };
 
     AppState::new_with_index(index)

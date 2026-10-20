@@ -5,6 +5,7 @@ use crate::idgd_catalog::{EffectRegionFlags, IdGdCatalog};
 use crate::idgd_collapse::{
     build_merged_duplicated_id_gd, collapse_merged_id_gd_on_disk, write_idgd_catalog,
 };
+use crate::keyword_catalog::KeywordCatalog;
 use anyhow::{anyhow, Context, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -113,6 +114,7 @@ pub fn merge_indexes(
 
     merge_stats(out, &plan, &sources)?;
     merge_factions(out, &plan, &sources)?;
+    merge_keywords(out, &sources)?;
 
     let source_dirs: Vec<PathBuf> = sources.iter().map(|s| s.dir.clone()).collect();
     let duplicated_id_gd = build_merged_duplicated_id_gd(&source_dirs, &merge_remap)?;
@@ -828,6 +830,15 @@ struct MergeManifestSourceOut {
     set: String,
     card_count: u32,
     total_bit_span: u32,
+}
+
+/// Union of the source `keywords.json` files (first source in `--sets` order wins on conflicts).
+fn merge_keywords(out: &Path, sources: &[SourceIndex]) -> Result<()> {
+    let mut merged = KeywordCatalog::default();
+    for src in sources {
+        merged.merge_from(&KeywordCatalog::load_from_dir(&src.dir)?);
+    }
+    merged.save_in(out)
 }
 
 fn write_manifest(
