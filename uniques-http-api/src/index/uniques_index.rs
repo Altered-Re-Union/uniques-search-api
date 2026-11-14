@@ -14,8 +14,8 @@ use index_core::stat_index::StatField;
 use roaring::RoaringBitmap;
 
 use super::loader::{
-    FamilyLookupIndex, FamilyResolveError, FamilySpanGroup, FactionsSummary, IndexManifest,
-    NameSearchIndex, SetBitmaps, StatsSummary,
+    FamilyLookupIndex, FamilyResolveError, FamilySortIndex, FamilySpanGroup, FactionsSummary,
+    IndexManifest, NameSearchIndex, SetBitmaps, StatsSummary,
 };
 
 /// In-memory representation of a loaded index directory.
@@ -39,6 +39,7 @@ pub struct UniquesIndex {
     pub name_search_index: NameSearchIndex,
     pub family_lookup_index: FamilyLookupIndex,
     pub family_span_groups: Vec<FamilySpanGroup>,
+    pub family_sort_index: FamilySortIndex,
     /// Pre-serialized `GET /api/v2/effects` JSON body.
     pub effects_body: Arc<Bytes>,
 }
@@ -120,6 +121,10 @@ impl UniquesIndex {
 
     pub fn family_span_groups(&self) -> &[FamilySpanGroup] {
         &self.family_span_groups
+    }
+
+    pub fn family_sort_index(&self) -> &FamilySortIndex {
+        &self.family_sort_index
     }
 
     pub fn effects_body(&self) -> &Arc<Bytes> {

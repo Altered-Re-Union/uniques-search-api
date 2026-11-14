@@ -209,6 +209,7 @@ pub(crate) fn test_state() -> AppState {
     let name_search_index = build_name_search_index(&catalog);
     let family_lookup_index = build_family_lookup_index(&catalog);
     let family_span_groups = build_family_span_groups(&catalog);
+    let family_sort_index = crate::index::loader::build_family_sort_index(&catalog);
 
     let id_gd_aliases = IdGdAliasMap::from_catalog(&idgd_catalog);
 
@@ -264,6 +265,7 @@ pub(crate) fn test_state() -> AppState {
         name_search_index,
         family_lookup_index,
         family_span_groups,
+        family_sort_index,
     };
 
     AppState::new_with_index(index)
@@ -322,6 +324,7 @@ pub(crate) fn test_state_with_sets() -> AppState {
     let name_search_index = build_name_search_index(&catalog);
     let family_lookup_index = build_family_lookup_index(&catalog);
     let family_span_groups = build_family_span_groups(&catalog);
+    let family_sort_index = crate::index::loader::build_family_sort_index(&catalog);
     assert!(set_bitmaps.by_set.contains_key(SET_CORE));
     assert!(set_bitmaps.by_set.contains_key(SET_COREKS));
     assert!(set_bitmaps.by_set.contains_key("ALIZE"));
@@ -361,6 +364,7 @@ pub(crate) fn test_state_with_sets() -> AppState {
         name_search_index,
         family_lookup_index,
         family_span_groups,
+        family_sort_index,
     };
 
     AppState::new_with_index(index)

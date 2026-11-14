@@ -159,10 +159,36 @@ pub(crate) enum CostPredicate {
     Range { op: CompareOp, value: u8 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortField {
+    MainCost,
+    RecallCost,
+    ForestPower,
+    MountainPower,
+    OceanPower,
+    SetDate,
+    Collector,
+    Reference,
+    Name(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardsSort {
+    pub field: SortField,
+    pub dir: SortDir,
+}
+
 #[derive(Debug, Clone)]
 pub struct CardsRequest {
     pub limit: usize,
     pub cursor: Option<u32>,
+    pub sort: Option<CardsSort>,
     pub filters: AbilityFilters,
     pub factions: Vec<Faction>,
     pub sets: Vec<String>,

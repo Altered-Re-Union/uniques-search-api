@@ -197,6 +197,7 @@ mod tests {
             name_search_index: build_name_search_index(&catalog),
             family_lookup_index: build_family_lookup_index(&catalog),
             family_span_groups: build_family_span_groups(&catalog),
+            family_sort_index: Default::default(),
             effects_body: Arc::new(Bytes::from_static(b"[]")),
         }
     }

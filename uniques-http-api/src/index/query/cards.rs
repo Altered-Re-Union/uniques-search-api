@@ -9,12 +9,12 @@ use index_core::stat_index::StatField;
 use crate::collections::CollectionStore;
 use crate::formats::{FormatIndex, FormatLoadStatus};
 use crate::index::UniquesIndex;
-use crate::index::loader::{SetBitmaps, SET_CORE, SET_COREKS};
+use crate::index::loader::{FamilySpanRange, SetBitmaps, SET_CORE, SET_COREKS};
 
 use super::error::{QueryError, QueryResult};
 use crate::http::api::cards::models::{
-    CardFaction, CardSetV2, CardSubTypeV2, CardV2, CardsRequest, CompareOp, CostPredicate,
-    EffectCombineMode, FamilyMatchV2,
+    CardFaction, CardSetV2, CardSubTypeV2, CardV2, CardsRequest, CardsSort, CompareOp,
+    CostPredicate, EffectCombineMode, FamilyMatchV2, SortDir, SortField,
 };
 
 fn union_requested_sets(bitmaps: &SetBitmaps, sets: &[String]) -> RoaringBitmap {
@@ -471,6 +471,7 @@ pub(crate) fn cards_from_indices(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn page_cards_v2(
     state: &UniquesIndex,
     bitmap: &RoaringBitmap,
@@ -478,6 +479,28 @@ pub(crate) fn page_cards_v2(
     limit: usize,
     debug_bga_trigram: bool,
 ) -> QueryResult<(Vec<CardV2>, Option<u32>)> {
+    page_cards_v2_sorted(state, bitmap, cursor, limit, None, debug_bga_trigram)
+}
+
+pub(crate) fn page_cards_v2_sorted(
+    state: &UniquesIndex,
+    bitmap: &RoaringBitmap,
+    cursor: Option<u32>,
+    limit: usize,
+    sort: Option<&CardsSort>,
+    debug_bga_trigram: bool,
+) -> QueryResult<(Vec<CardV2>, Option<u32>)> {
+    if let Some(sort) = sort {
+        return page_sorted_cards(
+            state,
+            bitmap,
+            cursor.unwrap_or(0) as usize,
+            limit,
+            sort,
+            debug_bga_trigram,
+        );
+    }
+
     let mut out = Vec::with_capacity(limit);
     let mut last_index: Option<u32> = None;
 
@@ -507,6 +530,176 @@ pub(crate) fn page_cards_v2(
     let next_cursor = if out.len() == limit { last_index } else { None };
 
     Ok((out, next_cursor))
+}
+
+fn collect_sorted_stat_indices(
+    state: &UniquesIndex,
+    bitmap: &RoaringBitmap,
+    field: StatField,
+    dir: SortDir,
+    offset: usize,
+    limit: usize,
+) -> QueryResult<Vec<u32>> {
+    let Some(buckets) = state.stats().get(&field) else {
+        return Err(QueryError::invalid(format!(
+            "missing stats index for {field:?}"
+        )));
+    };
+
+    let mut remaining_skip = offset as u64;
+    let mut out = Vec::with_capacity(limit);
+    let bucket_order: [usize; 16] = match dir {
+        SortDir::Asc => std::array::from_fn(|i| i),
+        SortDir::Desc => std::array::from_fn(|i| 15 - i),
+    };
+
+    for val_idx in bucket_order {
+        if out.len() >= limit {
+            break;
+        }
+        let sub = bitmap & &buckets[val_idx];
+        let count = sub.len();
+        if count == 0 {
+            continue;
+        }
+        if remaining_skip >= count {
+            remaining_skip -= count;
+            continue;
+        }
+        let need = limit - out.len();
+        if remaining_skip == 0 {
+            out.extend(sub.iter().take(need));
+        } else if let Some(start_bit) = sub.select(remaining_skip as u32) {
+            out.extend(sub.range(start_bit..).take(need));
+        }
+        remaining_skip = 0;
+    }
+
+    Ok(out)
+}
+
+fn family_ranges_for_sort<'a>(
+    state: &'a UniquesIndex,
+    field: &SortField,
+    dir: SortDir,
+) -> (&'a [FamilySpanRange], bool, bool) {
+    let fsi = state.family_sort_index();
+    match (field, dir) {
+        (SortField::SetDate, SortDir::Asc) => (&fsi.set_date_asc, false, false),
+        (SortField::SetDate, SortDir::Desc) => (&fsi.set_date_desc, false, false),
+        (SortField::Collector, SortDir::Asc) => (&fsi.collector_asc, false, false),
+        (SortField::Collector, SortDir::Desc) => (&fsi.collector_asc, true, true),
+        (SortField::Reference, SortDir::Asc) => (&fsi.reference_asc, false, false),
+        (SortField::Reference, SortDir::Desc) => (&fsi.reference_asc, true, true),
+        (SortField::Name(locale), SortDir::Asc) => (
+            fsi.name_asc_by_locale
+                .get(locale)
+                .or_else(|| fsi.name_asc_by_locale.get("en_US"))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            false,
+            false,
+        ),
+        (SortField::Name(locale), SortDir::Desc) => (
+            fsi.name_asc_by_locale
+                .get(locale)
+                .or_else(|| fsi.name_asc_by_locale.get("en_US"))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            true,
+            false,
+        ),
+        _ => (&[], false, false),
+    }
+}
+
+fn collect_sorted_family_indices(
+    state: &UniquesIndex,
+    bitmap: &RoaringBitmap,
+    field: &SortField,
+    dir: SortDir,
+    offset: usize,
+    limit: usize,
+) -> Vec<u32> {
+    let (ranges, reverse_ranges, reverse_within_family) =
+        family_ranges_for_sort(state, field, dir);
+    let mut remaining_skip = offset as u64;
+    let mut out = Vec::with_capacity(limit);
+
+    let iter: Box<dyn Iterator<Item = &FamilySpanRange>> = if reverse_ranges {
+        Box::new(ranges.iter().rev())
+    } else {
+        Box::new(ranges.iter())
+    };
+
+    for range in iter {
+        if out.len() >= limit {
+            break;
+        }
+        let count = bitmap.range_cardinality(range.start..range.end);
+        if count == 0 {
+            continue;
+        }
+        if remaining_skip >= count {
+            remaining_skip -= count;
+            continue;
+        }
+        let need = limit - out.len();
+        let skip = remaining_skip as usize;
+        remaining_skip = 0;
+        if reverse_within_family {
+            out.extend(bitmap.range(range.start..range.end).rev().skip(skip).take(need));
+        } else {
+            out.extend(bitmap.range(range.start..range.end).skip(skip).take(need));
+        }
+    }
+
+    out
+}
+
+fn page_sorted_cards(
+    state: &UniquesIndex,
+    bitmap: &RoaringBitmap,
+    offset: usize,
+    limit: usize,
+    sort: &CardsSort,
+    debug_bga_trigram: bool,
+) -> QueryResult<(Vec<CardV2>, Option<u32>)> {
+    let total = bitmap.len();
+    if (offset as u64) >= total || limit == 0 {
+        return Ok((Vec::new(), None));
+    }
+
+    let indices = match &sort.field {
+        SortField::MainCost => {
+            collect_sorted_stat_indices(state, bitmap, StatField::MainCost, sort.dir, offset, limit)?
+        }
+        SortField::RecallCost => {
+            collect_sorted_stat_indices(state, bitmap, StatField::RecallCost, sort.dir, offset, limit)?
+        }
+        SortField::ForestPower => {
+            collect_sorted_stat_indices(state, bitmap, StatField::ForestPower, sort.dir, offset, limit)?
+        }
+        SortField::MountainPower => {
+            collect_sorted_stat_indices(state, bitmap, StatField::MountainPower, sort.dir, offset, limit)?
+        }
+        SortField::OceanPower => {
+            collect_sorted_stat_indices(state, bitmap, StatField::OceanPower, sort.dir, offset, limit)?
+        }
+        SortField::SetDate | SortField::Collector | SortField::Reference | SortField::Name(_) => {
+            collect_sorted_family_indices(state, bitmap, &sort.field, sort.dir, offset, limit)
+        }
+    };
+
+    let cards = cards_from_indices(state, &indices, debug_bga_trigram)?;
+    let next_offset = offset + indices.len();
+    let next_cursor = if !indices.is_empty() && (next_offset as u64) < total {
+        Some(next_offset as u32)
+    } else {
+        None
+    };
+
+    Ok((cards, next_cursor))
 }
 
 fn faction_from_code(code: u8) -> String {
@@ -1252,5 +1445,79 @@ mod tests {
         assert!(req.refs.is_empty());
         let bmp = build_bitmap(state.index().as_ref(), state.formats().as_ref(), &state.snapshot().collections, &req).unwrap();
         assert_eq!(bmp.len(), state.index().manifest().total_bit_span as u64);
+    }
+
+    #[test]
+    fn sorted_stat_pagination_orders_buckets_and_paginates_across_pages() {
+        let state = test_state();
+        // stats[ForestPower] buckets in test_state: index 2 => 1, index 5 => 4.
+        let mut bmp = RoaringBitmap::new();
+        bmp.insert(2);
+        bmp.insert(5);
+
+        let desc = CardsSort {
+            field: SortField::ForestPower,
+            dir: SortDir::Desc,
+        };
+        let (p1, c1) = page_cards_v2_sorted(state.index().as_ref(), &bmp, None, 1, Some(&desc), false).unwrap();
+        assert_eq!(p1.iter().map(|c| c.reference.as_str()).collect::<Vec<_>>(), vec!["ALT_TEST_B_AX_01_U_6"]);
+        assert_eq!(c1, Some(1));
+
+        let (p2, c2) = page_cards_v2_sorted(state.index().as_ref(), &bmp, c1, 1, Some(&desc), false).unwrap();
+        assert_eq!(p2.iter().map(|c| c.reference.as_str()).collect::<Vec<_>>(), vec!["ALT_TEST_B_AX_01_U_3"]);
+        assert_eq!(c2, None);
+
+        let asc = CardsSort {
+            field: SortField::ForestPower,
+            dir: SortDir::Asc,
+        };
+        let (pa, ca) = page_cards_v2_sorted(state.index().as_ref(), &bmp, None, 2, Some(&asc), false).unwrap();
+        assert_eq!(
+            pa.iter().map(|c| c.reference.as_str()).collect::<Vec<_>>(),
+            vec!["ALT_TEST_B_AX_01_U_3", "ALT_TEST_B_AX_01_U_6"]
+        );
+        assert_eq!(ca, None);
+    }
+
+    #[test]
+    fn sorted_family_pagination_supports_set_date_name_and_reference() {
+        let state = test_state_with_sets();
+        let mut bmp = RoaringBitmap::new();
+        bmp.insert(0);  // CORE family 01 ("Kelon Elemental")
+        bmp.insert(5);  // COREKS family 01 ("Kelon Elemental")
+        bmp.insert(10); // ALIZE family 02 ("Other Character")
+        bmp.insert(11); // ALIZE family 02 ("Other Character")
+
+        let set_desc = CardsSort {
+            field: SortField::SetDate,
+            dir: SortDir::Desc,
+        };
+        let (p1, cur1) = page_cards_v2_sorted(state.index().as_ref(), &bmp, None, 2, Some(&set_desc), false).unwrap();
+        assert_eq!(p1[0].set.reference, "ALIZE");
+        assert_eq!(p1[1].set.reference, "ALIZE");
+        assert_eq!(cur1, Some(2));
+
+        let (p2, cur2) = page_cards_v2_sorted(state.index().as_ref(), &bmp, cur1, 2, Some(&set_desc), false).unwrap();
+        assert_eq!(
+            p2.iter().map(|c| c.set.reference.as_str()).collect::<Vec<_>>(),
+            vec!["COREKS", "CORE"]
+        );
+        assert_eq!(cur2, None);
+
+        let name_desc = CardsSort {
+            field: SortField::Name("en_US".to_string()),
+            dir: SortDir::Desc,
+        };
+        let (pn, _) = page_cards_v2_sorted(state.index().as_ref(), &bmp, None, 4, Some(&name_desc), false).unwrap();
+        assert_eq!(pn[0].name.get("en_US").map(String::as_str), Some("Other Character"));
+        assert_eq!(pn[2].name.get("en_US").map(String::as_str), Some("Kelon Elemental"));
+
+        let ref_desc = CardsSort {
+            field: SortField::Reference,
+            dir: SortDir::Desc,
+        };
+        let (pr, _) = page_cards_v2_sorted(state.index().as_ref(), &bmp, None, 2, Some(&ref_desc), false).unwrap();
+        assert_eq!(pr[0].reference, "ALT_COREKS_B_AX_01_U_1");
+        assert_eq!(pr[1].reference, "ALT_CORE_B_AX_01_U_1");
     }
 }

@@ -126,11 +126,12 @@ If multiple effects are specified, the `effectMode` determines if the card must 
 ### Response options
 
 
-| Supported | Parameter      | Type | Example        | Meaning                                                                                                                                                                           |
-| --------- | -------------- | ---- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Yes       | `withFamilies` | flag | `withFamilies` | On the **first** request only (`cursor` omitted): add `families[]` and replace normal `cards[]` paging with one full card per matching family (see Response). `limit` is ignored. |
-| Yes       | `limit`        | int  | `limit=50`     | Page size for `cards[]` when `withFamilies` is absent (default 50, max 200).                                                                                                      |
-| Yes       | `cursor`       | int  | `cursor=10516` | Resume `cards[]` paging after this `card_index`. When set, `withFamilies` is ignored.                                                                                             |
+| Supported | Parameter      | Type   | Example          | Meaning                                                                                                                                                                           |
+| --------- | -------------- | ------ | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Yes       | `withFamilies` | flag   | `withFamilies`   | On the **first** request only (`cursor` omitted): add `families[]` and replace normal `cards[]` paging with one full card per matching family (see Response). `limit` is ignored. |
+| Yes       | `limit`        | int    | `limit=50`       | Page size for `cards[]` when `withFamilies` is absent (default 50, max 200).                                                                                                      |
+| Yes       | `cursor`       | int    | `cursor=10516`   | Without `sort`: resume `cards[]` paging after this `card_index`. With `sort`: 0-based offset into the sorted result set. When set, `withFamilies` is ignored.                    |
+| Yes       | `sort`         | string | `sort=mainCost:desc` | Single-field sort (`mainCost`, `recallCost`, `forestPower`, `mountainPower`, `oceanPower`, `setDate`, `collector`, `reference`, `name[:locale]`) with `:asc` or `:desc` (or `default`). Supported locales: `fr`, `en`, `de`, `es`, `it` (default `en`). |
 
 
 ## `GET /api/v2/cards` Response

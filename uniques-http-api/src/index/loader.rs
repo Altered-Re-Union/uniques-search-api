@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -200,6 +201,209 @@ impl FamilyLookupIndex {
             return Err(FamilyResolveError::Padding);
         }
         Ok(span.start_bit + parsed.unique_id - 1)
+    }
+}
+
+/// Precomputed contiguous `card_index` half-open range `[start, end)` for one catalog family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FamilySpanRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Pre-sorted catalog family ranges built once at index load so family-level
+/// sorts (`setDate`, `collector`, `reference`, `name`) paginate without scanning
+/// or sorting millions of individual cards per request.
+#[derive(Debug, Clone, Default)]
+pub struct FamilySortIndex {
+    pub set_date_asc: Vec<FamilySpanRange>,
+    pub set_date_desc: Vec<FamilySpanRange>,
+    pub collector_asc: Vec<FamilySpanRange>,
+    pub reference_asc: Vec<FamilySpanRange>,
+    pub name_asc_by_locale: BTreeMap<String, Vec<FamilySpanRange>>,
+}
+
+fn family_set_code<'a>(catalog: &'a Catalog, family: &'a index_core::catalog::FamilyEntry) -> &'a str {
+    family.source_set.as_deref().unwrap_or(&catalog.set)
+}
+
+fn set_release_rank(set_ref: &str) -> (usize, &str) {
+    let rank = match set_ref {
+        "CORE" => 0,
+        "COREKS" => 1,
+        "ALIZE" => 2,
+        "BISE" => 3,
+        "CYCLONE" => 4,
+        "DUSTER" => 5,
+        "EOLE" => 6,
+        "FUGUE" => 7,
+        _ => usize::MAX,
+    };
+    (rank, set_ref)
+}
+
+fn faction_sort_rank(faction: &str) -> (usize, &str) {
+    let rank = match faction {
+        "AX" => 0,
+        "BR" => 1,
+        "LY" => 2,
+        "MU" => 3,
+        "OR" => 4,
+        "YZ" => 5,
+        _ => usize::MAX,
+    };
+    (rank, faction)
+}
+
+fn numeric_family_key(family_number: &str) -> (u32, &str) {
+    (family_number.parse::<u32>().unwrap_or(u32::MAX), family_number)
+}
+
+fn family_range(family: &index_core::catalog::FamilyEntry) -> FamilySpanRange {
+    FamilySpanRange {
+        start: family.start_bit,
+        end: family.start_bit.saturating_add(family.max_unique_id),
+    }
+}
+
+pub fn build_family_sort_index(catalog: &Catalog) -> FamilySortIndex {
+    let count = catalog.families.len();
+    let mut indices: Vec<usize> = (0..count).collect();
+
+    indices.sort_by(|&a, &b| {
+        let fa = &catalog.families[a];
+        let fb = &catalog.families[b];
+        let ka = (
+            set_release_rank(family_set_code(catalog, fa)),
+            faction_sort_rank(&fa.faction),
+            numeric_family_key(&fa.family_number),
+            fa.start_bit,
+        );
+        let kb = (
+            set_release_rank(family_set_code(catalog, fb)),
+            faction_sort_rank(&fb.faction),
+            numeric_family_key(&fb.family_number),
+            fb.start_bit,
+        );
+        ka.cmp(&kb)
+    });
+    let set_date_asc = indices.iter().map(|&i| family_range(&catalog.families[i])).collect();
+
+    indices.sort_by(|&a, &b| {
+        let fa = &catalog.families[a];
+        let fb = &catalog.families[b];
+        let ka = (
+            Reverse(set_release_rank(family_set_code(catalog, fa))),
+            faction_sort_rank(&fa.faction),
+            numeric_family_key(&fa.family_number),
+            fa.start_bit,
+        );
+        let kb = (
+            Reverse(set_release_rank(family_set_code(catalog, fb))),
+            faction_sort_rank(&fb.faction),
+            numeric_family_key(&fb.family_number),
+            fb.start_bit,
+        );
+        ka.cmp(&kb)
+    });
+    let set_date_desc = indices.iter().map(|&i| family_range(&catalog.families[i])).collect();
+
+    indices.sort_by(|&a, &b| {
+        let fa = &catalog.families[a];
+        let fb = &catalog.families[b];
+        let set_a = family_set_code(catalog, fa);
+        let set_b = family_set_code(catalog, fb);
+        let code_a = fa.set.code.as_deref().unwrap_or(set_a);
+        let code_b = fb.set.code.as_deref().unwrap_or(set_b);
+        let ka = (
+            code_a,
+            faction_sort_rank(&fa.faction),
+            numeric_family_key(&fa.family_number),
+            set_release_rank(set_a),
+            fa.start_bit,
+        );
+        let kb = (
+            code_b,
+            faction_sort_rank(&fb.faction),
+            numeric_family_key(&fb.family_number),
+            set_release_rank(set_b),
+            fb.start_bit,
+        );
+        ka.cmp(&kb)
+    });
+    let collector_asc = indices.iter().map(|&i| family_range(&catalog.families[i])).collect();
+
+    indices.sort_by(|&a, &b| {
+        let fa = &catalog.families[a];
+        let fb = &catalog.families[b];
+        let ka = (
+            family_set_code(catalog, fa),
+            fa.faction.as_str(),
+            fa.family_number.as_str(),
+            fa.start_bit,
+        );
+        let kb = (
+            family_set_code(catalog, fb),
+            fb.faction.as_str(),
+            fb.family_number.as_str(),
+            fb.start_bit,
+        );
+        ka.cmp(&kb)
+    });
+    let reference_asc = indices.iter().map(|&i| family_range(&catalog.families[i])).collect();
+
+    let mut locales = BTreeSet::new();
+    locales.insert("en_US".to_string());
+    for family in &catalog.families {
+        for loc in family.name.keys() {
+            locales.insert(loc.clone());
+        }
+    }
+
+    let mut name_asc_by_locale = BTreeMap::new();
+    for locale in locales {
+        let normalized: Vec<String> = catalog
+            .families
+            .iter()
+            .map(|f| {
+                let raw = f
+                    .name
+                    .get(&locale)
+                    .or_else(|| f.name.get("en_US"))
+                    .or_else(|| f.name.values().next())
+                    .map(String::as_str)
+                    .unwrap_or("");
+                normalize_name_for_search(raw)
+            })
+            .collect();
+
+        let mut loc_indices: Vec<usize> = (0..count).collect();
+        loc_indices.sort_by(|&a, &b| {
+            let fa = &catalog.families[a];
+            let fb = &catalog.families[b];
+            (
+                normalized[a].as_str(),
+                set_release_rank(family_set_code(catalog, fa)),
+                fa.start_bit,
+            )
+                .cmp(&(
+                    normalized[b].as_str(),
+                    set_release_rank(family_set_code(catalog, fb)),
+                    fb.start_bit,
+                ))
+        });
+        name_asc_by_locale.insert(
+            locale,
+            loc_indices.iter().map(|&i| family_range(&catalog.families[i])).collect(),
+        );
+    }
+
+    FamilySortIndex {
+        set_date_asc,
+        set_date_desc,
+        collector_asc,
+        reference_asc,
+        name_asc_by_locale,
     }
 }
 
@@ -406,6 +610,8 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
         catalog.families.len()
     );
 
+    let family_sort_index = build_family_sort_index(&catalog);
+
     let id_gd_aliases = IdGdAliasMap::from_catalog(&idgd_catalog);
 
     let effects_list = build_effects_list(&idgd_catalog);
@@ -437,6 +643,7 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
         name_search_index,
         family_lookup_index,
         family_span_groups,
+        family_sort_index,
         effects_body,
     })
 }

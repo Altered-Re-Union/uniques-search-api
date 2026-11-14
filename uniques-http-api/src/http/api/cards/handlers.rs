@@ -8,7 +8,10 @@ use index_core::idgd_catalog::IdGdCatalogEntry;
 use crate::http::api::cards::parse::{parse_query_multimap, parse_request};
 use crate::http::api::error::{bad_request, map_query_error, not_found, ApiResult};
 use crate::http::{IndexSnapshot, ServerState};
-use crate::index::{build_bitmap, card_v2_from_index, cards_from_indices, families_from_bitmap, page_cards_v2, CardResolveError};
+use crate::index::{
+    build_bitmap, card_v2_from_index, cards_from_indices, families_from_bitmap, page_cards_v2_sorted,
+    CardResolveError,
+};
 use super::{CardV2, CardsIter, CardsResponse};
 
 pub async fn get_card_v2(
@@ -70,11 +73,12 @@ pub async fn get_cards_v2(
             .map_err(map_query_error)?;
         (cards, None, Some(families))
     } else {
-        let (cards, next_cursor) = page_cards_v2(
+        let (cards, next_cursor) = page_cards_v2_sorted(
             &index,
             &bitmap,
             req.cursor,
             req.limit,
+            req.sort.as_ref(),
             req.debug_bga_trigram,
         )
         .map_err(map_query_error)?;

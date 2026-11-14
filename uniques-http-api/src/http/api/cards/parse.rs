@@ -10,8 +10,8 @@ use crate::http::api::error::{bad_request, collection_not_loaded, internal_serve
 use crate::collections::validate_collection_id;
 use crate::index::UniquesIndex;
 use super::models::{
-    AbilityFilters, CardsRequest, CompareOp, CostPredicate, EffectCombineMode,
-    EffectSlotFilter, IdGdSelector,
+    AbilityFilters, CardsRequest, CardsSort, CompareOp, CostPredicate, EffectCombineMode,
+    EffectSlotFilter, IdGdSelector, SortDir, SortField,
 };
 
 
@@ -160,6 +160,7 @@ pub(crate) fn parse_request(
     let mountain_power = parse_cost_predicate(params, "mountainPower")?;
     let ocean_power = parse_cost_predicate(params, "oceanPower")?;
     let name = parse_name(params);
+    let sort = parse_sort(params)?;
     let debug_bga_trigram = params.contains_key("debug_bga_trigram");
     let with_families = params.contains_key("withFamilies");
 
@@ -171,6 +172,7 @@ pub(crate) fn parse_request(
     Ok(CardsRequest {
         limit,
         cursor,
+        sort,
         filters,
         factions,
         sets,
@@ -196,6 +198,67 @@ fn parse_name(params: &QueryMultiMap) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn parse_sort_dir(raw: &str, full_value: &str) -> ApiResult<SortDir> {
+    match raw.to_ascii_lowercase().as_str() {
+        "asc" => Ok(SortDir::Asc),
+        "desc" => Ok(SortDir::Desc),
+        _ => Err(bad_request(format!(
+            "invalid sort value '{full_value}': expected direction ':asc' or ':desc'"
+        ))),
+    }
+}
+
+fn canonical_sort_locale(raw: &str) -> &'static str {
+    match raw.to_ascii_lowercase().as_str() {
+        "fr" | "fr_fr" => "fr_FR",
+        "de" | "de_de" => "de_DE",
+        "es" | "es_es" => "es_ES",
+        "it" | "it_it" => "it_IT",
+        _ => "en_US",
+    }
+}
+
+pub(crate) fn parse_sort(params: &QueryMultiMap) -> ApiResult<Option<CardsSort>> {
+    let Some(raw) = get_first(params, "sort") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return Ok(None);
+    }
+
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    let (field_part, locale_part, dir_part) = match parts.as_slice() {
+        [field, dir] => (*field, None, *dir),
+        [field, locale, dir] if field.eq_ignore_ascii_case("name") => (*field, Some(*locale), *dir),
+        _ => {
+            return Err(bad_request(format!(
+                "invalid sort value '{trimmed}': expected '<field>:<asc|desc>' or 'name:<locale>:<asc|desc>'"
+            )));
+        }
+    };
+
+    let dir = parse_sort_dir(dir_part, trimmed)?;
+    let field = match field_part.to_ascii_lowercase().as_str() {
+        "maincost" | "main_cost" | "mana" => SortField::MainCost,
+        "recallcost" | "recall_cost" | "reserve" => SortField::RecallCost,
+        "forestpower" | "forest_power" | "forest" => SortField::ForestPower,
+        "mountainpower" | "mountain_power" | "mountain" => SortField::MountainPower,
+        "oceanpower" | "ocean_power" | "ocean" => SortField::OceanPower,
+        "setdate" | "set_date" => SortField::SetDate,
+        "collector" => SortField::Collector,
+        "reference" | "number" => SortField::Reference,
+        "name" => SortField::Name(canonical_sort_locale(locale_part.unwrap_or("en_US")).to_string()),
+        _ => {
+            return Err(bad_request(format!(
+                "unsupported sort field '{field_part}' in '{trimmed}'"
+            )));
+        }
+    };
+
+    Ok(Some(CardsSort { field, dir }))
 }
 
 fn parse_id_list(params: &QueryMultiMap, key: &str) -> ApiResult<Vec<u32>> {
@@ -951,6 +1014,43 @@ mod tests {
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(err.1["error"], "collection_not_loaded");
         assert_eq!(err.1["collection"], "deck1");
+    }
+
+    #[test]
+    fn parse_sort_handles_default_valid_and_invalid_values() {
+        assert_eq!(parse_sort(&HashMap::new()).unwrap(), None);
+
+        let mut def: QueryMultiMap = HashMap::new();
+        def.insert("sort".to_string(), vec!["default".to_string()]);
+        assert_eq!(parse_sort(&def).unwrap(), None);
+
+        let mut stat: QueryMultiMap = HashMap::new();
+        stat.insert("sort".to_string(), vec!["mainCost:desc".to_string()]);
+        assert_eq!(
+            parse_sort(&stat).unwrap(),
+            Some(CardsSort {
+                field: SortField::MainCost,
+                dir: SortDir::Desc,
+            })
+        );
+
+        let mut name_fr: QueryMultiMap = HashMap::new();
+        name_fr.insert("sort".to_string(), vec!["name:fr:asc".to_string()]);
+        assert_eq!(
+            parse_sort(&name_fr).unwrap(),
+            Some(CardsSort {
+                field: SortField::Name("fr_FR".to_string()),
+                dir: SortDir::Asc,
+            })
+        );
+
+        let mut bad_field: QueryMultiMap = HashMap::new();
+        bad_field.insert("sort".to_string(), vec!["unknown:asc".to_string()]);
+        assert_eq!(parse_sort(&bad_field).unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        let mut bad_dir: QueryMultiMap = HashMap::new();
+        bad_dir.insert("sort".to_string(), vec!["mainCost:sideways".to_string()]);
+        assert_eq!(parse_sort(&bad_dir).unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 }
 
