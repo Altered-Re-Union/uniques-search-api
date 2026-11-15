@@ -1,27 +1,50 @@
-//! Loads the standalone non-unique index (see `index-core/src/nonunique.rs`) from the same
-//! [`IndexStorage`] root as the unique index, if present. Best-effort: an index directory built
-//! before Lot 2 simply has no `nonunique/` files, and callers get `Ok(None)`.
+//! Loader and queryable in-memory index for non-unique cards (`<out>/nonunique/`).
+//!
+//! Reads the bitmap index + compact records emitted by `index_core::nonunique::build_nonunique_index`
+//! plus optional rich metadata (`prints.json`, `card_types.json`, `keywords/`, `cost_relations/`,
+//! `has_no_effect.roar`) so unified search (`/api/v2/search`) and `/api/v2/card/{reference}` can
+//! filter, sort, and serialize non-unique prints alongside uniques with zero disk I/O per request.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Result;
-use index_core::nonunique::{CompactNonUniqueFields, CompactNonUniqueView, NonUniqueCatalog};
+use index_core::family_catalog::FamilyCatalogEntry;
+use index_core::nonunique::{
+    CompactNonUniqueFields, CompactNonUniqueView, NonUniqueCatalog, NonUniquePrintMeta,
+};
 use roaring::RoaringBitmap;
 
-use super::normalize_name_for_search;
 use super::storage::{read_json, read_roar, IndexStorage};
+use super::{faction_sort_rank, normalize_name_for_search, set_release_rank};
 
-const FACTIONS: [&str; 6] = ["AX", "BR", "LY", "MU", "OR", "YZ"];
-const RARITIES: [&str; 3] = ["C", "R", "E"];
-const PRODUCTS: [&str; 3] = ["B", "A", "P"];
-const STAT_FIELDS: [&str; 5] = [
+const VALUE_BUCKETS: usize = 16;
+const STAT_NAMES: [&str; 5] = [
     "main_cost",
     "recall_cost",
     "mountain_power",
     "ocean_power",
     "forest_power",
 ];
+const FACTION_CODES: [&str; 7] = ["AX", "BR", "LY", "MU", "OR", "YZ", "NE"];
 
+#[derive(Debug, Clone, Default)]
+pub struct NonUniqueCostRelationBitmaps {
+    pub equal: RoaringBitmap,
+    pub main_higher: RoaringBitmap,
+    pub recall_higher: RoaringBitmap,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NonUniqueSortIndex {
+    pub set_date_asc: Vec<u32>,
+    pub set_date_desc: Vec<u32>,
+    pub collector_asc: Vec<u32>,
+    pub reference_asc: Vec<u32>,
+    pub name_asc_by_locale: BTreeMap<String, Vec<u32>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct NonUniqueQueryIndex {
     pub catalog: NonUniqueCatalog,
     cards: Vec<u8>,
@@ -30,28 +53,47 @@ pub struct NonUniqueQueryIndex {
     pub product: BTreeMap<String, RoaringBitmap>,
     pub serialized: Option<RoaringBitmap>,
     pub stats: BTreeMap<String, BTreeMap<u8, RoaringBitmap>>,
-    /// Open-ended (a new set release adds values) — see `set`/`type`/`subtype` in
-    /// `nonunique.rs`'s `write_named_bitmaps` doc comment for why this needs `_index.json`
-    /// instead of the fixed-code-space `has_file` probing used for faction/rarity/product.
+    /// Per-stat bitmap of prints where the stat is missing (`None` / N/A, e.g. Heroes, Spells,
+    /// Landmarks) so numeric stat sorts push NULLS LAST cleanly.
+    pub stat_missing: BTreeMap<String, RoaringBitmap>,
     pub set: BTreeMap<String, RoaringBitmap>,
     pub card_type: BTreeMap<String, RoaringBitmap>,
     pub subtype: BTreeMap<String, RoaringBitmap>,
-    /// Keyed by `CardFamilyId` formatted as a string (open-ended, same `_index.json` mechanism as
-    /// set/type/subtype) — see plan 23.
+    pub keywords: BTreeMap<String, RoaringBitmap>,
+    pub has_no_effect: RoaringBitmap,
+    pub cost_relations: NonUniqueCostRelationBitmaps,
     pub family: BTreeMap<String, RoaringBitmap>,
     pub banned: RoaringBitmap,
     pub errated: RoaringBitmap,
     pub suspended: RoaringBitmap,
-    /// Normalized (lowercased, accent-folded) per-print, per-locale effect text — interim
-    /// full-text search substrate (see D6/plan 24). One entry per `print_index`, empty `Vec` for a
-    /// print with no effect rows. Not persisted normalized — raw text is normalized once here at
-    /// load time, same pattern `NameSearchIndex` already uses for unique family names.
-    effect_text_search: Vec<Vec<String>>,
+    /// Full per-print rich metadata (`prints[print_index]`), when `prints.json` is present.
+    pub prints: Vec<NonUniquePrintMeta>,
+    /// `CardTypeReference` -> localized names (`{"en_US": "Hero", "fr_FR": "Héros", ...}`).
+    pub card_types_i18n: BTreeMap<String, BTreeMap<String, String>>,
+    /// Reference (uppercased & exact-case insensitive) -> `print_index`.
+    pub ref_lookup: HashMap<String, u32>,
+    /// Normalized collector number keys (e.g. `BTG-001-C`, `SDU-001-C-EN`, `SDU-001-C`, `BTG-001`)
+    /// -> matching `print_index` list.
+    pub collector_lookup: HashMap<String, Vec<u32>>,
+    /// Normalized effect text per locale for each print.
+    pub normalized_effects: Vec<BTreeMap<String, String>>,
+    /// Concatenated normalized effect text across all locales per print (fallback `q` scan).
+    pub normalized_all_effects: Vec<String>,
+    /// Normalized localized names per print (populated via `bind_families`).
+    pub normalized_names: Vec<BTreeMap<String, String>>,
+    /// Concatenated normalized names across all locales per print.
+    pub normalized_all_names: Vec<String>,
+    /// Pre-sorted `print_index` vectors for global sorting & pagination.
+    pub sort_index: NonUniqueSortIndex,
 }
 
 impl NonUniqueQueryIndex {
     pub fn fields_for(&self, print_index: u32) -> Option<CompactNonUniqueFields> {
         CompactNonUniqueView::from_data(&self.cards, print_index).map(|v| v.fields())
+    }
+
+    pub fn print_for(&self, print_index: u32) -> Option<&NonUniquePrintMeta> {
+        self.prints.get(print_index as usize)
     }
 
     pub fn reference_for(&self, print_index: u32) -> Option<&str> {
@@ -62,33 +104,131 @@ impl NonUniqueQueryIndex {
         self.catalog.total_cards()
     }
 
-    /// Prints whose effect text contains `query` in any locale (case/accent-insensitive) — same
-    /// matching rule `NameSearchIndex::bitmap_for_contains` uses for unique names.
+    pub fn resolve_reference(&self, reference: &str) -> Option<u32> {
+        self.ref_lookup
+            .get(&reference.trim().to_ascii_uppercase())
+            .copied()
+    }
+
+    /// Recompute localized names and `NonUniqueSortIndex` once `FamilyCatalog` is attached.
+    pub fn bind_families(&mut self, families: &BTreeMap<i64, FamilyCatalogEntry>) {
+        let total = self.total() as usize;
+        let mut norm_names = Vec::with_capacity(total);
+        let mut norm_all = Vec::with_capacity(total);
+
+        for i in 0..total {
+            let mut per_loc = BTreeMap::new();
+            let mut joined = String::new();
+            if let Some(meta) = self.prints.get(i) {
+                if let Some(fam) = families.get(&meta.card_family_id) {
+                    for (loc, raw) in &fam.name {
+                        let norm = normalize_name_for_search(raw);
+                        if !norm.is_empty() {
+                            if !joined.is_empty() {
+                                joined.push(' ');
+                            }
+                            joined.push_str(&norm);
+                        }
+                        per_loc.insert(loc.clone(), norm);
+                    }
+                }
+            }
+            norm_names.push(per_loc);
+            norm_all.push(joined);
+        }
+
+        self.normalized_names = norm_names;
+        self.normalized_all_names = norm_all;
+        self.sort_index =
+            build_nonunique_sort_index(&self.catalog, &self.prints, &self.normalized_names, families);
+    }
+
+    /// All non-unique print indices whose effect text in any locale contains `query`
+    /// (case- and diacritic-insensitive). Empty / whitespace-only query returns an empty bitmap.
     pub fn bitmap_for_effect_contains(&self, query: &str) -> RoaringBitmap {
         let needle = normalize_name_for_search(query);
-        let mut bitmap = RoaringBitmap::new();
-        for (print_index, texts) in self.effect_text_search.iter().enumerate() {
-            if texts.iter().any(|t| t.contains(&needle)) {
-                bitmap.insert(print_index as u32);
+        if needle.is_empty() {
+            return RoaringBitmap::new();
+        }
+        let mut out = RoaringBitmap::new();
+        for (i, all) in self.normalized_all_effects.iter().enumerate() {
+            if all.contains(&needle) {
+                out.insert(i as u32);
             }
         }
-        bitmap
+        out
+    }
+
+    /// Bitmap of prints whose name, reference, or collector number matches `needle`
+    /// (already normalized with `normalize_name_for_search`).
+    pub fn bitmap_for_name_or_ident(&self, needle: &str, locale: Option<&str>) -> RoaringBitmap {
+        if needle.is_empty() {
+            return RoaringBitmap::new();
+        }
+        let mut out = RoaringBitmap::new();
+        for i in 0..(self.total() as usize) {
+            let name_matches = match locale {
+                Some(loc) => self
+                    .normalized_names
+                    .get(i)
+                    .and_then(|m| m.get(loc))
+                    .map(|n| n.contains(needle))
+                    .unwrap_or(false)
+                    || self
+                        .normalized_all_names
+                        .get(i)
+                        .map(|n| n.contains(needle))
+                        .unwrap_or(false),
+                None => self
+                    .normalized_all_names
+                    .get(i)
+                    .map(|n| n.contains(needle))
+                    .unwrap_or(false),
+            };
+            let ref_matches = self
+                .catalog
+                .reference_for_index(i as u32)
+                .map(|r| r.to_ascii_lowercase().contains(needle))
+                .unwrap_or(false);
+            let col_matches = self
+                .prints
+                .get(i)
+                .and_then(|p| p.collector_number.as_deref())
+                .map(|c| c.to_ascii_lowercase().contains(needle))
+                .unwrap_or(false);
+            if name_matches || ref_matches || col_matches {
+                out.insert(i as u32);
+            }
+        }
+        out
+    }
+
+    /// Bitmap of prints whose name OR effect text OR reference OR collector number matches `needle`
+    /// (normalized with `normalize_name_for_search`).
+    pub fn bitmap_for_free_text(&self, needle: &str) -> RoaringBitmap {
+        if needle.is_empty() {
+            return RoaringBitmap::new();
+        }
+        let mut out = self.bitmap_for_name_or_ident(needle, None);
+        for (i, eff) in self.normalized_all_effects.iter().enumerate() {
+            if eff.contains(needle) {
+                out.insert(i as u32);
+            }
+        }
+        out
     }
 }
 
-/// `Ok(None)` when this storage root has no `nonunique/catalog.json` (nothing built yet for this
-/// index — not an error).
 pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUniqueQueryIndex>> {
     if !storage.has_file("nonunique/catalog.json") {
         return Ok(None);
     }
-
     let catalog: NonUniqueCatalog = read_json(storage, "nonunique/catalog.json")?;
     let cards = storage.read_bytes("nonunique/cards.bin")?;
 
-    let faction = load_coded_bitmaps(storage, "nonunique/factions", &FACTIONS)?;
-    let rarity = load_coded_bitmaps(storage, "nonunique/rarity", &RARITIES)?;
-    let product = load_coded_bitmaps(storage, "nonunique/product", &PRODUCTS)?;
+    let faction = load_named_bitmap_list(storage, "nonunique/factions", &FACTION_CODES)?;
+    let rarity = load_named_bitmap_list(storage, "nonunique/rarity", &["C", "R", "E", "U"])?;
+    let product = load_named_bitmap_list(storage, "nonunique/product", &["B", "A", "P"])?;
 
     let serialized_rel = "nonunique/serialized.roar";
     let serialized = storage
@@ -97,38 +237,104 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
         .transpose()?;
 
     let mut stats = BTreeMap::new();
-    for field in STAT_FIELDS {
-        let field_dir = format!("nonunique/stats/{field}");
+    for stat in STAT_NAMES {
         let mut buckets = BTreeMap::new();
-        for value in 0u8..16 {
-            let rel = format!("{field_dir}/{value:02}.roar");
+        for value in 0..VALUE_BUCKETS as u8 {
+            let rel = format!("nonunique/stats/{stat}/{value:02}.roar");
             if storage.has_file(&rel) {
                 buckets.insert(value, read_roar(storage, &rel)?);
             }
         }
-        if !buckets.is_empty() {
-            stats.insert(field.to_string(), buckets);
-        }
+        stats.insert(stat.to_string(), buckets);
     }
 
-    let set = load_named_bitmaps(storage, "nonunique/set")?;
-    let card_type = load_named_bitmaps(storage, "nonunique/type")?;
-    let subtype = load_named_bitmaps(storage, "nonunique/subtype")?;
-    let family = load_named_bitmaps(storage, "nonunique/family")?;
+    let set = load_indexed_bitmaps(storage, "nonunique/set")?;
+    let card_type = load_indexed_bitmaps(storage, "nonunique/type")?;
+    let subtype = load_indexed_bitmaps(storage, "nonunique/subtype")?;
+    let keywords = load_indexed_bitmaps(storage, "nonunique/keywords")?;
+    let family = load_indexed_bitmaps(storage, "nonunique/family")?;
 
-    let banned = load_status_flag(storage, "nonunique/status/banned.roar")?;
-    let errated = load_status_flag(storage, "nonunique/status/errated.roar")?;
-    let suspended = load_status_flag(storage, "nonunique/status/suspended.roar")?;
+    let banned = load_optional_bitmap(storage, "nonunique/status/banned.roar")?;
+    let errated = load_optional_bitmap(storage, "nonunique/status/errated.roar")?;
+    let suspended = load_optional_bitmap(storage, "nonunique/status/suspended.roar")?;
+    let has_no_effect = load_optional_bitmap(storage, "nonunique/has_no_effect.roar")?;
 
-    let effect_text_rel = "nonunique/effect_text.json";
-    let effect_text_search = if storage.has_file(effect_text_rel) {
-        let raw: Vec<BTreeMap<String, String>> = read_json(storage, effect_text_rel)?;
-        raw.into_iter()
-            .map(|by_locale| by_locale.into_values().map(|t| normalize_name_for_search(&t)).collect())
-            .collect()
+    let effect_text: Vec<BTreeMap<String, String>> = if storage.has_file("nonunique/effect_text.json")
+    {
+        read_json(storage, "nonunique/effect_text.json")?
     } else {
         Vec::new()
     };
+
+    let prints: Vec<NonUniquePrintMeta> = if storage.has_file("nonunique/prints.json") {
+        read_json(storage, "nonunique/prints.json")?
+    } else {
+        Vec::new()
+    };
+
+    let card_types_i18n: BTreeMap<String, BTreeMap<String, String>> =
+        if storage.has_file("nonunique/card_types.json") {
+            read_json(storage, "nonunique/card_types.json")?
+        } else {
+            BTreeMap::new()
+        };
+
+    let total = catalog.total_cards();
+    let mut all_prints = RoaringBitmap::new();
+    all_prints.insert_range(0..total);
+
+    let cost_relations = if storage.has_file("nonunique/cost_relations/equal.roar")
+        || storage.has_file("nonunique/cost_relations/main_higher.roar")
+        || storage.has_file("nonunique/cost_relations/recall_higher.roar")
+    {
+        NonUniqueCostRelationBitmaps {
+            equal: load_optional_bitmap(storage, "nonunique/cost_relations/equal.roar")?,
+            main_higher: load_optional_bitmap(storage, "nonunique/cost_relations/main_higher.roar")?,
+            recall_higher: load_optional_bitmap(
+                storage,
+                "nonunique/cost_relations/recall_higher.roar",
+            )?,
+        }
+    } else {
+        derive_cost_relations(&prints)
+    };
+
+    let stat_missing = compute_stat_missing(&all_prints, &stats, &prints);
+
+    let mut ref_lookup = HashMap::with_capacity(total as usize);
+    for idx in 0..total {
+        if let Some(reference) = catalog.reference_for_index(idx) {
+            ref_lookup.insert(reference.to_ascii_uppercase(), idx);
+        }
+    }
+
+    let collector_lookup = build_collector_lookup(&prints);
+
+    let normalized_effects: Vec<BTreeMap<String, String>> = effect_text
+        .iter()
+        .map(|per_loc| {
+            per_loc
+                .iter()
+                .map(|(loc, text)| (loc.clone(), normalize_name_for_search(text)))
+                .collect()
+        })
+        .collect();
+    let normalized_all_effects: Vec<String> = normalized_effects
+        .iter()
+        .map(|per_loc| {
+            per_loc
+                .values()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+
+    let empty_families = BTreeMap::new();
+    let normalized_names = vec![BTreeMap::new(); total as usize];
+    let normalized_all_names = vec![String::new(); total as usize];
+    let sort_index =
+        build_nonunique_sort_index(&catalog, &prints, &normalized_names, &empty_families);
 
     Ok(Some(NonUniqueQueryIndex {
         catalog,
@@ -138,25 +344,284 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
         product,
         serialized,
         stats,
+        stat_missing,
         set,
         card_type,
         subtype,
+        keywords,
+        has_no_effect,
+        cost_relations,
         family,
         banned,
         errated,
         suspended,
-        effect_text_search,
+        prints,
+        card_types_i18n,
+        ref_lookup,
+        collector_lookup,
+        normalized_effects,
+        normalized_all_effects,
+        normalized_names,
+        normalized_all_names,
+        sort_index,
     }))
 }
 
-fn load_coded_bitmaps(
+fn derive_cost_relations(prints: &[NonUniquePrintMeta]) -> NonUniqueCostRelationBitmaps {
+    let mut rel = NonUniqueCostRelationBitmaps::default();
+    for (idx, meta) in prints.iter().enumerate() {
+        if let (Some(mc), Some(rc)) = (meta.main_cost, meta.recall_cost) {
+            let i = idx as u32;
+            match mc.cmp(&rc) {
+                std::cmp::Ordering::Equal => {
+                    rel.equal.insert(i);
+                }
+                std::cmp::Ordering::Greater => {
+                    rel.main_higher.insert(i);
+                }
+                std::cmp::Ordering::Less => {
+                    rel.recall_higher.insert(i);
+                }
+            }
+        }
+    }
+    rel
+}
+
+fn compute_stat_missing(
+    all_prints: &RoaringBitmap,
+    stats: &BTreeMap<String, BTreeMap<u8, RoaringBitmap>>,
+    prints: &[NonUniquePrintMeta],
+) -> BTreeMap<String, RoaringBitmap> {
+    let mut missing = BTreeMap::new();
+    for stat in STAT_NAMES {
+        let bmp = if prints.len() as u32 == all_prints.len() as u32 && !prints.is_empty() {
+            let mut m = RoaringBitmap::new();
+            for (idx, meta) in prints.iter().enumerate() {
+                let present = match stat {
+                    "main_cost" => meta.main_cost.is_some(),
+                    "recall_cost" => meta.recall_cost.is_some(),
+                    "mountain_power" => meta.mountain_power.is_some(),
+                    "ocean_power" => meta.ocean_power.is_some(),
+                    "forest_power" => meta.forest_power.is_some(),
+                    _ => false,
+                };
+                if !present {
+                    m.insert(idx as u32);
+                }
+            }
+            m
+        } else {
+            let mut present = RoaringBitmap::new();
+            if let Some(buckets) = stats.get(stat) {
+                for b in buckets.values() {
+                    present |= b;
+                }
+            }
+            all_prints - present
+        };
+        missing.insert(stat.to_string(), bmp);
+    }
+    missing
+}
+
+fn build_collector_lookup(prints: &[NonUniquePrintMeta]) -> HashMap<String, Vec<u32>> {
+    let mut map: HashMap<String, Vec<u32>> = HashMap::new();
+    for (idx, meta) in prints.iter().enumerate() {
+        let Some(raw) = meta.collector_number.as_deref() else {
+            continue;
+        };
+        let norm = raw.trim().to_ascii_uppercase();
+        if norm.is_empty() {
+            continue;
+        }
+        let i = idx as u32;
+        map.entry(norm.clone()).or_default().push(i);
+
+        // Also index stripped locale suffix (e.g. `SDU-001-C-EN` -> `SDU-001-C`).
+        for suffix in ["-EN", "-FR", "-ES", "-DE", "-IT"] {
+            if let Some(prefix) = norm.strip_suffix(suffix) {
+                let v = map.entry(prefix.to_string()).or_default();
+                if !v.contains(&i) {
+                    v.push(i);
+                }
+                // And stripped rarity (`SDU-001` from `SDU-001-C`).
+                for rar in ["-C", "-R", "-E", "-U"] {
+                    if let Some(base) = prefix.strip_suffix(rar) {
+                        let bv = map.entry(base.to_string()).or_default();
+                        if !bv.contains(&i) {
+                            bv.push(i);
+                        }
+                    }
+                }
+            }
+        }
+        // Also stripped rarity directly (`BTG-001-C` -> `BTG-001`).
+        for rar in ["-C", "-R", "-E", "-U"] {
+            if let Some(base) = norm.strip_suffix(rar) {
+                let bv = map.entry(base.to_string()).or_default();
+                if !bv.contains(&i) {
+                    bv.push(i);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn collector_sort_parts(raw: Option<&str>) -> (u32, String) {
+    let Some(s) = raw else {
+        return (u32::MAX, String::new());
+    };
+    let num = s
+        .split('-')
+        .nth(1)
+        .and_then(|seg| seg.parse::<u32>().ok())
+        .unwrap_or(u32::MAX);
+    (num, s.to_string())
+}
+
+fn build_nonunique_sort_index(
+    catalog: &NonUniqueCatalog,
+    prints: &[NonUniquePrintMeta],
+    normalized_names: &[BTreeMap<String, String>],
+    families: &BTreeMap<i64, FamilyCatalogEntry>,
+) -> NonUniqueSortIndex {
+    let total = catalog.total_cards() as usize;
+    if total == 0 {
+        return NonUniqueSortIndex::default();
+    }
+
+    let print_ref = |i: usize| catalog.reference_for_index(i as u32).unwrap_or("");
+    let print_set = |i: usize| prints.get(i).map(|p| p.set.as_str()).unwrap_or("");
+    let print_set_code = |i: usize| {
+        prints
+            .get(i)
+            .and_then(|p| p.set_code.as_deref().or(Some(p.set.as_str())))
+            .unwrap_or("")
+    };
+    let print_faction = |i: usize| prints.get(i).map(|p| p.faction.as_str()).unwrap_or("");
+    let print_col = |i: usize| collector_sort_parts(prints.get(i).and_then(|p| p.collector_number.as_deref()));
+
+    let mut indices: Vec<u32> = (0..total as u32).collect();
+
+    indices.sort_by(|&a, &b| {
+        let ia = a as usize;
+        let ib = b as usize;
+        (
+            set_release_rank(print_set(ia)),
+            faction_sort_rank(print_faction(ia)),
+            print_col(ia),
+            print_ref(ia),
+        )
+            .cmp(&(
+                set_release_rank(print_set(ib)),
+                faction_sort_rank(print_faction(ib)),
+                print_col(ib),
+                print_ref(ib),
+            ))
+    });
+    let set_date_asc = indices.clone();
+
+    indices.sort_by(|&a, &b| {
+        let ia = a as usize;
+        let ib = b as usize;
+        (
+            Reverse(set_release_rank(print_set(ia))),
+            faction_sort_rank(print_faction(ia)),
+            print_col(ia),
+            print_ref(ia),
+        )
+            .cmp(&(
+                Reverse(set_release_rank(print_set(ib))),
+                faction_sort_rank(print_faction(ib)),
+                print_col(ib),
+                print_ref(ib),
+            ))
+    });
+    let set_date_desc = indices.clone();
+
+    indices.sort_by(|&a, &b| {
+        let ia = a as usize;
+        let ib = b as usize;
+        (
+            print_set_code(ia),
+            faction_sort_rank(print_faction(ia)),
+            print_col(ia),
+            set_release_rank(print_set(ia)),
+            print_ref(ia),
+        )
+            .cmp(&(
+                print_set_code(ib),
+                faction_sort_rank(print_faction(ib)),
+                print_col(ib),
+                set_release_rank(print_set(ib)),
+                print_ref(ib),
+            ))
+    });
+    let collector_asc = indices.clone();
+
+    indices.sort_by(|&a, &b| print_ref(a as usize).cmp(print_ref(b as usize)));
+    let reference_asc = indices.clone();
+
+    let mut locales = BTreeSet::new();
+    locales.insert("en_US".to_string());
+    for fam in families.values() {
+        for loc in fam.name.keys() {
+            locales.insert(loc.clone());
+        }
+    }
+
+    let mut name_asc_by_locale = BTreeMap::new();
+    for locale in locales {
+        let mut loc_indices: Vec<u32> = (0..total as u32).collect();
+        let names_for_locale: Vec<&str> = (0..total)
+            .map(|i| {
+                normalized_names
+                    .get(i)
+                    .and_then(|m| {
+                        m.get(&locale)
+                            .or_else(|| m.get("en_US"))
+                            .or_else(|| m.values().next())
+                    })
+                    .map(String::as_str)
+                    .unwrap_or_else(|| print_ref(i))
+            })
+            .collect();
+        loc_indices.sort_by(|&a, &b| {
+            let ia = a as usize;
+            let ib = b as usize;
+            (
+                names_for_locale[ia],
+                set_release_rank(print_set(ia)),
+                print_ref(ia),
+            )
+                .cmp(&(
+                    names_for_locale[ib],
+                    set_release_rank(print_set(ib)),
+                    print_ref(ib),
+                ))
+        });
+        name_asc_by_locale.insert(locale, loc_indices);
+    }
+
+    NonUniqueSortIndex {
+        set_date_asc,
+        set_date_desc,
+        collector_asc,
+        reference_asc,
+        name_asc_by_locale,
+    }
+}
+
+fn load_named_bitmap_list(
     storage: &impl IndexStorage,
-    dir: &str,
+    dir_rel: &str,
     codes: &[&str],
 ) -> Result<BTreeMap<String, RoaringBitmap>> {
     let mut out = BTreeMap::new();
     for code in codes {
-        let rel = format!("{dir}/{code}.roar");
+        let rel = format!("{dir_rel}/{code}.roar");
         if storage.has_file(&rel) {
             out.insert((*code).to_string(), read_roar(storage, &rel)?);
         }
@@ -164,31 +629,26 @@ fn load_coded_bitmaps(
     Ok(out)
 }
 
-/// For open-ended value spaces (set/type/subtype): reads `{dir}/_index.json` (the list of names
-/// that actually got a bitmap file, written by `nonunique.rs`'s `write_named_bitmaps`) first,
-/// rather than guessing candidates — `Ok(empty)` if the index itself is absent (older build, or
-/// nothing matched).
-fn load_named_bitmaps(
+fn load_indexed_bitmaps(
     storage: &impl IndexStorage,
-    dir: &str,
+    dir_rel: &str,
 ) -> Result<BTreeMap<String, RoaringBitmap>> {
-    let index_path = format!("{dir}/_index.json");
-    if !storage.has_file(&index_path) {
+    let index_rel = format!("{dir_rel}/_index.json");
+    if !storage.has_file(&index_rel) {
         return Ok(BTreeMap::new());
     }
-    let names: Vec<String> = read_json(storage, &index_path)?;
+    let names: Vec<String> = read_json(storage, &index_rel)?;
     let mut out = BTreeMap::new();
     for name in names {
-        let rel = format!("{dir}/{name}.roar");
+        let rel = format!("{dir_rel}/{name}.roar");
         if storage.has_file(&rel) {
-            out.insert(name.clone(), read_roar(storage, &rel)?);
+            out.insert(name, read_roar(storage, &rel)?);
         }
     }
     Ok(out)
 }
 
-/// `Ok(empty bitmap)` when `relative_path` isn't present.
-fn load_status_flag(storage: &impl IndexStorage, relative_path: &str) -> Result<RoaringBitmap> {
+fn load_optional_bitmap(storage: &impl IndexStorage, relative_path: &str) -> Result<RoaringBitmap> {
     if !storage.has_file(relative_path) {
         return Ok(RoaringBitmap::new());
     }

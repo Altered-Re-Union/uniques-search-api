@@ -3,18 +3,20 @@ use std::collections::BTreeMap;
 use roaring::RoaringBitmap;
 
 use index_core::bitmap::EffectLine;
+use index_core::family_catalog::FamilyCatalogEntry;
 use index_core::idgd_catalog::IdGdCatalogEntry;
 use index_core::stat_index::StatField;
 
 use crate::collections::CollectionStore;
 use crate::formats::{FormatIndex, FormatLoadStatus};
+use crate::index::loader::{FamilySpanRange, NonUniqueQueryIndex, SetBitmaps, SET_CORE, SET_COREKS};
 use crate::index::UniquesIndex;
-use crate::index::loader::{FamilySpanRange, SetBitmaps, SET_CORE, SET_COREKS};
 
 use super::error::{QueryError, QueryResult};
 use crate::http::api::cards::models::{
-    CardFaction, CardSetV2, CardSubTypeV2, CardV2, CardsRequest, CardsSort, CompareOp,
-    CostPredicate, CostRelation, EffectCombineMode, FamilyMatchV2, SortDir, SortField,
+    CardFaction, CardRarityV2, CardSetV2, CardSubTypeV2, CardTypeV2, CardV2, CardsRequest,
+    CardsSort, CompareOp, CostPredicate, CostRelation, EffectCombineMode, FamilyMatchV2, SortDir,
+    SortField,
 };
 
 fn union_requested_sets(bitmaps: &SetBitmaps, sets: &[String]) -> RoaringBitmap {
@@ -442,11 +444,11 @@ pub(crate) fn card_v2_from_index(
                 name: st.name.clone(),
             })
             .collect(),
-        main_cost: view.main_cost(),
-        recall_cost: view.recall_cost(),
-        forest_power: view.forest_power(),
-        mountain_power: view.mountain_power(),
-        ocean_power: view.ocean_power(),
+        main_cost: Some(view.main_cost()),
+        recall_cost: Some(view.recall_cost()),
+        forest_power: Some(view.forest_power()),
+        mountain_power: Some(view.mountain_power()),
+        ocean_power: Some(view.ocean_power()),
         faction: CardFaction {
             code: faction_code,
             name: faction_name,
@@ -454,8 +456,260 @@ pub(crate) fn card_v2_from_index(
         main_effect: build_main_effect_localized(idgd_by_id, &view),
         echo_effect: build_echo_effect_localized(idgd_by_id, &view),
         collector_number: build_collector_number(family, card_index),
+        card_type: None,
+        rarity: None,
+        product: None,
+        is_serialized: None,
+        is_banned: None,
+        is_errated: None,
+        is_suspended: None,
+        permanent: None,
+        reserve: None,
+        legal_formats: None,
         debug_bga_trigram: debug_bga_trigram.then(|| build_debug_bga_trigram(&view)),
     })
+}
+
+pub fn rarity_v2_from_code(code: &str) -> CardRarityV2 {
+    match code {
+        "C" | "COMMON" => CardRarityV2 {
+            reference: "COMMON".to_string(),
+            name: "Common".to_string(),
+        },
+        "R" | "RARE" => CardRarityV2 {
+            reference: "RARE".to_string(),
+            name: "Rare".to_string(),
+        },
+        "E" | "EXALTED" => CardRarityV2 {
+            reference: "EXALTED".to_string(),
+            name: "Exalted".to_string(),
+        },
+        "U" | "UNIQUE" => CardRarityV2 {
+            reference: "UNIQUE".to_string(),
+            name: "Unique".to_string(),
+        },
+        other => CardRarityV2 {
+            reference: other.to_string(),
+            name: other.to_string(),
+        },
+    }
+}
+
+pub fn unique_legal_formats(card_index: u32, formats: &FormatIndex) -> Option<Vec<String>> {
+    if formats.by_id.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (id, loaded) in &formats.by_id {
+        if let FormatLoadStatus::Ready { negated, bitmap } = &loaded.status {
+            let matches = bitmap.contains(card_index);
+            if (*negated && !matches) || (!*negated && matches) {
+                out.push(id.clone());
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Populate unified-search metadata (`rarity`, `cardType`, `isBanned`, `isErrated`, `isSuspended`,
+/// `legalFormats`) onto a `CardV2` built for a unique card.
+pub fn enrich_unique_card_v2(
+    card: &mut CardV2,
+    card_index: u32,
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+    formats: &FormatIndex,
+) {
+    card.rarity = Some(rarity_v2_from_code("U"));
+    let ct_names = nonunique
+        .and_then(|nu| nu.card_types_i18n.get("CHARACTER"))
+        .cloned()
+        .unwrap_or_else(|| {
+            let mut m = BTreeMap::new();
+            m.insert("en_US".to_string(), "Character".to_string());
+            m
+        });
+    card.card_type = Some(CardTypeV2 {
+        reference: "CHARACTER".to_string(),
+        name: ct_names,
+    });
+    card.is_banned = Some(index.banned().contains(card_index));
+    card.is_errated = Some(index.errated().contains(card_index));
+    card.is_suspended = Some(index.suspended().contains(card_index));
+    card.legal_formats = unique_legal_formats(card_index, formats);
+}
+
+/// Assemble a full `CardV2` for a non-unique print in `NonUniqueQueryIndex`.
+pub fn nonunique_card_v2(
+    nu: &NonUniqueQueryIndex,
+    print_index: u32,
+    families: &BTreeMap<i64, FamilyCatalogEntry>,
+    subtype_names: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Option<CardV2> {
+    let reference = nu.reference_for(print_index)?.to_string();
+    if let Some(meta) = nu.print_for(print_index) {
+        let fam = families.get(&meta.card_family_id);
+        let name = fam.map(|f| f.name.clone()).unwrap_or_default();
+        let faction_name = index_core::faction_display_name(&meta.faction)
+            .unwrap_or("")
+            .to_string();
+        let card_type_ref = if !meta.card_type.is_empty() {
+            meta.card_type.clone()
+        } else {
+            fam.map(|f| f.card_type.clone()).unwrap_or_default()
+        };
+        let card_type = if card_type_ref.is_empty() {
+            None
+        } else {
+            let ct_name = nu
+                .card_types_i18n
+                .get(&card_type_ref)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut m = BTreeMap::new();
+                    m.insert("en_US".to_string(), card_type_ref.clone());
+                    m
+                });
+            Some(CardTypeV2 {
+                reference: card_type_ref,
+                name: ct_name,
+            })
+        };
+        let card_sub_types = meta
+            .card_sub_types
+            .iter()
+            .map(|r| CardSubTypeV2 {
+                reference: r.clone(),
+                name: subtype_names.get(r).cloned().unwrap_or_else(|| {
+                    let mut m = BTreeMap::new();
+                    m.insert("en_US".to_string(), r.clone());
+                    m
+                }),
+            })
+            .collect();
+
+        Some(CardV2 {
+            reference,
+            name,
+            artist: meta.artist.clone(),
+            set: CardSetV2 {
+                reference: meta.set.clone(),
+                name: meta.set_name.clone(),
+                code: meta.set_code.clone(),
+            },
+            card_sub_types,
+            main_cost: meta.main_cost,
+            recall_cost: meta.recall_cost,
+            forest_power: meta.forest_power,
+            mountain_power: meta.mountain_power,
+            ocean_power: meta.ocean_power,
+            faction: CardFaction {
+                code: meta.faction.clone(),
+                name: faction_name,
+            },
+            main_effect: meta.main_effect.clone(),
+            echo_effect: meta.echo_effect.clone(),
+            collector_number: meta.collector_number.clone(),
+            card_type,
+            rarity: Some(rarity_v2_from_code(&meta.rarity)),
+            product: Some(meta.product.clone()),
+            is_serialized: Some(meta.is_serialized),
+            is_banned: Some(meta.is_banned),
+            is_errated: Some(meta.is_errated),
+            is_suspended: Some(meta.is_suspended),
+            permanent: meta.permanent,
+            reserve: meta.reserve,
+            legal_formats: None,
+            debug_bga_trigram: None,
+        })
+    } else {
+        // Fallback when legacy index lacks `prints.json`.
+        let fields = nu.fields_for(print_index)?;
+        let faction_code = nu
+            .faction
+            .iter()
+            .find_map(|(k, b)| b.contains(print_index).then(|| k.clone()))
+            .unwrap_or_default();
+        let faction_name = index_core::faction_display_name(&faction_code)
+            .unwrap_or("")
+            .to_string();
+        let rarity_code = index_core::nonunique::rarity_reference_from_code(fields.rarity_code)
+            .unwrap_or("");
+        let product_code = index_core::nonunique::product_reference_from_code(fields.product_code)
+            .unwrap_or("");
+        let set_ref = nu
+            .set
+            .iter()
+            .find_map(|(k, b)| b.contains(print_index).then(|| k.clone()))
+            .unwrap_or_default();
+        let fam_id = nu
+            .family
+            .iter()
+            .find_map(|(k, b)| b.contains(print_index).then(|| k.parse::<i64>().ok()).flatten());
+        let fam = fam_id.and_then(|id| families.get(&id));
+        let card_type_ref = nu
+            .card_type
+            .iter()
+            .find_map(|(k, b)| b.contains(print_index).then(|| k.clone()))
+            .or_else(|| fam.map(|f| f.card_type.clone()))
+            .unwrap_or_default();
+        let card_type = (!card_type_ref.is_empty()).then(|| CardTypeV2 {
+            reference: card_type_ref.clone(),
+            name: nu
+                .card_types_i18n
+                .get(&card_type_ref)
+                .cloned()
+                .unwrap_or_default(),
+        });
+
+        Some(CardV2 {
+            reference,
+            name: fam.map(|f| f.name.clone()).unwrap_or_default(),
+            artist: String::new(),
+            set: CardSetV2 {
+                name: set_ref.clone(),
+                code: index_core::set_code(&set_ref).map(str::to_string),
+                reference: set_ref,
+            },
+            card_sub_types: Vec::new(),
+            main_cost: Some(fields.main_cost),
+            recall_cost: Some(fields.recall_cost),
+            forest_power: Some(fields.forest_power),
+            mountain_power: Some(fields.mountain_power),
+            ocean_power: Some(fields.ocean_power),
+            faction: CardFaction {
+                code: faction_code,
+                name: faction_name,
+            },
+            main_effect: BTreeMap::new(),
+            echo_effect: BTreeMap::new(),
+            collector_number: None,
+            card_type,
+            rarity: (!rarity_code.is_empty()).then(|| rarity_v2_from_code(rarity_code)),
+            product: (!product_code.is_empty()).then(|| product_code.to_string()),
+            is_serialized: Some(fields.is_serialized),
+            is_banned: Some(nu.banned.contains(print_index)),
+            is_errated: Some(nu.errated.contains(print_index)),
+            is_suspended: Some(nu.suspended.contains(print_index)),
+            permanent: None,
+            reserve: None,
+            legal_formats: None,
+            debug_bga_trigram: None,
+        })
+    }
+}
+
+pub fn subtype_names_from_index(index: &UniquesIndex) -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    for fam in &index.catalog().families {
+        for st in &fam.card_sub_types {
+            let key = st.reference.trim().to_ascii_uppercase();
+            if !key.is_empty() && !map.contains_key(&key) {
+                map.insert(key, st.name.clone());
+            }
+        }
+    }
+    map
 }
 
 /// `SET-FAMILY-U-UID` (e.g. `BTG-011-U-5`) — `None` if either `set.code` or

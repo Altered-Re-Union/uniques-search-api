@@ -49,6 +49,20 @@ pub struct CardSubTypeV2 {
     pub name: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardTypeV2 {
+    pub reference: String,
+    pub name: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardRarityV2 {
+    pub reference: String,
+    pub name: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CardV2 {
@@ -57,19 +71,37 @@ pub struct CardV2 {
     pub artist: String,
     pub set: CardSetV2,
     pub card_sub_types: Vec<CardSubTypeV2>,
-    pub main_cost: u8,
-    pub recall_cost: u8,
-    pub forest_power: u8,
-    pub mountain_power: u8,
-    pub ocean_power: u8,
+    pub main_cost: Option<u8>,
+    pub recall_cost: Option<u8>,
+    pub forest_power: Option<u8>,
+    pub mountain_power: Option<u8>,
+    pub ocean_power: Option<u8>,
     pub faction: CardFaction,
     pub main_effect: BTreeMap<String, String>,
     pub echo_effect: BTreeMap<String, String>,
-    /// `SET-FAMILY-U-UID` (e.g. `BTG-011-U-5`) — `None` when the family lacks either `set.code` or
-    /// `collector_family_number` (older index, or a family from the deferred `cardsdata.rs` path).
-    /// Uniques only — see `cli-indexer/plans/24-collector-number-ingestion.md`.
+    /// `SET-FAMILY-...` (e.g. `BTG-011-U-5`, `BTG-001-C`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collector_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_type: Option<CardTypeV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rarity: Option<CardRarityV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_serialized: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_banned: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_errated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_suspended: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permanent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_formats: Option<Vec<String>>,
     #[serde(rename = "debug_bga_trigram", skip_serializing_if = "Option::is_none")]
     pub debug_bga_trigram: Option<String>,
 }

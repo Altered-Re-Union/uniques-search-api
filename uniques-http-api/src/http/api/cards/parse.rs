@@ -214,7 +214,7 @@ pub(crate) fn parse_request(
     })
 }
 
-fn parse_name(params: &QueryMultiMap) -> Option<String> {
+pub(crate) fn parse_name(params: &QueryMultiMap) -> Option<String> {
     let raw = get_first(params, "name")?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -287,7 +287,7 @@ pub(crate) fn parse_sort(params: &QueryMultiMap) -> ApiResult<Option<CardsSort>>
 
 /// Unified search box term: OR across name substring / exact ref / exact collector number. Same
 /// trim/empty rule as `parse_name`.
-fn parse_q(params: &QueryMultiMap) -> Option<String> {
+pub(crate) fn parse_q(params: &QueryMultiMap) -> Option<String> {
     let raw = get_first(params, "q")?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -297,7 +297,7 @@ fn parse_q(params: &QueryMultiMap) -> Option<String> {
     }
 }
 
-fn parse_collector_numbers(params: &QueryMultiMap) -> Vec<String> {
+pub(crate) fn parse_collector_numbers(params: &QueryMultiMap) -> Vec<String> {
     // Spec: collectorNumber[] repeated keys
     // Convenience: collectorNumber=A,B,C (CSV)
     let mut values: Vec<String> = Vec::new();
@@ -331,7 +331,7 @@ fn parse_collector_numbers(params: &QueryMultiMap) -> Vec<String> {
     out
 }
 
-fn parse_id_list(params: &QueryMultiMap, key: &str) -> ApiResult<Vec<u32>> {
+pub(crate) fn parse_id_list(params: &QueryMultiMap, key: &str) -> ApiResult<Vec<u32>> {
     let Some(values) = params.get(key) else {
         return Ok(Vec::new());
     };
@@ -497,7 +497,7 @@ fn parse_factions(params: &QueryMultiMap) -> ApiResult<Vec<Faction>> {
     Ok(out)
 }
 
-fn parse_refs(params: &QueryMultiMap) -> Vec<String> {
+pub(crate) fn parse_refs(params: &QueryMultiMap) -> Vec<String> {
     // Spec: ref[] repeated keys
     // Convenience: ref=REF1,REF2,REF3 (CSV)
     let mut refs: Vec<String> = Vec::new();
@@ -531,7 +531,7 @@ fn parse_refs(params: &QueryMultiMap) -> Vec<String> {
     out
 }
 
-fn parse_sets(params: &QueryMultiMap) -> ApiResult<Vec<String>> {
+pub(crate) fn parse_sets(params: &QueryMultiMap) -> ApiResult<Vec<String>> {
     // Spec: set[] repeated keys
     // Convenience: set=CORE,COREKS
     let mut codes: Vec<String> = Vec::new();
@@ -663,7 +663,7 @@ pub(crate) fn parse_cost_predicate(params: &QueryMultiMap, base: &str) -> ApiRes
     Ok(None)
 }
 
-fn parse_cost_relation(params: &QueryMultiMap) -> ApiResult<Option<CostRelation>> {
+pub(crate) fn parse_cost_relation(params: &QueryMultiMap) -> ApiResult<Option<CostRelation>> {
     let Some(raw) = get_first(params, "costRelation") else {
         return Ok(None);
     };
@@ -681,7 +681,7 @@ fn parse_cost_relation(params: &QueryMultiMap) -> ApiResult<Option<CostRelation>
     }
 }
 
-fn parse_sub_types(params: &QueryMultiMap) -> Vec<String> {
+pub(crate) fn parse_sub_types(params: &QueryMultiMap) -> Vec<String> {
     let mut out = Vec::new();
     for key in ["subTypes[]", "subTypes", "cardSubTypes[]", "cardSubTypes"] {
         if let Some(values) = params.get(key) {
@@ -698,7 +698,7 @@ fn parse_sub_types(params: &QueryMultiMap) -> Vec<String> {
     out
 }
 
-fn parse_has_no_effect(params: &QueryMultiMap) -> ApiResult<Option<bool>> {
+pub(crate) fn parse_has_no_effect(params: &QueryMultiMap) -> ApiResult<Option<bool>> {
     let Some(raw) = get_first(params, "hasNoEffect") else {
         return Ok(None);
     };
@@ -768,12 +768,12 @@ pub(crate) fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters
 
     Ok(())
 }
-fn parse_u32(field: &str, s: &str) -> ApiResult<u32> {
+pub(crate) fn parse_u32(field: &str, s: &str) -> ApiResult<u32> {
     s.parse::<u32>()
         .map_err(|_| bad_request(format!("invalid {field} value '{s}'")))
 }
 
-fn parse_usize(field: &str, s: &str) -> ApiResult<usize> {
+pub(crate) fn parse_usize(field: &str, s: &str) -> ApiResult<usize> {
     s.parse::<usize>()
         .map_err(|_| bad_request(format!("invalid {field} value '{s}'")))
 }

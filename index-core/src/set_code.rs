@@ -6,7 +6,14 @@ pub fn set_code(reference: &str) -> Option<&'static str> {
         "BISE" => Some("WFM"),
         "CYCLONE" => Some("SKY"),
         "DUSTER" => Some("SDU"),
+        "DUSTERCB" => Some("SDUCB"),
+        "DUSTEROP" => Some("SDUOP"),
+        "DUSTERTOP" => Some("SDUTOP"),
         "EOLE" => Some("ROC"),
+        "EOLECB" => Some("ROCCB"),
+        "EOLEOP" => Some("ROCOP"),
+        "EOLETOP" => Some("ROCTOP"),
+        "FUGUE" => Some("NEJ"),
         _ => None,
     }
 }

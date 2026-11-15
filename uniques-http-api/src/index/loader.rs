@@ -265,22 +265,35 @@ fn family_set_code<'a>(catalog: &'a Catalog, family: &'a index_core::catalog::Fa
     family.source_set.as_deref().unwrap_or(&catalog.set)
 }
 
-fn set_release_rank(set_ref: &str) -> (usize, &str) {
+pub(crate) fn set_release_rank(set_ref: &str) -> (usize, &str) {
     let rank = match set_ref {
         "CORE" => 0,
         "COREKS" => 1,
         "ALIZE" => 2,
         "BISE" => 3,
-        "CYCLONE" => 4,
-        "DUSTER" => 5,
-        "EOLE" => 6,
-        "FUGUE" => 7,
+        "JUDGE" => 4,
+        "WCQ25" => 5,
+        "WCF25" => 6,
+        "WCS25" => 7,
+        "CYCLONE" => 8,
+        "DUSTER" => 9,
+        "DUSTERCB" => 10,
+        "DUSTEROP" => 11,
+        "DUSTERTOP" => 12,
+        "TCS3" => 13,
+        "MUSUBI" => 14,
+        "EOLE" => 15,
+        "EOLECB" => 16,
+        "EOLEOP" => 17,
+        "EOLETOP" => 18,
+        "FUGUE" => 19,
+        "WCS26" => 20,
         _ => usize::MAX,
     };
     (rank, set_ref)
 }
 
-fn faction_sort_rank(faction: &str) -> (usize, &str) {
+pub(crate) fn faction_sort_rank(faction: &str) -> (usize, &str) {
     let rank = match faction {
         "AX" => 0,
         "BR" => 1,
@@ -288,6 +301,7 @@ fn faction_sort_rank(faction: &str) -> (usize, &str) {
         "MU" => 3,
         "OR" => 4,
         "YZ" => 5,
+        "NE" => 6,
         _ => usize::MAX,
     };
     (rank, faction)
@@ -881,10 +895,23 @@ pub fn load_family_catalog(
 pub fn load_app_state(settings: &Settings) -> Result<AppState> {
     let (index, nonunique, families) = match settings.index.source {
         crate::config::IndexSourceKind::Disk | crate::config::IndexSourceKind::Archive => {
-            let storage = open_index_storage(&settings.index_path()?)?;
+            let index_path = settings.index_path()?;
+            let storage = open_index_storage(&index_path)?;
             let index = load_uniques_index_from(&storage)?;
-            let nonunique = load_nonunique_index(&storage)?;
-            let families = load_family_catalog(&storage)?;
+            let mut nonunique = load_nonunique_index(&storage)?;
+            let mut families = load_family_catalog(&storage)?;
+            if index_path.is_file() {
+                if let Some(parent_dir) = index_path.parent().filter(|p| p.is_dir()) {
+                    if let Ok(disk_storage) = DiskIndexStorage::new(parent_dir) {
+                        if nonunique.is_none() {
+                            nonunique = load_nonunique_index(&disk_storage)?;
+                        }
+                        if families.is_empty() {
+                            families = load_family_catalog(&disk_storage)?;
+                        }
+                    }
+                }
+            }
             (index, nonunique, families)
         }
         crate::config::IndexSourceKind::ObjectStore => {
@@ -899,10 +926,13 @@ pub fn load_app_state(settings: &Settings) -> Result<AppState> {
 
 pub fn build_app_state(
     index: UniquesIndex,
-    nonunique: Option<NonUniqueQueryIndex>,
+    mut nonunique: Option<NonUniqueQueryIndex>,
     families: BTreeMap<i64, index_core::family_catalog::FamilyCatalogEntry>,
     settings: &Settings,
 ) -> AppState {
+    if let Some(ref mut nu) = nonunique {
+        nu.bind_families(&families);
+    }
     let formats = match settings.formats.as_ref().filter(|f| f.is_enabled()) {
         Some(formats_settings) => Arc::new(load_format_index(&index, formats_settings)),
         None => Arc::new(FormatIndex::empty()),

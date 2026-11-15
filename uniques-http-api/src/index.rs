@@ -12,6 +12,6 @@ pub use reload::{spawn_hot_reload, AnyIndexSource, DiskIndexSource, RemoteIndexS
 pub use query::QueryError;
 pub use uniques_index::{CardResolveError, UniquesIndex};
 pub(crate) use query::{
-    build_bitmap, card_v2_from_index, cards_from_indices, combine_effect_bitmaps,
-    effect_slot_bitmap, families_from_bitmap, page_cards_v2_sorted,
+    build_bitmap, card_v2_from_index, cards_from_indices, enrich_unique_card_v2,
+    families_from_bitmap, nonunique_card_v2, page_cards_v2_sorted, subtype_names_from_index,
 };
