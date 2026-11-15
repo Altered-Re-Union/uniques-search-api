@@ -4,6 +4,7 @@ use index_core::build;
 use index_core::decode;
 use index_core::idgd_collapse;
 use index_core::merge;
+use index_core::nonunique;
 use index_core::query;
 use index_core::extra_catalog::ExtraFilterType;
 use crate::bench_query;
@@ -40,11 +41,21 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum BuildSource {
+    /// Crawl Equinox raw JSON under `<root>/json/<SET>/...` (default, current pipeline).
+    Json,
+    /// Read a CardsData checkout's CSVs under `<root>/data/csv/...` (unique prints only for now;
+    /// see `cli-indexer/plans/15-cardsdata-csv-ingestion.md`).
+    Cardsdata,
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Crawl a dataset and write catalog + idGd bitmaps.
     Build {
-        /// Dataset root containing `json/<SET>/...`
+        /// Dataset root. Meaning depends on `--source`: `json/<SET>/...` for `json` (default),
+        /// or a CardsData checkout (`data/csv/...`) for `cardsdata`.
         #[arg(long)]
         root: PathBuf,
         /// Set code (e.g. COREKS, ALIZE, BISE)
@@ -53,15 +64,36 @@ pub enum Command {
         /// Output directory (writes `<out>/<SET>/...`)
         #[arg(long)]
         out: PathBuf,
+        /// Where to read cards from.
+        #[arg(long, value_enum, default_value_t = BuildSource::Json)]
+        source: BuildSource,
         /// Stop discovery and indexing after this many files (for testing).
         #[arg(long)]
         limit: Option<usize>,
         /// Print build phase timings (read, parse, process, write). Also enabled by CLI_INDEXER_PROFILE=1.
+        /// Has no effect with `--source cardsdata` yet.
         #[arg(long)]
         profile: bool,
         /// Collapse idGd entries that share the same element type and effect text (default: true).
         #[arg(long, default_value_t = true)]
         merge_duplicated_abilities: bool,
+    },
+    /// Build a standalone non-unique index from a CardsData checkout (faction, rarity, product,
+    /// serialization, and the 5 stats shared with uniques — see
+    /// `cli-indexer/plans/16-nonunique-index.md`).
+    BuildNonunique {
+        /// CardsData checkout root containing `data/csv/NonUnique/<SET>/...`
+        #[arg(long)]
+        root: PathBuf,
+        /// One set code, or a comma-separated list to combine into one index (e.g.
+        /// `CORE,COREKS,ALIZE`) — writes to `<out>/<SET>/nonunique/` for a single set, or directly
+        /// to `<out>/nonunique/` for multiple (see `build_nonunique_index`'s doc comment).
+        #[arg(long, value_delimiter = ',')]
+        set: Vec<String>,
+        /// Output directory. For a single `--set`, writes `<out>/<SET>/...`; for multiple, `out`'s
+        /// own folder name becomes the combined index's set name.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Decode a global bit index to a card reference.
     Decode {
@@ -203,20 +235,22 @@ pub fn run() -> Result<()> {
             root,
             set,
             out,
+            source,
             limit,
             profile,
             merge_duplicated_abilities,
         } => {
-            let summary = build::build(
-                &root,
-                &set,
-                &out,
-                build::BuildOptions {
-                    file_limit: limit,
-                    profile,
-                    merge_duplicated_abilities,
-                },
-            )?;
+            let build_options = build::BuildOptions {
+                file_limit: limit,
+                profile,
+                merge_duplicated_abilities,
+            };
+            let summary = match source {
+                BuildSource::Json => build::build(&root, &set, &out, build_options)?,
+                BuildSource::Cardsdata => {
+                    build::build_from_cardsdata(&root, &set, &out, build_options)?
+                }
+            };
             let limit_note = match summary.file_limit {
                 Some(n) if summary.stopped_early => format!(" (limit {n})"),
                 Some(n) => format!(" (under limit {n})"),
@@ -230,6 +264,14 @@ pub fn run() -> Result<()> {
                 summary.catalog.families.len(),
                 summary.id_gd_count,
                 summary.catalog.total_bit_span
+            );
+        }
+        Command::BuildNonunique { root, set, out } => {
+            let summary = nonunique::build_nonunique_index(&root, &set, &out)?;
+            println!(
+                "built {}: {} non-unique prints",
+                summary.output_dir.display(),
+                summary.cards_indexed
             );
         }
         Command::Decode { catalog, bit } => {

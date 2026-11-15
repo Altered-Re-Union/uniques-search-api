@@ -67,5 +67,12 @@ pub fn load_app_state_from_http(
 ) -> Result<crate::http::state::AppState> {
     use super::build_app_state;
 
-    Ok(build_app_state(load_uniques_index_from_http(client)?, settings))
+    // Non-unique/family-catalog loading isn't wired for the http source yet (same "not yet"
+    // precedent as hot-reload over http, see config.rs's validate_settings).
+    Ok(build_app_state(
+        load_uniques_index_from_http(client)?,
+        None,
+        Default::default(),
+        settings,
+    ))
 }

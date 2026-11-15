@@ -15,6 +15,10 @@ enabled = false
 # [index.http]
 # url = "https://storage.googleapis.com/taum-reunion-public/index/full_index.tar.zst"
 
+[cards]
+# Maximum size to POST /api/v2/cards (same params as GET, in the body) -- 0 = keep 2MiB default
+max_post_payload_bytes = 0
+
 [collections]
 # Cache maximum size (32 MiB)
 max_memory_bytes = 32_000_000

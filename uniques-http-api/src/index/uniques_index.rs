@@ -14,8 +14,8 @@ use index_core::stat_index::StatField;
 use roaring::RoaringBitmap;
 
 use super::loader::{
-    FamilyLookupIndex, FamilyResolveError, FamilySortIndex, FamilySpanGroup, FactionsSummary,
-    IndexManifest, NameSearchIndex, SetBitmaps, StatsSummary,
+    CollectorNumberLookupIndex, FamilyLookupIndex, FamilyResolveError, FamilySortIndex,
+    FamilySpanGroup, FactionsSummary, IndexManifest, NameSearchIndex, SetBitmaps, StatsSummary,
 };
 
 /// In-memory representation of a loaded index directory.
@@ -37,12 +37,21 @@ pub struct UniquesIndex {
     pub factions: BTreeMap<Faction, RoaringBitmap>,
     pub set_bitmaps: SetBitmaps,
     pub cost_relations: crate::index::loader::CostRelationBitmaps,
-    pub sub_types: BTreeMap<String, RoaringBitmap>,
+    /// Derived at load time from `catalog.json`'s per-family `card_sub_types` (no separate
+    /// bitmap files on disk) — a print can belong to more than one subtype.
+    pub subtype_bitmaps: BTreeMap<String, RoaringBitmap>,
     pub no_effect_bitmap: RoaringBitmap,
+    /// `status/{banned,errated,suspended}.roar` — absent (empty) for an index built before this
+    /// was added, or for a set with none of a given flag.
+    pub banned: RoaringBitmap,
+    pub errated: RoaringBitmap,
+    pub suspended: RoaringBitmap,
     pub name_search_index: NameSearchIndex,
     pub family_lookup_index: FamilyLookupIndex,
     pub family_span_groups: Vec<FamilySpanGroup>,
     pub family_sort_index: FamilySortIndex,
+    /// Uniques only — see `cli-indexer/plans/24-collector-number-ingestion.md`.
+    pub collector_number_lookup_index: CollectorNumberLookupIndex,
     /// Pre-serialized `GET /api/v2/effects` JSON body.
     pub effects_body: Arc<Bytes>,
 }
@@ -118,12 +127,24 @@ impl UniquesIndex {
         &self.cost_relations
     }
 
-    pub fn sub_types(&self) -> &BTreeMap<String, RoaringBitmap> {
-        &self.sub_types
+    pub fn subtype_bitmaps(&self) -> &BTreeMap<String, RoaringBitmap> {
+        &self.subtype_bitmaps
     }
 
     pub fn no_effect_bitmap(&self) -> &RoaringBitmap {
         &self.no_effect_bitmap
+    }
+
+    pub fn banned(&self) -> &RoaringBitmap {
+        &self.banned
+    }
+
+    pub fn errated(&self) -> &RoaringBitmap {
+        &self.errated
+    }
+
+    pub fn suspended(&self) -> &RoaringBitmap {
+        &self.suspended
     }
 
     pub fn name_search_index(&self) -> &NameSearchIndex {
@@ -140,6 +161,10 @@ impl UniquesIndex {
 
     pub fn family_sort_index(&self) -> &FamilySortIndex {
         &self.family_sort_index
+    }
+
+    pub fn collector_number_lookup_index(&self) -> &CollectorNumberLookupIndex {
+        &self.collector_number_lookup_index
     }
 
     pub fn effects_body(&self) -> &Arc<Bytes> {
@@ -172,6 +197,39 @@ impl UniquesIndex {
                             .max_unique_id(&parsed)
                             .unwrap_or(0)
                     ),
+                },
+            })
+    }
+
+    /// Resolves an exact `collectorNumberFormatted` string (`SET-FAMILY-U-UID`, e.g.
+    /// `BTG-011-U-5`) to a `card_index`. Uniques only — see
+    /// `cli-indexer/plans/24-collector-number-ingestion.md`.
+    pub fn resolve_card_index_by_collector_number(&self, s: &str) -> Result<u32, CardResolveError> {
+        let parts: Vec<&str> = s.split('-').collect();
+        let [set_code, family_collector_number, rarity, unique_id_str] = parts.as_slice() else {
+            return Err(CardResolveError::BadRequest {
+                message: format!("invalid collector number '{s}': expected SET-FAMILY-U-UID"),
+            });
+        };
+        if *rarity != "U" {
+            return Err(CardResolveError::BadRequest {
+                message: format!(
+                    "invalid collector number '{s}': expected 'U' rarity marker (uniques only)"
+                ),
+            });
+        }
+        let unique_id: u32 = unique_id_str.parse().map_err(|_| CardResolveError::BadRequest {
+            message: format!("invalid collector number '{s}': non-numeric unique id"),
+        })?;
+
+        self.collector_number_lookup_index
+            .resolve(set_code, family_collector_number, unique_id)
+            .map_err(|e| match e {
+                FamilyResolveError::NotFound => CardResolveError::NotFound {
+                    message: format!("collector number not found: {s}"),
+                },
+                FamilyResolveError::Padding => CardResolveError::NotFound {
+                    message: format!("collector number {s} falls in padding"),
                 },
             })
     }

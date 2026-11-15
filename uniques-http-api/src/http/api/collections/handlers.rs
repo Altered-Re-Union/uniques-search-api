@@ -4,7 +4,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde::Serialize;
 
-use crate::collections::{build_collection_bitmap, parse_refs_body, validate_collection_id};
+use crate::collections::{build_collection_bitmaps, parse_refs_body, validate_collection_id};
 use crate::http::api::error::{bad_request, ApiResult};
 use crate::http::ServerState;
 
@@ -28,8 +28,9 @@ pub async fn post_collection(
 
     let snapshot = server.app.snapshot();
     let index = snapshot.index.as_ref();
-    let (count, bitmap) = build_collection_bitmap(
+    let (count, bitmaps) = build_collection_bitmaps(
         index.catalog(),
+        snapshot.nonunique.as_deref(),
         &refs,
         index.manifest().total_bit_span,
     )
@@ -37,7 +38,7 @@ pub async fn post_collection(
 
     snapshot
         .collections
-        .insert(&collection_id, Arc::new(bitmap));
+        .insert(&collection_id, Arc::new(bitmaps));
 
     Ok(Json(PostCollectionResponse {
         collection: collection_id,

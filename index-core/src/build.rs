@@ -1,5 +1,6 @@
 use crate::bitmap::{BitmapStore, PerLineBitmapStore};
 use crate::card::{effects_from_card, id_gds_per_effect_line, CardJson};
+use crate::cardsdata::CardsDataSet;
 use crate::catalog::{Catalog, CatalogBuilder};
 use crate::compact::{compact_fields_from_card, write_compact_records, CompactCardFields};
 use crate::crawl::{discover_card_files, CardFile, DiscoverOptions};
@@ -9,6 +10,7 @@ use crate::idgd_collapse::apply_build_collapse;
 use crate::profile::{profile_enabled, BuildProfile};
 use crate::progress::{BuildProgress, DiscoveryProgress, WriteProgress};
 use crate::stat_index::{StatIndex, StatIndexBuilder};
+use crate::status_index::StatusFlagsBuilder;
 use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -92,6 +94,7 @@ pub fn build(
     let mut compact_cards: Vec<(u32, CompactCardFields)> = Vec::with_capacity(total_files);
     let mut stat_index = StatIndexBuilder::new();
     let mut faction_index = FactionIndexBuilder::new();
+    let mut status = StatusFlagsBuilder::new();
 
     for file in &files {
         let phases = index_one_card(
@@ -103,6 +106,7 @@ pub fn build(
             &mut compact_cards,
             &mut stat_index,
             &mut faction_index,
+            &mut status,
             profile.as_mut(),
             measure_phases,
         )?;
@@ -144,6 +148,7 @@ pub fn build(
                     compact_cards,
                     stat_index,
                     faction_index,
+                    status,
                 )
             });
             p.write_ns = ns;
@@ -162,6 +167,7 @@ pub fn build(
                 compact_cards,
                 stat_index,
                 faction_index,
+                status,
             )?;
         }
     }
@@ -184,6 +190,116 @@ pub fn build(
     })
 }
 
+/// Build a unique-card index from a [`CardsDataSet`] checkout instead of Equinox JSON.
+///
+/// Per [`cli-indexer/plans/15-cardsdata-csv-ingestion.md`], `cardsdata_root` is a `CardsData`
+/// checkout (`data/csv/...` under it), not the `json/<SET>/...` layout `build()` expects. This
+/// reuses `apply_card_index` / `write_index_outputs` unchanged — only card *loading* differs.
+///
+/// `options.profile` has no effect yet: per-file read/parse timings don't apply to CSV ingestion
+/// (the whole dataset is parsed up front by `CardsDataSet::load`, not per card).
+pub fn build_from_cardsdata(
+    cardsdata_root: &Path,
+    set: &str,
+    out: &Path,
+    options: BuildOptions,
+) -> Result<BuildSummary> {
+    if options.profile {
+        eprintln!(
+            "note: --profile has no effect for --source cardsdata (see build_from_cardsdata doc comment)"
+        );
+    }
+
+    let dataset = CardsDataSet::load(cardsdata_root, set)?;
+    let mut cards = dataset.unique_cards()?;
+
+    let stopped_early = match options.file_limit {
+        Some(limit) if cards.len() > limit => {
+            cards.truncate(limit);
+            true
+        }
+        _ => false,
+    };
+    let total_cards = cards.len();
+
+    let progress = BuildProgress::start(total_cards);
+    let mut catalog_builder = CatalogBuilder::new(set);
+    let mut bitmaps = BitmapStore::new();
+    let mut per_line_bitmaps = PerLineBitmapStore::new();
+    let mut idgd_catalog_builder = IdGdCatalogBuilder::new();
+    let mut compact_cards: Vec<(u32, CompactCardFields)> = Vec::with_capacity(total_cards);
+    let mut stat_index = StatIndexBuilder::new();
+    let mut faction_index = FactionIndexBuilder::new();
+    let mut status = StatusFlagsBuilder::new();
+
+    for (parsed, card) in &cards {
+        let card_index = catalog_builder.on_card(parsed, card)?;
+        apply_card_index(
+            card_index,
+            card,
+            &mut bitmaps,
+            &mut per_line_bitmaps,
+            &mut idgd_catalog_builder,
+            &mut compact_cards,
+            &mut stat_index,
+            &mut faction_index,
+            &mut status,
+        );
+        progress.inc();
+    }
+
+    progress.finish("Indexing complete");
+
+    catalog_builder.finalize_last()?;
+    let catalog = catalog_builder.into_catalog()?;
+
+    if options.merge_duplicated_abilities {
+        apply_build_collapse(
+            &mut bitmaps,
+            &mut per_line_bitmaps,
+            &mut idgd_catalog_builder,
+            &mut compact_cards,
+        );
+    }
+
+    let write_progress = WriteProgress::start();
+    let set_out = out.join(set);
+
+    write_index_outputs(
+        set,
+        cardsdata_root,
+        &set_out,
+        options.file_limit,
+        &catalog,
+        &bitmaps,
+        &per_line_bitmaps,
+        idgd_catalog_builder,
+        compact_cards,
+        stat_index,
+        faction_index,
+        status,
+    )?;
+
+    write_progress.finish();
+
+    // Global (not per-set) family catalog, written alongside this set's own files — see
+    // cli-indexer/plans/23-family-catalog.md. Idempotent with build-nonunique's own write of the
+    // same content to the same path.
+    crate::family_catalog::build_family_catalog(cardsdata_root)?
+        .save(&set_out.join("families.json"))?;
+
+    let id_gd_count = bitmaps.len();
+
+    Ok(BuildSummary {
+        catalog,
+        output_dir: set_out,
+        files_processed: total_cards,
+        id_gd_count,
+        file_limit: options.file_limit,
+        stopped_early,
+    })
+}
+
 /// Per-card phase timings `(read_ns, parse_ns, process_ns)` when `measure_phases` is true.
 fn index_one_card(
     file: &CardFile,
@@ -194,6 +310,7 @@ fn index_one_card(
     compact_cards: &mut Vec<(u32, CompactCardFields)>,
     stat_index: &mut StatIndexBuilder,
     faction_index: &mut FactionIndexBuilder,
+    status: &mut StatusFlagsBuilder,
     mut profile: Option<&mut BuildProfile>,
     measure_phases: bool,
 ) -> Result<Option<(u64, u64, u64)>> {
@@ -214,6 +331,7 @@ fn index_one_card(
             compact_cards,
             stat_index,
             faction_index,
+            status,
         );
     };
 
@@ -248,7 +366,10 @@ fn apply_card_index(
     compact_cards: &mut Vec<(u32, CompactCardFields)>,
     stat_index: &mut StatIndexBuilder,
     faction_index: &mut FactionIndexBuilder,
+    status: &mut StatusFlagsBuilder,
 ) {
+    status.insert(card_index, card);
+
     let occurrences = effects_from_card(card);
     for occ in &occurrences {
         idgd_catalog_builder.record_first(occ);
@@ -278,6 +399,7 @@ fn write_index_outputs(
     compact_cards: Vec<(u32, CompactCardFields)>,
     stat_index: StatIndexBuilder,
     faction_index: FactionIndexBuilder,
+    status: StatusFlagsBuilder,
 ) -> Result<()> {
     let id_gd_dir = set_out.join("id_gd");
     fs_create_dir_all(set_out)?;
@@ -304,6 +426,8 @@ fn write_index_outputs(
     faction_index.write_dir(&set_out.join("factions"))?;
     let factions_summary = faction_index.build_summary(set, catalog.total_cards_indexed());
     FactionIndex::save_summary(&factions_summary, &set_out.join("factions_summary.json"))?;
+
+    status.into_flags().write_dir(&set_out.join("status"))?;
 
     let built_at_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

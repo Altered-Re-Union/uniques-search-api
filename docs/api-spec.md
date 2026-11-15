@@ -14,6 +14,8 @@
 | Yes       | `format`    | string          | `format=standard` | Restrict results to a configured format (see [Format filters](#format-filters)). Only one format per request. If the parameter appears more than once, the **last** value wins. Requires `[formats]` in server config; otherwise any `format=` value returns `400 unknown format '{id}'`. |
 | Yes       | `collection` | string         | `collection=deck1` | Restrict results to a bitmap previously created via `POST /api/v2/collection/{id}` (see `collections` module). AND with other filters. `422 collection_not_loaded` if the id was never created. |
 | Yes       | `ref[]`     | repeated array  | `ref[]=ALT_CORE_B_AX_01_U_1` | Restrict results to an explicit, ad-hoc list of card references given directly in the query string — no `POST /api/v2/collection` round-trip needed. Alias: `ref=REF1,REF2,REF3` (CSV). References are OR'd together, then AND'd with every other active filter (`format`, `collection`, `faction`, etc.), same combination pattern as `collection`. Unknown or malformed references are silently ignored (they just never match) instead of causing an error. |
+| Yes       | `collectorNumber[]` | repeated array | `collectorNumber[]=BTG-011-U-5` | Restrict results to an explicit list of collector numbers (`SET-FAMILY-U-UID`, e.g. `BTG-011-U-5` — the code printed on the physical/digital card, distinct from `ref[]`'s internal reference format). Alias: `collectorNumber=A,B,C` (CSV). Same OR-within/AND-across semantics as `ref[]`; unknown or malformed values are silently ignored. Uniques only. |
+| Yes       | `q`         | string          | `q=Ogun`       | Unified search box: matches if **any** of — case/accent-insensitive substring of the character name (same rule as `name`), exact reference (same rule as `ref[]`), or exact collector number (same rule as `collectorNumber[]`) — succeeds. This is the one filter where "OR within" spans different match *kinds* rather than repeated values of one kind; still AND'd with every other active filter same as `name`/`ref[]`. Independent of and additive to `name`/`ref[]`/`collectorNumber[]`, which keep their own semantics unchanged. Empty/whitespace-only values are ignored (no filter). |
 
 
 ### Format filters
@@ -191,7 +193,8 @@ The response is a JSON object with `iter` (match totals and paging), and `cards`
         de_DE: "...",
         es_ES: "...",
         it_IT: "..."
-      }
+      },
+      collectorNumber: "BTG-011-U-161"
     },
     {
       reference: "ALT_COREKS_B_BR_51_U_3467"
@@ -200,6 +203,35 @@ The response is a JSON object with `iter` (match totals and paging), and `cards`
   ]
 }
 ```
+
+`collectorNumber` is omitted (not `null`) when the loaded index has no collector-number data for that
+family (older index, or a family from the non-JSON-crawl ingestion path — see
+`cli-indexer/plans/24-collector-number-ingestion.md`).
+
+## `POST /api/v2/cards`
+
+Same parameters as `GET /api/v2/cards` above, carried in the request body instead of the query
+string — for callers who'd otherwise hit the query-string size ceiling with a large `ref[]`/
+`collectorNumber[]` list. Not a separate contract: identical response shape, identical semantics,
+identical errors.
+
+|           |                                                   |
+| --------- | ------------------------------------------------- |
+| **Body**  | `application/x-www-form-urlencoded`, i.e. the same bytes that would otherwise follow `?` in the URL (e.g. `ref[]=A&ref[]=B&limit=200`) |
+| **200**   | Same `CardsResponse` as `GET /api/v2/cards` |
+| **400/422** | Same errors as `GET /api/v2/cards` |
+| **413**   | Body exceeds `cards.max_post_payload_bytes` config (`0` = Axum's 2 MiB default) |
+
+Example:
+
+```
+POST /api/v2/cards
+Content-Type: application/x-www-form-urlencoded
+
+ref[]=ALT_CORE_B_AX_01_U_1&ref[]=ALT_CORE_B_AX_01_U_2&limit=200
+```
+
+See [`uniques-http-api/plans/25-post-cards-endpoint.md`](../uniques-http-api/plans/25-post-cards-endpoint.md).
 
 ### With `withFamilies` (first page only)
 
@@ -281,7 +313,8 @@ GET /api/v2/card/ALT_COREKS_B_AX_05_U_161
   "oceanPower": 3,
   "faction": { "code": "AX", "name": "Axiom" },
   "mainEffect": { "en_US": "...", "fr_FR": "..." },
-  "echoEffect": { "en_US": "...", "fr_FR": "..." }
+  "echoEffect": { "en_US": "...", "fr_FR": "..." },
+  "collectorNumber": "BTG-011-U-161"
 }
 ```
 

@@ -123,9 +123,9 @@ function appendFilterParams(
     params.append('set[]', set);
   }
 
-  const name = state.name.trim();
-  if (name) {
-    params.set('name', name);
+  const search = state.search.trim();
+  if (search) {
+    params.set('q', search);
   }
 
   const format = state.format.trim();
@@ -271,29 +271,6 @@ export function buildFilteredEffectsUrl(
 export function getApiBaseUrl(): string {
   const base = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
   return base.replace(/\/$/, '');
-}
-
-export function buildCardByReferencePath(
-  reference: string,
-  options?: { debugBgaTrigram?: boolean },
-): string {
-  const trimmed = reference.trim();
-  const params = new URLSearchParams();
-  if (options?.debugBgaTrigram) {
-    params.set('debug_bga_trigram', '');
-  }
-  const qs = params.toString();
-  const path = `/api/v2/card/${encodeURIComponent(trimmed)}`;
-  return qs ? `${path}?${qs}` : path;
-}
-
-export function buildCardByReferenceUrl(
-  reference: string,
-  options?: { debugBgaTrigram?: boolean },
-): string {
-  const path = buildCardByReferencePath(reference, options);
-  const apiBase = getApiBaseUrl();
-  return apiBase ? `${apiBase}${path}` : path;
 }
 
 export function buildFullUrl(

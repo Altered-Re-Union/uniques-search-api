@@ -16,9 +16,9 @@ use roaring::RoaringBitmap;
 use crate::http::state::AppState;
 use crate::index::UniquesIndex;
 use crate::index::loader::{
-    build_cost_relation_bitmaps, build_family_lookup_index, build_family_span_groups,
-    build_name_search_index, build_no_effect_bitmap, build_set_bitmaps, build_sub_type_bitmaps,
-    FactionsSummary, IndexManifest, StatsSummary, SET_CORE, SET_COREKS,
+    build_collector_number_lookup_index, build_cost_relation_bitmaps, build_family_lookup_index,
+    build_family_span_groups, build_name_search_index, build_no_effect_bitmap, build_set_bitmaps,
+    build_subtype_bitmaps, FactionsSummary, IndexManifest, StatsSummary, SET_CORE, SET_COREKS,
 };
 
 pub(crate) fn test_state() -> AppState {
@@ -48,6 +48,8 @@ pub(crate) fn test_state() -> AppState {
                 name: "Test Set".to_string(),
                 code: Some("BTG".to_string()),
             },
+            card_family_id: Some(1),
+            collector_family_number: Some("011".to_string()),
         }],
         total_bit_span: 10,
     };
@@ -211,6 +213,7 @@ pub(crate) fn test_state() -> AppState {
     let family_lookup_index = build_family_lookup_index(&catalog);
     let family_span_groups = build_family_span_groups(&catalog);
     let family_sort_index = crate::index::loader::build_family_sort_index(&catalog);
+    let collector_number_lookup_index = build_collector_number_lookup_index(&catalog);
 
     let id_gd_aliases = IdGdAliasMap::from_catalog(&idgd_catalog);
 
@@ -237,7 +240,7 @@ pub(crate) fn test_state() -> AppState {
     stats.insert(StatField::OceanPower, ocean_power);
 
     let cost_relations = build_cost_relation_bitmaps(&stats);
-    let sub_types = build_sub_type_bitmaps(&catalog);
+    let subtype_bitmaps = build_subtype_bitmaps(&catalog);
     let no_effect_bitmap =
         build_no_effect_bitmap(&catalog, &cards, &BTreeMap::new(), &id_gd_per_line);
 
@@ -262,12 +265,16 @@ pub(crate) fn test_state() -> AppState {
         },
         set_bitmaps,
         cost_relations,
-        sub_types,
+        subtype_bitmaps,
         no_effect_bitmap,
+        banned: RoaringBitmap::new(),
+        errated: RoaringBitmap::new(),
+        suspended: RoaringBitmap::new(),
         name_search_index,
         family_lookup_index,
         family_span_groups,
         family_sort_index,
+        collector_number_lookup_index,
     };
 
     AppState::new_with_index(index)
@@ -296,6 +303,8 @@ fn family_entry(
             name: source_set.to_string(),
             code: None,
         },
+        card_family_id: None,
+        collector_family_number: None,
     }
 }
 
@@ -323,12 +332,13 @@ pub(crate) fn test_state_with_sets() -> AppState {
     };
 
     let set_bitmaps = build_set_bitmaps(&catalog);
-    let sub_types = build_sub_type_bitmaps(&catalog);
+    let subtype_bitmaps = build_subtype_bitmaps(&catalog);
     let no_effect_bitmap = RoaringBitmap::from_iter(0..15);
     let name_search_index = build_name_search_index(&catalog);
     let family_lookup_index = build_family_lookup_index(&catalog);
     let family_span_groups = build_family_span_groups(&catalog);
     let family_sort_index = crate::index::loader::build_family_sort_index(&catalog);
+    let collector_number_lookup_index = build_collector_number_lookup_index(&catalog);
     assert!(set_bitmaps.by_set.contains_key(SET_CORE));
     assert!(set_bitmaps.by_set.contains_key(SET_COREKS));
     assert!(set_bitmaps.by_set.contains_key("ALIZE"));
@@ -366,12 +376,16 @@ pub(crate) fn test_state_with_sets() -> AppState {
         factions: BTreeMap::new(),
         set_bitmaps,
         cost_relations: Default::default(),
-        sub_types,
+        subtype_bitmaps,
         no_effect_bitmap,
+        banned: RoaringBitmap::new(),
+        errated: RoaringBitmap::new(),
+        suspended: RoaringBitmap::new(),
         name_search_index,
         family_lookup_index,
         family_span_groups,
         family_sort_index,
+        collector_number_lookup_index,
     };
 
     AppState::new_with_index(index)

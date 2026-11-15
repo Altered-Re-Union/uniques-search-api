@@ -260,8 +260,9 @@ mod tests {
 
     use crate::config::{FormatsSettings, FormatsSourceConfig};
     use crate::index::loader::{
-        build_family_lookup_index, build_family_span_groups, build_name_search_index,
-        build_set_bitmaps, FactionsSummary, IndexManifest, StatsSummary, SET_CORE,
+        build_collector_number_lookup_index, build_family_lookup_index, build_family_span_groups,
+        build_name_search_index, build_set_bitmaps, FactionsSummary, IndexManifest, StatsSummary,
+        SET_CORE,
     };
     use crate::index::UniquesIndex;
 
@@ -288,6 +289,8 @@ mod tests {
                     name: String::new(),
                     code: None,
                 },
+                card_family_id: None,
+                collector_family_number: None,
             }],
             total_bit_span: 2,
         };
@@ -332,12 +335,16 @@ mod tests {
             factions: BTreeMap::new(),
             set_bitmaps,
             cost_relations: Default::default(),
-            sub_types: Default::default(),
+            subtype_bitmaps: BTreeMap::new(),
             no_effect_bitmap: Default::default(),
+            banned: RoaringBitmap::new(),
+            errated: RoaringBitmap::new(),
+            suspended: RoaringBitmap::new(),
             name_search_index: build_name_search_index(&catalog),
             family_lookup_index: build_family_lookup_index(&catalog),
             family_span_groups: build_family_span_groups(&catalog),
             family_sort_index: Default::default(),
+            collector_number_lookup_index: build_collector_number_lookup_index(&catalog),
             effects_body: Arc::new(Bytes::from_static(b"[]")),
         }
     }

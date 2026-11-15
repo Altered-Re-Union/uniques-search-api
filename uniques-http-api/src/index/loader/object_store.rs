@@ -187,8 +187,11 @@ pub fn load_app_state_from_object_store(
 ) -> Result<crate::http::state::AppState> {
     use super::build_app_state;
 
+    // Non-unique/family-catalog loading isn't wired for the object_store source yet, same as http.
     Ok(build_app_state(
         load_uniques_index_from_object_store(client)?,
+        None,
+        Default::default(),
         settings,
     ))
 }

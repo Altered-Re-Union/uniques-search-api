@@ -11,6 +11,10 @@ pub struct CardsIter {
     pub total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<u32>,
+    /// Echoes the request's `page` when page-based pagination was used (mutually exclusive with
+    /// `cursor` — see `CardsRequest::page`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +65,11 @@ pub struct CardV2 {
     pub faction: CardFaction,
     pub main_effect: BTreeMap<String, String>,
     pub echo_effect: BTreeMap<String, String>,
+    /// `SET-FAMILY-U-UID` (e.g. `BTG-011-U-5`) — `None` when the family lacks either `set.code` or
+    /// `collector_family_number` (older index, or a family from the deferred `cardsdata.rs` path).
+    /// Uniques only — see `cli-indexer/plans/24-collector-number-ingestion.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collector_number: Option<String>,
     #[serde(rename = "debug_bga_trigram", skip_serializing_if = "Option::is_none")]
     pub debug_bga_trigram: Option<String>,
 }
@@ -195,11 +204,15 @@ pub struct CardsSort {
 pub struct CardsRequest {
     pub limit: usize,
     pub cursor: Option<u32>,
+    /// 1-indexed direct page access (via bitmap rank/select), mutually exclusive with `cursor`.
+    /// See `uniques-http-api/plans/20-page-pagination.md`.
+    pub page: Option<u32>,
     pub sort: Option<CardsSort>,
     pub filters: AbilityFilters,
     pub factions: Vec<Faction>,
     pub sets: Vec<String>,
     pub refs: Vec<String>,
+    pub collector_numbers: Vec<String>,
     pub main_cost: Option<CostPredicate>,
     pub recall_cost: Option<CostPredicate>,
     pub forest_power: Option<CostPredicate>,
@@ -209,6 +222,9 @@ pub struct CardsRequest {
     pub cost_relation: Option<CostRelation>,
     pub sub_types: Vec<String>,
     pub has_no_effect: Option<bool>,
+    /// Unified search box: OR across name substring, exact reference, exact collector number.
+    /// Independent of `name`/`refs`/`collector_numbers`, which keep their own AND semantics.
+    pub q: Option<String>,
     pub debug_bga_trigram: bool,
     pub with_families: bool,
     pub format: Option<String>,

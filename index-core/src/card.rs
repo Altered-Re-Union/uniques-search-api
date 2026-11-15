@@ -29,6 +29,21 @@ pub struct CardJson {
     pub main_faction: Option<MainFaction>,
     #[serde(default)]
     pub card_elements: Vec<CardElement>,
+    #[serde(default)]
+    pub is_banned: bool,
+    #[serde(default)]
+    pub is_errated: bool,
+    #[serde(default)]
+    pub is_suspended: bool,
+    /// CardsData's canonical `CardFamilyId` — `None` on the original Equinox JSON-crawl path
+    /// (which has no CardsData id to offer), `Some` when sourced via `cardsdata.rs`.
+    #[serde(default)]
+    pub card_family_id: Option<i64>,
+    /// Raw `collectorNumberFormatted` (e.g. `"BTG-011-U-5"`) — `Some` on the JSON-crawl path (the
+    /// key is already present in raw Equinox card JSON); `None` on the `cardsdata.rs` path until
+    /// that ingestion is wired (see `cli-indexer/plans/24-collector-number-ingestion.md`).
+    #[serde(default)]
+    pub collector_number_formatted: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,6 +326,22 @@ mod tests {
     }
 
     #[test]
+    fn family_collector_number_from_fixtures() {
+        let cases = [
+            ("ALT_COREKS_B_AX_06_U_5.json", "011"),
+            ("ALT_COREKS_B_MU_22_U_3140.json", "113"),
+            ("ALT_COREKS_B_OR_16_U_6.json", "134"),
+        ];
+        for (file, expected) in cases {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/card-json")
+                .join(file);
+            let card = load_card(&path, None).unwrap();
+            assert_eq!(family_collector_number(&card).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
     fn id_gds_per_effect_line_reads_all_nodes_on_each_display() {
         let json = r#"{
             "cardElements": [{
@@ -397,6 +428,17 @@ pub fn family_card_sub_types(card: &CardJson) -> Vec<FamilyCardSubType> {
         .collect()
 }
 
+/// Family-invariant collector number segment (e.g. `"011"` from `"BTG-011-U-5"`).
+///
+/// `collectorNumberFormatted` is `{setCode}-{familyCollectorNumber}-U-{uniqueId}` for uniques —
+/// only the second segment is new information (`setCode` and `uniqueId` are already derivable
+/// elsewhere), and it's constant across every print in a family. See
+/// `cli-indexer/plans/24-collector-number-ingestion.md`.
+pub fn family_collector_number(card: &CardJson) -> Option<String> {
+    let raw = card.collector_number_formatted.as_deref()?;
+    raw.split('-').nth(1).map(str::to_string)
+}
+
 /// Set metadata for catalog / API.
 pub fn family_set(card: &CardJson) -> FamilySet {
     let reference = card
@@ -424,6 +466,8 @@ pub fn family_metadata_from_card(card: &CardJson) -> crate::catalog::FamilyMetad
         artist: family_artist(card),
         card_sub_types: family_card_sub_types(card),
         set: family_set(card),
+        card_family_id: card.card_family_id,
+        collector_family_number: family_collector_number(card),
     }
 }
 

@@ -31,6 +31,19 @@ pub fn faction_code_from_reference(reference: &str) -> u8 {
     }
 }
 
+/// Inverse of [`faction_code_from_reference`].
+pub fn faction_reference_from_code(code: u8) -> Option<&'static str> {
+    match code {
+        1 => Some("AX"),
+        2 => Some("BR"),
+        3 => Some("LY"),
+        4 => Some("MU"),
+        5 => Some("OR"),
+        6 => Some("YZ"),
+        _ => None,
+    }
+}
+
 /// Extract compact fields from an already-parsed card.
 pub fn compact_fields_from_card(card: &CardJson) -> CompactCardFields {
     // Faction: mainFaction.reference only (not path faction).
