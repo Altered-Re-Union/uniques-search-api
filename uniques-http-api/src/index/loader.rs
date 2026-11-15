@@ -478,6 +478,100 @@ pub fn build_name_search_index(catalog: &Catalog) -> NameSearchIndex {
     NameSearchIndex { by_family }
 }
 
+/// Precomputed bitmaps comparing `MainCost` and `RecallCost` (`stats[MainCost]` vs `stats[RecallCost]`).
+#[derive(Debug, Clone, Default)]
+pub struct CostRelationBitmaps {
+    pub equal: RoaringBitmap,
+    pub main_higher: RoaringBitmap,
+    pub recall_higher: RoaringBitmap,
+}
+
+/// Build cost-relation bitmaps from the 16-bucket stat bitmaps without scanning `cards.bin`.
+pub fn build_cost_relation_bitmaps(
+    stats: &BTreeMap<StatField, [RoaringBitmap; 16]>,
+) -> CostRelationBitmaps {
+    let (Some(main_by_cost), Some(recall_by_cost)) = (
+        stats.get(&StatField::MainCost),
+        stats.get(&StatField::RecallCost),
+    ) else {
+        return CostRelationBitmaps::default();
+    };
+
+    let mut out = CostRelationBitmaps::default();
+    let mut recall_lt = RoaringBitmap::new();
+    for m in 0..16 {
+        let main_bm = &main_by_cost[m];
+        if !main_bm.is_empty() {
+            if !recall_by_cost[m].is_empty() {
+                out.equal |= main_bm & &recall_by_cost[m];
+            }
+            if !recall_lt.is_empty() {
+                out.main_higher |= main_bm & &recall_lt;
+            }
+        }
+        recall_lt |= &recall_by_cost[m];
+    }
+
+    let mut main_lt = RoaringBitmap::new();
+    for r in 0..16 {
+        let recall_bm = &recall_by_cost[r];
+        if !recall_bm.is_empty() && !main_lt.is_empty() {
+            out.recall_higher |= recall_bm & &main_lt;
+        }
+        main_lt |= &main_by_cost[r];
+    }
+
+    out
+}
+
+/// Build per-subtype bitmaps from catalog families' `card_sub_types` (uppercased keys).
+pub fn build_sub_type_bitmaps(catalog: &Catalog) -> BTreeMap<String, RoaringBitmap> {
+    let mut by_sub_type: BTreeMap<String, RoaringBitmap> = BTreeMap::new();
+    for family in &catalog.families {
+        if family.card_sub_types.is_empty() || family.max_unique_id == 0 {
+            continue;
+        }
+        let start = family.start_bit;
+        let end = family.start_bit + family.max_unique_id;
+        for sub_type in &family.card_sub_types {
+            let key = sub_type.reference.trim().to_ascii_uppercase();
+            if key.is_empty() {
+                continue;
+            }
+            by_sub_type.entry(key).or_default().insert_range(start..end);
+        }
+    }
+    by_sub_type
+}
+
+/// Build bitmap of cards with zero effects across `id_gd_whole`, `id_gd_per_line`, and `cards.bin`.
+pub fn build_no_effect_bitmap(
+    catalog: &Catalog,
+    cards: &[u8],
+    id_gd_whole: &BTreeMap<u32, RoaringBitmap>,
+    id_gd_per_line: &BTreeMap<(u32, EffectLine), RoaringBitmap>,
+) -> RoaringBitmap {
+    let mut all_cards = RoaringBitmap::new();
+    for family in &catalog.families {
+        all_cards.insert_range(family.start_bit..family.start_bit + family.max_unique_id);
+    }
+
+    let mut has_effect = RoaringBitmap::new();
+    for bm in id_gd_whole.values() {
+        has_effect |= bm;
+    }
+    for bm in id_gd_per_line.values() {
+        has_effect |= bm;
+    }
+    for (idx, rec) in cards.chunks_exact(RECORD_SIZE).enumerate() {
+        if rec.len() > 6 && rec[6..].iter().any(|&b| b != 0) {
+            has_effect.insert(idx as u32);
+        }
+    }
+
+    all_cards - has_effect
+}
+
 pub enum AnyIndexStorage {
     Disk(DiskIndexStorage),
     Archive(TarZstIndexStorage),
@@ -612,6 +706,15 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
 
     let family_sort_index = build_family_sort_index(&catalog);
 
+    let cost_relations = build_cost_relation_bitmaps(&stats);
+    let sub_types = build_sub_type_bitmaps(&catalog);
+    let no_effect_bitmap = build_no_effect_bitmap(&catalog, &cards, &id_gd_whole, &id_gd_per_line);
+    eprintln!(
+        "  derived bitmaps: {} sub_types, {} no_effect cards",
+        sub_types.len(),
+        no_effect_bitmap.len()
+    );
+
     let id_gd_aliases = IdGdAliasMap::from_catalog(&idgd_catalog);
 
     let effects_list = build_effects_list(&idgd_catalog);
@@ -640,6 +743,9 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
         stats,
         factions,
         set_bitmaps,
+        cost_relations,
+        sub_types,
+        no_effect_bitmap,
         name_search_index,
         family_lookup_index,
         family_span_groups,

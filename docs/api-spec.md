@@ -9,6 +9,7 @@
 | --------- | ----------- | --------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Yes       | `set[]`     | repeated array  | `set[]=CORE`   | Filter by one or more source set codes (e.g. `CORE`, `COREKS`). Alias: `set=CORE,COREKS` (CSV). OR within listed sets; AND with other filters.                                                                                           |
 | Yes       | `faction[]` | repeated array  | `faction[]=AX` | Filter by one or more faction codes.                                                                                                                                                                                                     |
+| Yes       | `subTypes[]` | repeated array | `subTypes[]=ELEMENTAL` | Filter by one or more card subtype codes (`cardSubTypes[].reference`), OR-combined (AND with other filters). Aliases: `subTypes` (CSV), `cardSubTypes[]`, `cardSubTypes`. Unknown subtypes match 0 cards.                              |
 | Yes       | `name`      | string          | `name=Kelon`   | Case-insensitive substring match on character name (any locale). Accented characters match unaccented queries (e.g. `elementaire` matches `Élémentaire`, `boshi` matches `Issun-bōshi`). Whitespace-only values are ignored (no filter). |
 | Yes       | `format`    | string          | `format=standard` | Restrict results to a configured format (see [Format filters](#format-filters)). Only one format per request. If the parameter appears more than once, the **last** value wins. Requires `[formats]` in server config; otherwise any `format=` value returns `400 unknown format '{id}'`. |
 | Yes       | `collection` | string         | `collection=deck1` | Restrict results to a bitmap previously created via `POST /api/v2/collection/{id}` (see `collections` module). AND with other filters. `422 collection_not_loaded` if the id was never created. |
@@ -94,8 +95,9 @@ to `manifest.json`). `FORMATS_PATH` env overrides `formats.source.path` (disk so
 | Supported | Parameter                                                           | Type / Encoding         | Example                         | Meaning                                  |
 | --------- | ------------------------------------------------------------------- | ----------------------- | ------------------------------- | ---------------------------------------- |
 | Yes       | `mainCost`                                                          | exact integer           | `mainCost=3`                    | Exact main cost.                         |
-| Yes       | `mainCost[gt]` / `mainCost[gte]` / `mainCost[lt]` / `mainCost[lte]` | ranged integer          | `mainCost[gte]=3`               | Main cost greater/less than comparisons. |
+| Yes       | `mainCost[gt]` / `mainCost[gte]` / `mainCost[lt]` / `mainCost[lte]` | ranged integer          | `mainCost[gte]=3&mainCost[lte]=5` | Main cost greater/less than comparisons (multiple bounds are ANDed). |
 | Yes       | `mainCost[]`                                                        | repeated array          | `mainCost[]=2&mainCost[]=3`     | Match any of several exact values.       |
+| Yes       | `costRelation`                                                      | enum                    | `costRelation=mainHigher`       | Compare hand and recall costs (`equal`/`eq`, `mainHigher`/`main_gt`, `recallHigher`/`recall_gt`). |
 | Yes       | `recallCost` / `recallCost[...]` / `recallCost[]`                   | integer or ranged/array | `recallCost[lte]=1`             | Recall cost filter.                      |
 | Yes       | `oceanPower` / `oceanPower[...]` / `oceanPower[]`                   | integer or ranged/array | `oceanPower[]=0&oceanPower[]=1` | Ocean power filter.                      |
 | Yes       | `mountainPower` / `mountainPower[...]` / `mountainPower[]`          | integer or ranged/array | `mountainPower[gt]=5`           | Mountain power filter.                   |
@@ -118,6 +120,7 @@ to `manifest.json`). `FORMATS_PATH` env overrides `formats.source.path` (disk so
 | Yes       | `support[t]`   | integer id or comma-separated list | `support[t]=24`   | Ability trigger idGd for support effect.   |
 | Yes       | `support[c]`   | integer id or comma-separated list | `support[c]=191`  | Ability condition idGd for support effect. |
 | Yes       | `support[o]`   | integer id or comma-separated list | `support[o]=90`   | Ability output idGd for support effect.    |
+| Yes       | `hasNoEffect`  | boolean                            | `hasNoEffect=true` | `true` for cards with no effects (`false` for cards with at least one effect). |
 
 
 If multiple values are specified for a trigger, condition or output, a predicate is created that matches ANY of these values (OR).

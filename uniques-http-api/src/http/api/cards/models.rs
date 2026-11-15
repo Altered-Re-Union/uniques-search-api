@@ -144,7 +144,7 @@ pub(crate) struct AbilityFilters {
     pub(crate) support_o: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompareOp {
     Gt,
     Gte,
@@ -152,11 +152,18 @@ pub(crate) enum CompareOp {
     Lte,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CostRelation {
+    Equal,
+    MainHigher,
+    RecallHigher,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum CostPredicate {
     Exact(u8),
     AnyOf(Vec<u8>),
-    Range { op: CompareOp, value: u8 },
+    RangeBounds(Vec<(CompareOp, u8)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +206,9 @@ pub struct CardsRequest {
     pub mountain_power: Option<CostPredicate>,
     pub ocean_power: Option<CostPredicate>,
     pub name: Option<String>,
+    pub cost_relation: Option<CostRelation>,
+    pub sub_types: Vec<String>,
+    pub has_no_effect: Option<bool>,
     pub debug_bga_trigram: bool,
     pub with_families: bool,
     pub format: Option<String>,

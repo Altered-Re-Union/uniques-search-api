@@ -232,3 +232,16 @@ async fn wrong_type_co_constraint_is_bad_request() {
     let (status, _) = call(test_server(), "effect%5B0%5D%5Bt%5D=3&editing=output:0").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn has_no_effect_filters_effect_suggestions() {
+    let (status_true, body_true) =
+        call(test_server(), "hasNoEffect=true&editing=trigger:0").await;
+    assert_eq!(status_true, 200);
+    assert!(ids(&body_true).is_empty());
+
+    let (status_false, body_false) =
+        call(test_server(), "hasNoEffect=false&editing=trigger:0").await;
+    assert_eq!(status_false, 200);
+    assert_eq!(ids(&body_false), vec![1, 7]);
+}

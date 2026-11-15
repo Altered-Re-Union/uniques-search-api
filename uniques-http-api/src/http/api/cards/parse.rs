@@ -10,8 +10,8 @@ use crate::http::api::error::{bad_request, collection_not_loaded, internal_serve
 use crate::collections::validate_collection_id;
 use crate::index::UniquesIndex;
 use super::models::{
-    AbilityFilters, CardsRequest, CardsSort, CompareOp, CostPredicate, EffectCombineMode,
-    EffectSlotFilter, IdGdSelector, SortDir, SortField,
+    AbilityFilters, CardsRequest, CardsSort, CompareOp, CostPredicate, CostRelation,
+    EffectCombineMode, EffectSlotFilter, IdGdSelector, SortDir, SortField,
 };
 
 
@@ -160,6 +160,9 @@ pub(crate) fn parse_request(
     let mountain_power = parse_cost_predicate(params, "mountainPower")?;
     let ocean_power = parse_cost_predicate(params, "oceanPower")?;
     let name = parse_name(params);
+    let cost_relation = parse_cost_relation(params)?;
+    let sub_types = parse_sub_types(params);
+    let has_no_effect = parse_has_no_effect(params)?;
     let sort = parse_sort(params)?;
     let debug_bga_trigram = params.contains_key("debug_bga_trigram");
     let with_families = params.contains_key("withFamilies");
@@ -183,6 +186,9 @@ pub(crate) fn parse_request(
         mountain_power,
         ocean_power,
         name,
+        cost_relation,
+        sub_types,
+        has_no_effect,
         debug_bga_trigram,
         with_families,
         format,
@@ -571,6 +577,7 @@ fn parse_cost_predicate(params: &QueryMultiMap, base: &str) -> ApiResult<Option<
         return Ok(Some(CostPredicate::AnyOf(values)));
     }
 
+    let mut bounds = Vec::new();
     for (key, op) in [
         (&gt_key, CompareOp::Gt),
         (&gte_key, CompareOp::Gte),
@@ -582,14 +589,66 @@ fn parse_cost_predicate(params: &QueryMultiMap, base: &str) -> ApiResult<Option<
             if v.is_empty() {
                 continue;
             }
-            return Ok(Some(CostPredicate::Range {
-                op,
-                value: parse_cost_u8(key, v)?,
-            }));
+            bounds.push((op, parse_cost_u8(key, v)?));
         }
+    }
+    if !bounds.is_empty() {
+        return Ok(Some(CostPredicate::RangeBounds(bounds)));
     }
 
     Ok(None)
+}
+
+fn parse_cost_relation(params: &QueryMultiMap) -> ApiResult<Option<CostRelation>> {
+    let Some(raw) = get_first(params, "costRelation") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "equal" | "eq" => Ok(Some(CostRelation::Equal)),
+        "mainhigher" | "main_higher" | "main_gt" => Ok(Some(CostRelation::MainHigher)),
+        "recallhigher" | "recall_higher" | "recall_gt" => Ok(Some(CostRelation::RecallHigher)),
+        _ => Err(bad_request(format!(
+            "invalid parameter 'costRelation': expected equal|eq, mainHigher|main_gt, or recallHigher|recall_gt, got '{trimmed}'"
+        ))),
+    }
+}
+
+fn parse_sub_types(params: &QueryMultiMap) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["subTypes[]", "subTypes", "cardSubTypes[]", "cardSubTypes"] {
+        if let Some(values) = params.get(key) {
+            for raw in values {
+                for part in raw.split(',') {
+                    let normalized = part.trim().to_ascii_uppercase();
+                    if !normalized.is_empty() && !out.contains(&normalized) {
+                        out.push(normalized);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn parse_has_no_effect(params: &QueryMultiMap) -> ApiResult<Option<bool>> {
+    let Some(raw) = get_first(params, "hasNoEffect") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(Some(true)),
+        "false" | "0" => Ok(Some(false)),
+        _ => Err(bad_request(format!(
+            "invalid parameter 'hasNoEffect': expected true or false, got '{trimmed}'"
+        ))),
+    }
 }
 
 fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters) -> ApiResult<()> {
@@ -803,7 +862,17 @@ mod tests {
         p3.insert("recallCost[lte]".to_string(), vec!["3".to_string()]);
         p3.insert("effect[0][t]".to_string(), vec!["24".to_string()]);
         let r3 = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &p3).unwrap();
-        assert!(matches!(r3.recall_cost, Some(CostPredicate::Range { .. })));
+        assert!(matches!(r3.recall_cost, Some(CostPredicate::RangeBounds(_))));
+
+        // multi-bound range
+        let mut p3b: QueryMultiMap = HashMap::new();
+        p3b.insert("mainCost[gte]".to_string(), vec!["2".to_string()]);
+        p3b.insert("mainCost[lte]".to_string(), vec!["4".to_string()]);
+        let r3b = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &p3b).unwrap();
+        match r3b.main_cost {
+            Some(CostPredicate::RangeBounds(bounds)) => assert_eq!(bounds.len(), 2),
+            other => panic!("expected RangeBounds, got {other:?}"),
+        }
 
         // reject mixing
         let mut p4: QueryMultiMap = HashMap::new();
@@ -1051,6 +1120,76 @@ mod tests {
         let mut bad_dir: QueryMultiMap = HashMap::new();
         bad_dir.insert("sort".to_string(), vec!["mainCost:sideways".to_string()]);
         assert_eq!(parse_sort(&bad_dir).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn parse_cost_relation_sub_types_and_has_no_effect() {
+        let state = test_state();
+        let mut params: QueryMultiMap = HashMap::new();
+        params.insert("costRelation".to_string(), vec!["mainHigher".to_string()]);
+        params.insert(
+            "subTypes[]".to_string(),
+            vec!["engineer".to_string(), "SPIRIT,dragon".to_string()],
+        );
+        params.insert("hasNoEffect".to_string(), vec!["true".to_string()]);
+
+        let req = parse_request(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            false,
+            &state.snapshot().collections,
+            &params,
+        )
+        .unwrap();
+        assert_eq!(req.cost_relation, Some(CostRelation::MainHigher));
+        assert_eq!(req.sub_types, vec!["ENGINEER", "SPIRIT", "DRAGON"]);
+        assert_eq!(req.has_no_effect, Some(true));
+
+        let mut alias: QueryMultiMap = HashMap::new();
+        alias.insert("costRelation".to_string(), vec!["recall_gt".to_string()]);
+        alias.insert("cardSubTypes".to_string(), vec!["robot".to_string()]);
+        alias.insert("hasNoEffect".to_string(), vec!["false".to_string()]);
+        let req2 = parse_request(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            false,
+            &state.snapshot().collections,
+            &alias,
+        )
+        .unwrap();
+        assert_eq!(req2.cost_relation, Some(CostRelation::RecallHigher));
+        assert_eq!(req2.sub_types, vec!["ROBOT"]);
+        assert_eq!(req2.has_no_effect, Some(false));
+
+        let mut bad_rel: QueryMultiMap = HashMap::new();
+        bad_rel.insert("costRelation".to_string(), vec!["nope".to_string()]);
+        assert_eq!(
+            parse_request(
+                state.index().as_ref(),
+                state.formats().as_ref(),
+                false,
+                &state.snapshot().collections,
+                &bad_rel,
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut bad_no_fx: QueryMultiMap = HashMap::new();
+        bad_no_fx.insert("hasNoEffect".to_string(), vec!["maybe".to_string()]);
+        assert_eq!(
+            parse_request(
+                state.index().as_ref(),
+                state.formats().as_ref(),
+                false,
+                &state.snapshot().collections,
+                &bad_no_fx,
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_REQUEST
+        );
     }
 }
 

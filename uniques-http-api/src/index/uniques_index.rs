@@ -36,6 +36,9 @@ pub struct UniquesIndex {
     pub stats: BTreeMap<StatField, [RoaringBitmap; 16]>,
     pub factions: BTreeMap<Faction, RoaringBitmap>,
     pub set_bitmaps: SetBitmaps,
+    pub cost_relations: crate::index::loader::CostRelationBitmaps,
+    pub sub_types: BTreeMap<String, RoaringBitmap>,
+    pub no_effect_bitmap: RoaringBitmap,
     pub name_search_index: NameSearchIndex,
     pub family_lookup_index: FamilyLookupIndex,
     pub family_span_groups: Vec<FamilySpanGroup>,
@@ -109,6 +112,18 @@ impl UniquesIndex {
 
     pub fn set_bitmaps(&self) -> &SetBitmaps {
         &self.set_bitmaps
+    }
+
+    pub fn cost_relations(&self) -> &crate::index::loader::CostRelationBitmaps {
+        &self.cost_relations
+    }
+
+    pub fn sub_types(&self) -> &BTreeMap<String, RoaringBitmap> {
+        &self.sub_types
+    }
+
+    pub fn no_effect_bitmap(&self) -> &RoaringBitmap {
+        &self.no_effect_bitmap
     }
 
     pub fn name_search_index(&self) -> &NameSearchIndex {

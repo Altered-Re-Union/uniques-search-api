@@ -14,7 +14,7 @@ use crate::index::loader::{FamilySpanRange, SetBitmaps, SET_CORE, SET_COREKS};
 use super::error::{QueryError, QueryResult};
 use crate::http::api::cards::models::{
     CardFaction, CardSetV2, CardSubTypeV2, CardV2, CardsRequest, CardsSort, CompareOp,
-    CostPredicate, EffectCombineMode, FamilyMatchV2, SortDir, SortField,
+    CostPredicate, CostRelation, EffectCombineMode, FamilyMatchV2, SortDir, SortField,
 };
 
 fn union_requested_sets(bitmaps: &SetBitmaps, sets: &[String]) -> RoaringBitmap {
@@ -151,6 +151,34 @@ pub(crate) fn build_bitmap(
         groups.push(state.name_search_index().bitmap_for_contains(state.catalog(), name));
     }
 
+    if let Some(rel) = req.cost_relation {
+        let bmp = match rel {
+            CostRelation::Equal => &state.cost_relations().equal,
+            CostRelation::MainHigher => &state.cost_relations().main_higher,
+            CostRelation::RecallHigher => &state.cost_relations().recall_higher,
+        };
+        groups.push(bmp.clone());
+    }
+
+    if !req.sub_types.is_empty() {
+        let mut combined = RoaringBitmap::new();
+        for st in &req.sub_types {
+            if let Some(bmp) = state.sub_types().get(st) {
+                combined |= bmp;
+            }
+        }
+        groups.push(combined);
+    }
+
+    let mut no_effect_exclude: Option<&RoaringBitmap> = None;
+    if let Some(has_no_effect) = req.has_no_effect {
+        if has_no_effect {
+            groups.push(state.no_effect_bitmap().clone());
+        } else {
+            no_effect_exclude = Some(state.no_effect_bitmap());
+        }
+    }
+
     let mut format_exclude: Option<RoaringBitmap> = None;
     if let Some(id) = &req.format {
         if let Some(loaded) = format_index.get(id) {
@@ -181,6 +209,9 @@ pub(crate) fn build_bitmap(
     };
     for bmp in it {
         out &= bmp;
+    }
+    if let Some(exclude) = no_effect_exclude {
+        out -= exclude;
     }
     if let Some(exclude) = format_exclude {
         out -= exclude;
@@ -218,14 +249,14 @@ fn bitmap_for_cost_predicate(
                 out |= buckets[v as usize].clone();
             }
         }
-        CostPredicate::Range { op, value } => {
+        CostPredicate::RangeBounds(bounds) => {
             for v in 0u8..=15u8 {
-                let keep = match op {
+                let keep = bounds.iter().all(|(op, value)| match op {
                     CompareOp::Gt => v > *value,
                     CompareOp::Gte => v >= *value,
                     CompareOp::Lt => v < *value,
                     CompareOp::Lte => v <= *value,
-                };
+                });
                 if keep {
                     out |= buckets[v as usize].clone();
                 }
@@ -1519,5 +1550,135 @@ mod tests {
         let (pr, _) = page_cards_v2_sorted(state.index().as_ref(), &bmp, None, 2, Some(&ref_desc), false).unwrap();
         assert_eq!(pr[0].reference, "ALT_COREKS_B_AX_01_U_1");
         assert_eq!(pr[1].reference, "ALT_CORE_B_AX_01_U_1");
+    }
+
+    #[test]
+    fn build_bitmap_supports_cost_relation_sub_types_has_no_effect_and_multi_range() {
+        let state = test_state();
+
+        // costRelation=recallHigher: in test_state, idx 5 has MainCost=2, RecallCost=3.
+        let mut p_recall = HashMap::new();
+        p_recall.insert("costRelation".to_string(), vec!["recallHigher".to_string()]);
+        let req_recall = parse_request(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            false,
+            &state.snapshot().collections,
+            &p_recall,
+        )
+        .unwrap();
+        let bmp_recall = build_bitmap(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            &state.snapshot().collections,
+            &req_recall,
+        )
+        .unwrap();
+        assert_eq!(bmp_recall.iter().collect::<Vec<_>>(), vec![5]);
+
+        // subTypes[]=engineer matches catalog family 0..10; unknown subtype returns empty (not 400).
+        let mut p_sub = HashMap::new();
+        p_sub.insert("subTypes[]".to_string(), vec!["engineer".to_string()]);
+        let req_sub = parse_request(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            false,
+            &state.snapshot().collections,
+            &p_sub,
+        )
+        .unwrap();
+        let bmp_sub = build_bitmap(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            &state.snapshot().collections,
+            &req_sub,
+        )
+        .unwrap();
+        assert_eq!(bmp_sub.len(), 10);
+
+        let mut p_unknown_sub = HashMap::new();
+        p_unknown_sub.insert("subTypes[]".to_string(), vec!["SONG".to_string()]);
+        let req_unknown_sub = parse_request(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            false,
+            &state.snapshot().collections,
+            &p_unknown_sub,
+        )
+        .unwrap();
+        let bmp_unknown_sub = build_bitmap(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            &state.snapshot().collections,
+            &req_unknown_sub,
+        )
+        .unwrap();
+        assert!(bmp_unknown_sub.is_empty());
+
+        // Multi-bound range on forestPower: in test_state, idx 2 => 1, idx 5 => 4.
+        let mut p_range = HashMap::new();
+        p_range.insert("forestPower[gte]".to_string(), vec!["2".to_string()]);
+        p_range.insert("forestPower[lte]".to_string(), vec!["4".to_string()]);
+        let req_range = parse_request(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            false,
+            &state.snapshot().collections,
+            &p_range,
+        )
+        .unwrap();
+        let bmp_range = build_bitmap(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            &state.snapshot().collections,
+            &req_range,
+        )
+        .unwrap();
+        assert_eq!(bmp_range.iter().collect::<Vec<_>>(), vec![5]);
+
+        // hasNoEffect=true / hasNoEffect=false: in test_state, idx 2, 5, 7 have effects; others do not.
+        let mut p_no_fx = HashMap::new();
+        p_no_fx.insert("hasNoEffect".to_string(), vec!["true".to_string()]);
+        let req_no_fx = parse_request(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            false,
+            &state.snapshot().collections,
+            &p_no_fx,
+        )
+        .unwrap();
+        let bmp_no_fx = build_bitmap(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            &state.snapshot().collections,
+            &req_no_fx,
+        )
+        .unwrap();
+        assert!(!bmp_no_fx.contains(2));
+        assert!(!bmp_no_fx.contains(5));
+        assert!(!bmp_no_fx.contains(7));
+        assert!(bmp_no_fx.contains(0));
+
+        let mut p_has_fx = HashMap::new();
+        p_has_fx.insert("hasNoEffect".to_string(), vec!["false".to_string()]);
+        let req_has_fx = parse_request(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            false,
+            &state.snapshot().collections,
+            &p_has_fx,
+        )
+        .unwrap();
+        let bmp_has_fx = build_bitmap(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            &state.snapshot().collections,
+            &req_has_fx,
+        )
+        .unwrap();
+        assert!(bmp_has_fx.contains(2));
+        assert!(bmp_has_fx.contains(5));
+        assert!(bmp_has_fx.contains(7));
+        assert!(!bmp_has_fx.contains(0));
     }
 }
