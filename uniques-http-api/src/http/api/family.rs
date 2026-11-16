@@ -79,35 +79,46 @@ async fn get_family(
     let snapshot = server.app.snapshot();
     let catalog_entry: Option<&FamilyCatalogEntry> = snapshot.families.get(&id);
 
-    // A merged multi-set index could in principle have more than one `FamilyEntry` row sharing a
-    // `card_family_id` (e.g. the same character printed in two sets) — today's single-set-at-a-
-    // time deployments never do, so the first match is taken; revisit once non-unique gets its own
-    // multi-set merge story (plan 16/D16's `edition` caveat applies here too).
-    let unique_family = snapshot
+    // A merged multi-set index can have multiple `FamilyEntry` rows sharing a `card_family_id`
+    // (e.g. CORE and COREKS editions of the same family); aggregate prints across all of them and
+    // filter out unindexed/gap slots inside each family span.
+    let matching_families: Vec<_> = snapshot
         .index
         .catalog()
         .families
         .iter()
-        .find(|f| f.card_family_id == Some(id));
+        .filter(|f| f.card_family_id == Some(id))
+        .collect();
 
-    let unique_print_total = unique_family.map(|f| f.max_unique_id).unwrap_or(0);
-    let unique_prints = unique_family
-        .map(|f| {
-            let set = f
-                .source_set
-                .as_deref()
-                .unwrap_or(&snapshot.index.catalog().set);
-            let start = (page.saturating_sub(1) as u64) * limit as u64;
-            let end = (start + limit as u64).min(f.max_unique_id as u64);
-            if start >= f.max_unique_id as u64 {
-                Vec::new()
-            } else {
-                ((start as u32 + 1)..=(end as u32))
-                    .map(|uid| format!("ALT_{set}_B_{}_{}_U_{uid}", f.faction, f.family_number))
-                    .collect()
-            }
+    let default_set = &snapshot.index.catalog().set;
+    let present = snapshot.index.present_cards();
+    let all_unique_prints: Vec<String> = matching_families
+        .iter()
+        .copied()
+        .flat_map(|f| {
+            let set = f.source_set.as_deref().unwrap_or(default_set);
+            (1..=f.max_unique_id).filter_map(move |uid| {
+                let idx = f.start_bit + uid - 1;
+                if present.contains(idx) {
+                    Some(format!(
+                        "ALT_{set}_B_{}_{}_U_{uid}",
+                        f.faction, f.family_number
+                    ))
+                } else {
+                    None
+                }
+            })
         })
-        .unwrap_or_default();
+        .collect();
+
+    let unique_print_total = all_unique_prints.len() as u32;
+    let start = (page.saturating_sub(1) as usize).saturating_mul(limit);
+    let end = start.saturating_add(limit).min(all_unique_prints.len());
+    let unique_prints = if start >= all_unique_prints.len() {
+        Vec::new()
+    } else {
+        all_unique_prints[start..end].to_vec()
+    };
 
     let non_unique_prints: Vec<String> = snapshot
         .nonunique
@@ -119,7 +130,7 @@ async fn get_family(
         })
         .unwrap_or_default();
 
-    if catalog_entry.is_none() && unique_family.is_none() && non_unique_prints.is_empty() {
+    if catalog_entry.is_none() && matching_families.is_empty() && non_unique_prints.is_empty() {
         return Err(not_found(format!("family {id} not found")));
     }
 

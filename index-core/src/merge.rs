@@ -643,13 +643,24 @@ fn merge_status(out: &Path, plan: &MergePlan, sources: &[SourceIndex]) -> Result
 }
 
 fn copy_family_catalog(out: &Path, sources: &[SourceIndex]) -> Result<()> {
+    let mut merged: BTreeMap<i64, crate::family_catalog::FamilyCatalogEntry> = BTreeMap::new();
+    let mut found = false;
     for src in sources {
         let src_path = src.dir.join("families.json");
-        if src_path.exists() {
-            fs::copy(&src_path, out.join("families.json"))
-                .with_context(|| format!("copy {}", src_path.display()))?;
-            break;
+        if !src_path.exists() {
+            continue;
         }
+        found = true;
+        let cat = crate::family_catalog::FamilyCatalog::load(&src_path)?;
+        for entry in cat.families {
+            merged.entry(entry.id).or_insert(entry);
+        }
+    }
+    if found {
+        let catalog = crate::family_catalog::FamilyCatalog {
+            families: merged.into_values().collect(),
+        };
+        catalog.save(&out.join("families.json"))?;
     }
     Ok(())
 }

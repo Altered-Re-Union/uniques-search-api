@@ -34,7 +34,10 @@ pub use archive::TarZstIndexStorage;
 pub use disk::DiskIndexStorage;
 pub use http::{load_app_state_from_http, load_index_from_http, HttpIndexClient};
 pub use nonunique::{load_nonunique_index, NonUniqueQueryIndex};
-pub use object_store::{load_app_state_from_object_store, load_index_from_object_store, ObjectStoreIndexClient};
+pub use object_store::{
+    load_app_state_from_object_store, load_bundle_from_object_store, load_index_from_object_store,
+    ObjectStoreIndexClient,
+};
 pub use storage::IndexStorage;
 
 use storage::{read_json, read_roar, read_roar_id_gd};
@@ -367,17 +370,19 @@ pub fn build_family_sort_index(catalog: &Catalog) -> FamilySortIndex {
         let set_b = family_set_code(catalog, fb);
         let code_a = fa.set.code.as_deref().unwrap_or(set_a);
         let code_b = fb.set.code.as_deref().unwrap_or(set_b);
+        let col_a = fa.collector_family_number.as_deref().unwrap_or(&fa.family_number);
+        let col_b = fb.collector_family_number.as_deref().unwrap_or(&fb.family_number);
         let ka = (
             code_a,
             faction_sort_rank(&fa.faction),
-            numeric_family_key(&fa.family_number),
+            numeric_family_key(col_a),
             set_release_rank(set_a),
             fa.start_bit,
         );
         let kb = (
             code_b,
             faction_sort_rank(&fb.faction),
-            numeric_family_key(&fb.family_number),
+            numeric_family_key(col_b),
             set_release_rank(set_b),
             fb.start_bit,
         );
@@ -528,12 +533,47 @@ pub struct CollectorNumberKey {
 
 #[derive(Debug, Clone)]
 pub struct CollectorNumberLookupIndex {
-    by_key: HashMap<CollectorNumberKey, FamilySpan>,
+    by_key: HashMap<CollectorNumberKey, Vec<FamilySpan>>,
 }
 
 impl CollectorNumberLookupIndex {
     pub fn len(&self) -> usize {
         self.by_key.len()
+    }
+
+    pub fn spans(
+        &self,
+        set_code: &str,
+        family_collector_number: &str,
+    ) -> Option<&[FamilySpan]> {
+        let key = CollectorNumberKey {
+            set_code: set_code.trim().to_ascii_uppercase(),
+            family_collector_number: family_collector_number.trim().to_ascii_uppercase(),
+        };
+        self.by_key.get(&key).map(Vec::as_slice)
+    }
+
+    pub fn resolve_all(
+        &self,
+        set_code: &str,
+        family_collector_number: &str,
+        unique_id: u32,
+    ) -> Result<Vec<u32>, FamilyResolveError> {
+        let Some(spans) = self.spans(set_code, family_collector_number) else {
+            return Err(FamilyResolveError::NotFound);
+        };
+        if unique_id == 0 {
+            return Err(FamilyResolveError::Padding);
+        }
+        let matches: Vec<u32> = spans
+            .iter()
+            .filter(|span| unique_id <= span.max_unique_id)
+            .map(|span| span.start_bit + unique_id - 1)
+            .collect();
+        if matches.is_empty() {
+            return Err(FamilyResolveError::Padding);
+        }
+        Ok(matches)
     }
 
     pub fn resolve(
@@ -542,15 +582,8 @@ impl CollectorNumberLookupIndex {
         family_collector_number: &str,
         unique_id: u32,
     ) -> Result<u32, FamilyResolveError> {
-        let key = CollectorNumberKey {
-            set_code: set_code.to_string(),
-            family_collector_number: family_collector_number.to_string(),
-        };
-        let span = self.by_key.get(&key).ok_or(FamilyResolveError::NotFound)?;
-        if unique_id > span.max_unique_id {
-            return Err(FamilyResolveError::Padding);
-        }
-        Ok(span.start_bit + unique_id - 1)
+        self.resolve_all(set_code, family_collector_number, unique_id)
+            .map(|v| v[0])
     }
 }
 
@@ -558,7 +591,7 @@ impl CollectorNumberLookupIndex {
 /// `cardsdata.rs` path) are simply absent from this index — resolution for them falls through to
 /// `NotFound`, matching the `Option`-all-the-way-down tolerance the rest of this field uses.
 pub fn build_collector_number_lookup_index(catalog: &Catalog) -> CollectorNumberLookupIndex {
-    let mut by_key = HashMap::new();
+    let mut by_key: HashMap<CollectorNumberKey, Vec<FamilySpan>> = HashMap::new();
     for family in &catalog.families {
         let (Some(set_code), Some(family_collector_number)) = (
             family.set.code.as_deref(),
@@ -567,16 +600,13 @@ pub fn build_collector_number_lookup_index(catalog: &Catalog) -> CollectorNumber
             continue;
         };
         let key = CollectorNumberKey {
-            set_code: set_code.to_string(),
-            family_collector_number: family_collector_number.to_string(),
+            set_code: set_code.trim().to_ascii_uppercase(),
+            family_collector_number: family_collector_number.trim().to_ascii_uppercase(),
         };
-        by_key.insert(
-            key,
-            FamilySpan {
-                start_bit: family.start_bit,
-                max_unique_id: family.max_unique_id,
-            },
-        );
+        by_key.entry(key).or_default().push(FamilySpan {
+            start_bit: family.start_bit,
+            max_unique_id: family.max_unique_id,
+        });
     }
     CollectorNumberLookupIndex { by_key }
 }
@@ -642,18 +672,25 @@ pub fn build_cost_relation_bitmaps(
     out
 }
 
-/// Build bitmap of cards with zero effects across `id_gd_whole`, `id_gd_per_line`, and `cards.bin`.
+/// Build bitmap of populated cards in `cards.bin` (any record with a non-zero byte),
+/// excluding unindexed / gap slots inside family spans.
+pub fn build_present_cards(cards: &[u8]) -> RoaringBitmap {
+    let mut present = RoaringBitmap::new();
+    for (idx, rec) in cards.chunks_exact(RECORD_SIZE).enumerate() {
+        if rec.iter().any(|&b| b != 0) {
+            present.insert(idx as u32);
+        }
+    }
+    present
+}
+
+/// Build bitmap of populated cards with zero effects across `id_gd_whole`, `id_gd_per_line`, and `cards.bin`.
 pub fn build_no_effect_bitmap(
-    catalog: &Catalog,
+    present_cards: &RoaringBitmap,
     cards: &[u8],
     id_gd_whole: &BTreeMap<u32, RoaringBitmap>,
     id_gd_per_line: &BTreeMap<(u32, EffectLine), RoaringBitmap>,
 ) -> RoaringBitmap {
-    let mut all_cards = RoaringBitmap::new();
-    for family in &catalog.families {
-        all_cards.insert_range(family.start_bit..family.start_bit + family.max_unique_id);
-    }
-
     let mut has_effect = RoaringBitmap::new();
     for bm in id_gd_whole.values() {
         has_effect |= bm;
@@ -667,7 +704,7 @@ pub fn build_no_effect_bitmap(
         }
     }
 
-    all_cards - has_effect
+    present_cards - &has_effect
 }
 
 pub enum AnyIndexStorage {
@@ -818,9 +855,12 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
     let family_sort_index = build_family_sort_index(&catalog);
 
     let cost_relations = build_cost_relation_bitmaps(&stats);
-    let no_effect_bitmap = build_no_effect_bitmap(&catalog, &cards, &id_gd_whole, &id_gd_per_line);
+    let present_cards = build_present_cards(&cards);
+    let no_effect_bitmap =
+        build_no_effect_bitmap(&present_cards, &cards, &id_gd_whole, &id_gd_per_line);
     eprintln!(
-        "  derived bitmaps: {} subtypes, {} no_effect cards",
+        "  derived bitmaps: {} present_cards, {} subtypes, {} no_effect cards",
+        present_cards.len(),
         subtype_bitmaps.len(),
         no_effect_bitmap.len()
     );
@@ -870,6 +910,7 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
         family_span_groups,
         family_sort_index,
         collector_number_lookup_index,
+        present_cards,
         effects_body,
     })
 }
@@ -891,28 +932,45 @@ pub fn load_family_catalog(
     Ok(catalog.families.into_iter().map(|f| (f.id, f)).collect())
 }
 
+/// Full loaded index bundle: unique index + optional non-unique index + shared family catalog.
+pub struct LoadedIndexBundle {
+    pub index: UniquesIndex,
+    pub nonunique: Option<NonUniqueQueryIndex>,
+    pub families: BTreeMap<i64, index_core::family_catalog::FamilyCatalogEntry>,
+}
+
+/// Load unique index, optional `nonunique/`, and optional `families.json` from any [`IndexStorage`].
+pub fn load_bundle_from_storage(storage: &impl IndexStorage) -> Result<LoadedIndexBundle> {
+    let index = load_uniques_index_from(storage)?;
+    let nonunique = load_nonunique_index(storage)?;
+    let families = load_family_catalog(storage)?;
+    Ok(LoadedIndexBundle {
+        index,
+        nonunique,
+        families,
+    })
+}
+
 /// Load index and format filters; wrap in [`AppState`].
 pub fn load_app_state(settings: &Settings) -> Result<AppState> {
-    let (index, nonunique, families) = match settings.index.source {
+    let mut bundle = match settings.index.source {
         crate::config::IndexSourceKind::Disk | crate::config::IndexSourceKind::Archive => {
             let index_path = settings.index_path()?;
             let storage = open_index_storage(&index_path)?;
-            let index = load_uniques_index_from(&storage)?;
-            let mut nonunique = load_nonunique_index(&storage)?;
-            let mut families = load_family_catalog(&storage)?;
+            let mut bundle = load_bundle_from_storage(&storage)?;
             if index_path.is_file() {
                 if let Some(parent_dir) = index_path.parent().filter(|p| p.is_dir()) {
                     if let Ok(disk_storage) = DiskIndexStorage::new(parent_dir) {
-                        if nonunique.is_none() {
-                            nonunique = load_nonunique_index(&disk_storage)?;
+                        if bundle.nonunique.is_none() {
+                            bundle.nonunique = load_nonunique_index(&disk_storage)?;
                         }
-                        if families.is_empty() {
-                            families = load_family_catalog(&disk_storage)?;
+                        if bundle.families.is_empty() {
+                            bundle.families = load_family_catalog(&disk_storage)?;
                         }
                     }
                 }
             }
-            (index, nonunique, families)
+            bundle
         }
         crate::config::IndexSourceKind::ObjectStore => {
             bail!("load_app_state for object_store: use load_index_from_object_store in main")
@@ -921,7 +979,12 @@ pub fn load_app_state(settings: &Settings) -> Result<AppState> {
             bail!("load_app_state for http: use load_index_from_http in main")
         }
     };
-    Ok(build_app_state(index, nonunique, families, settings))
+    Ok(build_app_state(
+        bundle.index,
+        bundle.nonunique.take(),
+        bundle.families,
+        settings,
+    ))
 }
 
 pub fn build_app_state(

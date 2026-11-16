@@ -101,8 +101,13 @@ fn build_fixture() -> PathBuf {
     )
     .unwrap();
 
-    // cards.bin must be total_bit_span * 32 bytes; contents are unused by this endpoint.
-    fs::write(dir.join("cards.bin"), vec![0u8; 4 * 32]).unwrap();
+    // cards.bin must be total_bit_span * 32 bytes with non-zero bytes for populated slots
+    // so `build_present_cards` treats all 4 cards as indexed (byte 0 = faction_code 1 = AX).
+    let mut cards_bin = vec![0u8; 4 * 32];
+    for card_idx in 0..4 {
+        cards_bin[card_idx * 32] = 1;
+    }
+    fs::write(dir.join("cards.bin"), cards_bin).unwrap();
 
     let write_roar = |name: &str, bits: &[u32]| {
         let mut bm = RoaringBitmap::new();

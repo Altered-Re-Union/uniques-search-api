@@ -80,11 +80,48 @@ impl AppState {
         *self.query.write().expect("query lock poisoned") = snapshot;
     }
 
-    /// Swap index+formats when the new index has a strictly higher `built_at_secs`.
-    /// Collections are discarded as incompatible with the new index layout.
+    /// Swap index+formats (keeping existing nonunique/families) when newer.
     pub(crate) fn commit_if_newer(
         &self,
         new_index: Arc<UniquesIndex>,
+        new_formats: Arc<FormatIndex>,
+        collections_settings: &CollectionsSettings,
+    ) -> Option<(u64, u64)> {
+        let current = self.snapshot();
+        self.commit_snapshot_if_newer(
+            new_index,
+            current.nonunique.clone(),
+            current.families.clone(),
+            new_formats,
+            collections_settings,
+        )
+    }
+
+    /// Swap a full loaded index bundle (unique + non-unique + family catalog + formats) when
+    /// `bundle.index.manifest.built_at_secs` is strictly higher than the active snapshot.
+    pub(crate) fn commit_bundle_if_newer(
+        &self,
+        mut bundle: crate::index::loader::LoadedIndexBundle,
+        new_formats: Arc<FormatIndex>,
+        collections_settings: &CollectionsSettings,
+    ) -> Option<(u64, u64)> {
+        if let Some(ref mut nu) = bundle.nonunique {
+            nu.bind_families(&bundle.families);
+        }
+        self.commit_snapshot_if_newer(
+            Arc::new(bundle.index),
+            bundle.nonunique.map(Arc::new),
+            Arc::new(bundle.families),
+            new_formats,
+            collections_settings,
+        )
+    }
+
+    pub(crate) fn commit_snapshot_if_newer(
+        &self,
+        new_index: Arc<UniquesIndex>,
+        nonunique: Option<Arc<NonUniqueQueryIndex>>,
+        families: Arc<BTreeMap<i64, FamilyCatalogEntry>>,
         new_formats: Arc<FormatIndex>,
         collections_settings: &CollectionsSettings,
     ) -> Option<(u64, u64)> {
@@ -94,10 +131,8 @@ impl AppState {
         if new_secs > old_secs {
             self.commit(Arc::new(QuerySnapshot {
                 index: new_index,
-                // Non-unique hot-reload isn't wired yet (Lot 2 first slice); carry the current
-                // value forward unchanged rather than dropping it on every unique-index reload.
-                nonunique: current.nonunique.clone(),
-                families: current.families.clone(),
+                nonunique,
+                families,
                 formats: new_formats,
                 collections: CollectionStore::new(collections_settings),
             }));
@@ -231,6 +266,7 @@ mod tests {
             family_span_groups: vec![],
             family_sort_index: Default::default(),
             collector_number_lookup_index: build_collector_number_lookup_index(&catalog),
+            present_cards: roaring::RoaringBitmap::new(),
             effects_body: Arc::new(Bytes::from_static(b"[]")),
         }
     }

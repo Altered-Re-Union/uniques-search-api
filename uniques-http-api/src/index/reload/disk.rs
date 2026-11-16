@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::index::loader::{load_uniques_index, read_manifest};
-use crate::index::UniquesIndex;
+use crate::index::loader::{
+    load_bundle_from_storage, read_manifest, DiskIndexStorage, LoadedIndexBundle,
+};
 
 use super::source::IndexSource;
 
@@ -25,7 +26,7 @@ impl IndexSource for DiskIndexSource {
         Ok(read_manifest(&self.index_dir)?.built_at_secs)
     }
 
-    fn load_index(&self) -> Result<UniquesIndex> {
-        load_uniques_index(&self.index_dir)
+    fn load_bundle(&self) -> Result<LoadedIndexBundle> {
+        load_bundle_from_storage(&DiskIndexStorage::new(&self.index_dir)?)
     }
 }

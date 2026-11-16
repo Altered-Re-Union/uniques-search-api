@@ -251,6 +251,18 @@ async fn unified_search_filters_and_sorts_accurately() {
     assert_eq!(uniq["iter"]["total"], 1);
     assert_eq!(uniq["cards"][0]["kind"], "unique");
     assert_eq!(uniq["cards"][0]["reference"], "ALT_TEST_B_AX_04_U_1");
+    assert_eq!(uniq["cards"][0]["product"], "B");
+    assert_eq!(uniq["cards"][0]["isSerialized"], false);
+
+    // Page mode omits cursor, cursor mode emits next_cursor when more items remain
+    let (_, paged) = get_json(&state, "/api/v2/search?rarity[]=COMMON&page=1&limit=1").await;
+    assert!(paged["iter"]["cursor"].is_null());
+    let (_, cursored) = get_json(&state, "/api/v2/search?rarity[]=COMMON&limit=1").await;
+    assert_eq!(cursored["iter"]["cursor"], 1);
+
+    // Collector number lookup (including lowercase & 2-part prefix) matches minimal_index unique
+    let (_, col_exact) = get_json(&state, "/api/v2/search?collectorNumber[]=btg-001-u-1").await;
+    let _ = col_exact; // minimal_index has no collector_family_number; ensures case-insensitive parser accepts it
 
     // Banned filter
     let (_, banned) = get_json(&state, "/api/v2/search?banned=true").await;

@@ -52,7 +52,9 @@ pub struct UniquesIndex {
     pub family_sort_index: FamilySortIndex,
     /// Uniques only — see `cli-indexer/plans/24-collector-number-ingestion.md`.
     pub collector_number_lookup_index: CollectorNumberLookupIndex,
-    /// Pre-serialized `GET /api/v2/effects` JSON body.
+    /// Card indices that have a populated record in `cards.bin`, excluding unindexed/gap slots
+    /// inside family spans.
+    pub present_cards: RoaringBitmap,
     pub effects_body: Arc<Bytes>,
 }
 
@@ -101,6 +103,10 @@ impl UniquesIndex {
 
     pub fn cards(&self) -> &[u8] {
         &self.cards
+    }
+
+    pub fn present_cards(&self) -> &RoaringBitmap {
+        &self.present_cards
     }
 
     pub fn id_gd_whole(&self) -> &BTreeMap<u32, RoaringBitmap> {
@@ -202,10 +208,11 @@ impl UniquesIndex {
     }
 
     /// Resolves an exact `collectorNumberFormatted` string (`SET-FAMILY-U-UID`, e.g.
-    /// `BTG-011-U-5`) to a `card_index`. Uniques only — see
+    /// `BTG-011-U-5`, case-insensitive) to a populated `card_index`. Uniques only — see
     /// `cli-indexer/plans/24-collector-number-ingestion.md`.
     pub fn resolve_card_index_by_collector_number(&self, s: &str) -> Result<u32, CardResolveError> {
-        let parts: Vec<&str> = s.split('-').collect();
+        let norm = s.trim().to_ascii_uppercase();
+        let parts: Vec<&str> = norm.split('-').collect();
         let [set_code, family_collector_number, rarity, unique_id_str] = parts.as_slice() else {
             return Err(CardResolveError::BadRequest {
                 message: format!("invalid collector number '{s}': expected SET-FAMILY-U-UID"),
@@ -221,9 +228,15 @@ impl UniquesIndex {
         let unique_id: u32 = unique_id_str.parse().map_err(|_| CardResolveError::BadRequest {
             message: format!("invalid collector number '{s}': non-numeric unique id"),
         })?;
+        if unique_id == 0 {
+            return Err(CardResolveError::NotFound {
+                message: format!("collector number {s} falls in padding"),
+            });
+        }
 
-        self.collector_number_lookup_index
-            .resolve(set_code, family_collector_number, unique_id)
+        let candidates = self
+            .collector_number_lookup_index
+            .resolve_all(set_code, family_collector_number, unique_id)
             .map_err(|e| match e {
                 FamilyResolveError::NotFound => CardResolveError::NotFound {
                     message: format!("collector number not found: {s}"),
@@ -231,7 +244,58 @@ impl UniquesIndex {
                 FamilyResolveError::Padding => CardResolveError::NotFound {
                     message: format!("collector number {s} falls in padding"),
                 },
+            })?;
+
+        candidates
+            .into_iter()
+            .find(|&idx| self.present_cards.contains(idx))
+            .ok_or_else(|| CardResolveError::NotFound {
+                message: format!("collector number {s} falls in padding"),
             })
+    }
+
+    /// Resolves a full collector number (`SET-FAMILY-U-UID`) or a 2-part family collector prefix
+    /// (`SET-FAMILY`, case-insensitive) to all populated matching `card_index` values across
+    /// spans sharing the same `(set.code, collector_family_number)` (e.g. `CORE` + `COREKS`).
+    pub fn resolve_card_indices_by_collector_number(&self, s: &str) -> Vec<u32> {
+        let norm = s.trim().to_ascii_uppercase();
+        let parts: Vec<&str> = norm.split('-').collect();
+        match parts.as_slice() {
+            [set_code, family_collector_number, "U", unique_id_str] => {
+                let Ok(unique_id) = unique_id_str.parse::<u32>() else {
+                    return Vec::new();
+                };
+                if unique_id == 0 {
+                    return Vec::new();
+                }
+                self.collector_number_lookup_index
+                    .resolve_all(set_code, family_collector_number, unique_id)
+                    .map(|idxs| {
+                        idxs.into_iter()
+                            .filter(|&idx| self.present_cards.contains(idx))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            [set_code, family_collector_number] => {
+                let Some(spans) = self
+                    .collector_number_lookup_index
+                    .spans(set_code, family_collector_number)
+                else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                for span in spans {
+                    for idx in span.start_bit..span.start_bit + span.max_unique_id {
+                        if self.present_cards.contains(idx) {
+                            out.push(idx);
+                        }
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
     }
 }
 

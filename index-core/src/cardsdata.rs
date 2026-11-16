@@ -308,9 +308,9 @@ impl CardsDataSet {
     /// Rows for `unique_print_id` whose Trigger resolves to `slot` (`MAIN_EFFECT` or
     /// `ECHO_EFFECT`), ordered by `DisplayIndex`.
     ///
-    /// Per D5, `Slot` lives on the Trigger fragment, not on the row itself — a row with no
-    /// `TriggerId` can't be assigned a slot and is skipped (see open question Q1 in the decision
-    /// log: this assumes every row has a Trigger, unverified against the full dataset yet).
+    /// When `TriggerId` is absent (or its fragment `Slot` is empty), we classify the row as
+    /// `ECHO_EFFECT` if any referenced fragment explicitly has `Slot == "ECHO_EFFECT"` or starts
+    /// with `{D}` / `#{D}` (matching `nonunique.rs`), and `MAIN_EFFECT` otherwise.
     fn effect_rows_for_slot(
         &self,
         unique_print_id: i64,
@@ -321,18 +321,43 @@ impl CardsDataSet {
         };
         let mut matched = Vec::new();
         for row in rows {
-            let Some(trigger_id) = row.trigger_id else {
-                continue;
+            let resolved_slot = if let Some(trigger_id) = row.trigger_id {
+                let fragment = self.effect_fragments.get(&trigger_id).with_context(|| {
+                    format!("unknown TriggerId {trigger_id} on unique print {unique_print_id}")
+                })?;
+                if !fragment.slot.is_empty() {
+                    fragment.slot.as_str()
+                } else if self.is_echo_row(row) {
+                    "ECHO_EFFECT"
+                } else {
+                    "MAIN_EFFECT"
+                }
+            } else if self.is_echo_row(row) {
+                "ECHO_EFFECT"
+            } else {
+                "MAIN_EFFECT"
             };
-            let fragment = self.effect_fragments.get(&trigger_id).with_context(|| {
-                format!("unknown TriggerId {trigger_id} on unique print {unique_print_id}")
-            })?;
-            if fragment.slot == slot {
+            if resolved_slot == slot {
                 matched.push(row);
             }
         }
         matched.sort_by_key(|r| r.display_index);
         Ok(matched)
+    }
+
+    fn is_echo_row(&self, row: &UniquePrintEffectFragmentRow) -> bool {
+        [row.trigger_id, row.condition_id, row.effect_id]
+            .into_iter()
+            .flatten()
+            .any(|id| {
+                self.effect_fragments.get(&id).is_some_and(|f| {
+                    if f.slot == "ECHO_EFFECT" {
+                        return true;
+                    }
+                    let trimmed = f.text_en_us.trim_start();
+                    trimmed.starts_with("{D}") || trimmed.starts_with("#{D}")
+                })
+            })
     }
 
     fn effect_element_for_slot(

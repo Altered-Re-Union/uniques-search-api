@@ -10,7 +10,7 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BTreeMap;
 
-use axum::extract::{RawQuery, State};
+use axum::extract::{DefaultBodyLimit, RawQuery, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use index_core::bitmap::EffectLine;
@@ -21,6 +21,7 @@ use roaring::RoaringBitmap;
 use serde::Serialize;
 
 use crate::collections::CollectionStore;
+use crate::config::CardsSettings;
 use crate::formats::FormatIndex;
 use crate::http::api::cards::models::{
     AbilityFilters, CardV2, CardsRequest, CardsSort, CompareOp, CostPredicate, CostRelation,
@@ -41,8 +42,13 @@ use crate::index::{
     subtype_names_from_index, NonUniqueQueryIndex, UniquesIndex,
 };
 
-pub fn router() -> Router<ServerState> {
-    Router::new().route("/api/v2/search", get(get_search).post(post_search))
+pub fn router(cards: &CardsSettings) -> Router<ServerState> {
+    let route = Router::new().route("/api/v2/search", get(get_search).post(post_search));
+    if cards.max_post_payload_bytes > 0 {
+        route.layer(DefaultBodyLimit::max(cards.max_post_payload_bytes as usize))
+    } else {
+        route
+    }
 }
 
 const DEFAULT_LIMIT: usize = 50;
@@ -196,9 +202,21 @@ impl SearchRequest {
         let sets: Vec<String> = self
             .sets
             .iter()
-            .map(|s| match s.as_str() {
-                "BTG" => "CORE".to_string(),
-                other => other.to_string(),
+            .flat_map(|s| match s.to_ascii_uppercase().as_str() {
+                "BTG" => vec!["CORE".to_string(), "COREKS".to_string()],
+                "TBF" => vec!["ALIZE".to_string()],
+                "WFM" => vec!["BISE".to_string()],
+                "SKY" => vec!["CYCLONE".to_string()],
+                "SDU" => vec!["DUSTER".to_string()],
+                "SDUCB" => vec!["DUSTERCB".to_string()],
+                "SDUOP" => vec!["DUSTEROP".to_string()],
+                "SDUTOP" => vec!["DUSTERTOP".to_string()],
+                "ROC" => vec!["EOLE".to_string()],
+                "ROCCB" => vec!["EOLECB".to_string()],
+                "ROCOP" => vec!["EOLEOP".to_string()],
+                "ROCTOP" => vec!["EOLETOP".to_string()],
+                "NEJ" => vec!["FUGUE".to_string()],
+                other => vec![other.to_string()],
             })
             .collect();
         Some(CardsRequest {
@@ -381,7 +399,10 @@ fn respond_search(server: &ServerState, params: &QueryMultiMap) -> ApiResult<Jso
         }
     }
 
-    let next_cursor = if (offset as u64) + (cards.len() as u64) < total {
+    let next_cursor = if req.page.is_none()
+        && !cards.is_empty()
+        && (offset as u64) + (cards.len() as u64) < total
+    {
         Some((offset as u64) + (cards.len() as u64))
     } else {
         None
@@ -853,22 +874,45 @@ fn compare_nu_vs_family(
     let nu_faction = nu_meta.map(|m| m.faction.as_str()).unwrap_or("");
     let u_set = fam.source_set.as_deref().unwrap_or(&catalog.set);
 
+    let nu_num = nu_meta
+        .and_then(|m| m.collector_number.as_deref())
+        .and_then(|s| s.split('-').nth(1))
+        .and_then(|seg| seg.parse::<u32>().ok())
+        .unwrap_or(u32::MAX);
+    let u_col_str = fam
+        .collector_family_number
+        .as_deref()
+        .unwrap_or(&fam.family_number);
+    let u_num = u_col_str.parse::<u32>().unwrap_or(u32::MAX);
+
     match field {
         SortField::SetDate => {
             if dir == SortDir::Desc {
                 (
                     Reverse(set_release_rank(nu_set)),
                     faction_sort_rank(nu_faction),
+                    nu_num,
+                    nu_ref,
                 )
                     .cmp(&(
                         Reverse(set_release_rank(u_set)),
                         faction_sort_rank(&fam.faction),
+                        u_num,
+                        fam.first_reference.as_str(),
                     ))
-                    .then_with(|| nu_ref.cmp(&fam.first_reference))
             } else {
-                (set_release_rank(nu_set), faction_sort_rank(nu_faction))
-                    .cmp(&(set_release_rank(u_set), faction_sort_rank(&fam.faction)))
-                    .then_with(|| nu_ref.cmp(&fam.first_reference))
+                (
+                    set_release_rank(nu_set),
+                    faction_sort_rank(nu_faction),
+                    nu_num,
+                    nu_ref,
+                )
+                    .cmp(&(
+                        set_release_rank(u_set),
+                        faction_sort_rank(&fam.faction),
+                        u_num,
+                        fam.first_reference.as_str(),
+                    ))
             }
         }
         SortField::Collector => {
@@ -879,12 +923,14 @@ fn compare_nu_vs_family(
             let ord = (
                 nu_code,
                 faction_sort_rank(nu_faction),
+                nu_num,
                 set_release_rank(nu_set),
                 nu_ref,
             )
                 .cmp(&(
                     u_code,
                     faction_sort_rank(&fam.faction),
+                    u_num,
                     set_release_rank(u_set),
                     fam.first_reference.as_str(),
                 ));
@@ -1177,8 +1223,9 @@ fn parse_factions_str(params: &QueryMultiMap) -> ApiResult<Vec<String>> {
 fn parse_all_sets(params: &QueryMultiMap) -> ApiResult<Vec<String>> {
     let mut out = parse_sets(params)?;
     for s in collect_multi_values(params, &["cardSet[]", "cardSet", "edition[]", "edition"]) {
-        if !out.contains(&s) {
-            out.push(s);
+        let upper = s.trim().to_ascii_uppercase();
+        if !upper.is_empty() && !out.contains(&upper) {
+            out.push(upper);
         }
     }
     Ok(out)
@@ -1603,34 +1650,12 @@ fn unique_keyword_bitmap(
             }
             return echo;
         }
-        let needle = match canon {
-            "AFTER_YOU" => "after you",
-            "ANCHORED" => "anchored",
-            "ASCEND" => "ascend",
-            "ASLEEP" => "asleep",
-            "AUGMENT" => "augment",
-            "BOOSTED" => "boost",
-            "COOLDOWN" => "cooldown",
-            "DEFENDER" => "defender",
-            "ETERNAL" => "eternal",
-            "FLEETING" => "fleeting",
-            "GIGANTIC" => "gigantic",
-            "RESUPPLY" => "resupply",
-            "SABOTAGE" => "sabotage",
-            "SCOUT" => "scout",
-            "SEASONED" => "seasoned",
-            "TOUGH" => "tough",
-            other => other,
-        };
-        let needle_lower = needle.to_ascii_lowercase();
         let mut matching_ids = Vec::new();
         for entry in &unique.idgd_catalog().entries {
-            let en = entry
-                .translations
-                .get("en_US")
-                .map(|t| t.text.to_ascii_lowercase())
-                .unwrap_or_default();
-            if en.contains(&needle_lower) {
+            let Some(en) = entry.translations.get("en_US").map(|t| t.text.as_str()) else {
+                continue;
+            };
+            if text_has_canonical_keyword(en, canon) {
                 matching_ids.push(entry.id_gd);
             }
         }
@@ -1666,6 +1691,30 @@ fn intersect(acc: &mut Option<RoaringBitmap>, bitmap: RoaringBitmap) {
         Some(current) => current & bitmap,
         None => bitmap,
     });
+}
+
+fn text_has_canonical_keyword(text: &str, expected_canon: &str) -> bool {
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(']') else {
+            break;
+        };
+        let norm = after[..close].trim().replace(' ', "_");
+        if !norm.is_empty()
+            && norm
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            if let Some(canon) = canonical_keyword(&norm) {
+                if canon == expected_canon {
+                    return true;
+                }
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    false
 }
 
 fn bool_bitmap(value: bool, flag_bitmap: &RoaringBitmap, total: u32) -> RoaringBitmap {
@@ -1761,5 +1810,29 @@ mod tests {
         let default = window_across(&first, &second, 0, 10);
         let page_one = window_across(&first, &second, (1u32.saturating_sub(1) as u64) * 10, 10);
         assert_eq!(default, page_one);
+    }
+
+    #[test]
+    fn bracket_keyword_matching_avoids_prose_false_positives() {
+        assert!(!super::text_has_canonical_keyword(
+            "{D} Boost target.",
+            "BOOSTED"
+        ));
+        assert!(super::text_has_canonical_keyword(
+            "[BOOSTED].",
+            "BOOSTED"
+        ));
+        assert!(super::text_has_canonical_keyword(
+            "[AFTER_YOU].",
+            "AFTER_YOU"
+        ));
+        assert!(super::text_has_canonical_keyword(
+            "[AFTER YOU].",
+            "AFTER_YOU"
+        ));
+        assert!(super::text_has_canonical_keyword(
+            "[TOUGH 1].",
+            "TOUGH"
+        ));
     }
 }

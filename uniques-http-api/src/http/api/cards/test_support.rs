@@ -239,10 +239,11 @@ pub(crate) fn test_state() -> AppState {
     ocean_power[0] = RoaringBitmap::from_iter([2, 5]);
     stats.insert(StatField::OceanPower, ocean_power);
 
+    let present_cards = RoaringBitmap::from_iter(0..catalog.total_bit_span);
     let cost_relations = build_cost_relation_bitmaps(&stats);
     let subtype_bitmaps = build_subtype_bitmaps(&catalog);
     let no_effect_bitmap =
-        build_no_effect_bitmap(&catalog, &cards, &BTreeMap::new(), &id_gd_per_line);
+        build_no_effect_bitmap(&present_cards, &cards, &BTreeMap::new(), &id_gd_per_line);
 
     let index = UniquesIndex {
         index_dir: "C:\\tmp\\index".into(),
@@ -275,6 +276,7 @@ pub(crate) fn test_state() -> AppState {
         family_span_groups,
         family_sort_index,
         collector_number_lookup_index,
+        present_cards,
     };
 
     AppState::new_with_index(index)
@@ -333,6 +335,7 @@ pub(crate) fn test_state_with_sets() -> AppState {
 
     let set_bitmaps = build_set_bitmaps(&catalog);
     let subtype_bitmaps = build_subtype_bitmaps(&catalog);
+    let present_cards = RoaringBitmap::from_iter(0..catalog.total_bit_span);
     let no_effect_bitmap = RoaringBitmap::from_iter(0..15);
     let name_search_index = build_name_search_index(&catalog);
     let family_lookup_index = build_family_lookup_index(&catalog);
@@ -386,6 +389,7 @@ pub(crate) fn test_state_with_sets() -> AppState {
         family_span_groups,
         family_sort_index,
         collector_number_lookup_index,
+        present_cards,
     };
 
     AppState::new_with_index(index)

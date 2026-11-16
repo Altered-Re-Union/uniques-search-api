@@ -220,6 +220,7 @@ pub(crate) fn build_bitmap(
     for bmp in it {
         out &= bmp;
     }
+    out &= state.present_cards();
     if let Some(exclude) = no_effect_exclude {
         out -= exclude;
     }
@@ -229,11 +230,11 @@ pub(crate) fn build_bitmap(
     Ok(out)
 }
 
-/// Exact-match, lenient like `ref[]`: unresolved values just don't set a bit. Uniques only.
+/// Exact-match (4-part `SET-FAM-U-UID` or 2-part `SET-FAM`), lenient like `ref[]`. Uniques only.
 fn collector_number_bitmap(state: &UniquesIndex, collector_numbers: &[String]) -> RoaringBitmap {
     let mut out = RoaringBitmap::new();
     for cn in collector_numbers {
-        if let Ok(card_index) = state.resolve_card_index_by_collector_number(cn) {
+        for card_index in state.resolve_card_indices_by_collector_number(cn) {
             out.insert(card_index);
         }
     }
@@ -244,20 +245,14 @@ fn collector_number_bitmap(state: &UniquesIndex, collector_numbers: &[String]) -
 fn unified_search_bitmap(state: &UniquesIndex, q: &str) -> RoaringBitmap {
     let mut out = state.name_search_index().bitmap_for_contains(state.catalog(), q);
     out |= index_core::build_bitmap_from_ref_strs_lenient(state.catalog(), &[q]);
-    if let Ok(card_index) = state.resolve_card_index_by_collector_number(q) {
+    for card_index in state.resolve_card_indices_by_collector_number(q) {
         out.insert(card_index);
     }
     out
 }
 
 fn all_cards_bitmap(state: &UniquesIndex) -> RoaringBitmap {
-    let span = state.manifest().total_bit_span;
-    if span == 0 {
-        return RoaringBitmap::new();
-    }
-    let mut bmp = RoaringBitmap::new();
-    bmp.insert_range(0..span);
-    bmp
+    state.present_cards().clone()
 }
 
 fn bitmap_for_cost_predicate(
@@ -533,6 +528,8 @@ pub fn enrich_unique_card_v2(
         reference: "CHARACTER".to_string(),
         name: ct_names,
     });
+    card.product = Some("B".to_string());
+    card.is_serialized = Some(false);
     card.is_banned = Some(index.banned().contains(card_index));
     card.is_errated = Some(index.errated().contains(card_index));
     card.is_suspended = Some(index.suspended().contains(card_index));
@@ -949,7 +946,7 @@ fn family_ranges_for_sort<'a>(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
             true,
-            false,
+            true,
         ),
         _ => (&[], false, false),
     }

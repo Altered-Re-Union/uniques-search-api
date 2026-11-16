@@ -851,7 +851,11 @@ fn extract_bracket_keywords(raw: &str, out: &mut BTreeSet<String>) {
         let after = &rest[open + 1..];
         if let Some(close) = after.find(']') {
             let token = &after[..close];
-            if !token.is_empty() && token.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+            if !token.is_empty()
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
                 if let Some(canon) = canonical_keyword(token) {
                     out.insert(canon);
                 }

@@ -16,5 +16,5 @@ pub fn router(collections: &CollectionsSettings, cards: &CardsSettings) -> Route
         .merge(collections::router(collections))
         .merge(effects::router())
         .merge(family::router())
-        .merge(search::router())
+        .merge(search::router(cards))
 }

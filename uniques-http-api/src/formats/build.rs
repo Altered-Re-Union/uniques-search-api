@@ -210,6 +210,7 @@ mod tests {
             family_span_groups: build_family_span_groups(&catalog),
             family_sort_index: Default::default(),
             collector_number_lookup_index: build_collector_number_lookup_index(&catalog),
+            present_cards: RoaringBitmap::from_iter(0..catalog.total_bit_span),
             effects_body: Arc::new(Bytes::from_static(b"[]")),
         }
     }
