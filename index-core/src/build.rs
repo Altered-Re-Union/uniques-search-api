@@ -211,16 +211,16 @@ pub fn build_from_cardsdata(
     }
 
     let dataset = CardsDataSet::load(cardsdata_root, set)?;
-    let mut cards = dataset.unique_cards()?;
+    let mut print_indices = dataset.sorted_print_indices();
 
     let stopped_early = match options.file_limit {
-        Some(limit) if cards.len() > limit => {
-            cards.truncate(limit);
+        Some(limit) if print_indices.len() > limit => {
+            print_indices.truncate(limit);
             true
         }
         _ => false,
     };
-    let total_cards = cards.len();
+    let total_cards = print_indices.len();
 
     let progress = BuildProgress::start(total_cards);
     let mut catalog_builder = CatalogBuilder::new(set);
@@ -232,11 +232,12 @@ pub fn build_from_cardsdata(
     let mut faction_index = FactionIndexBuilder::new();
     let mut status = StatusFlagsBuilder::new();
 
-    for (parsed, card) in &cards {
-        let card_index = catalog_builder.on_card(parsed, card)?;
+    for (parsed, print_idx) in &print_indices {
+        let card = dataset.build_card_json(*print_idx)?;
+        let card_index = catalog_builder.on_card(parsed, &card)?;
         apply_card_index(
             card_index,
-            card,
+            &card,
             &mut bitmaps,
             &mut per_line_bitmaps,
             &mut idgd_catalog_builder,

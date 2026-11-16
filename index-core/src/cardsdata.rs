@@ -124,6 +124,8 @@ struct UniquePrintRow {
     is_errated: u8,
     #[serde(rename = "IsSuspended")]
     is_suspended: u8,
+    #[serde(rename = "CollectorNumberFormatted", default)]
+    collector_number_formatted: String,
     // Kept as raw strings and parsed downstream by the existing `compact_fields_from_card`
     // (same tolerant `str::parse::<u8>()` it already applies to JSON-sourced values).
     #[serde(rename = "MAIN_COST")]
@@ -204,6 +206,26 @@ impl CardsDataSet {
         })
     }
 
+    /// Sorted `(ParsedCardPath, index into self.unique_prints)` in the family-contiguous,
+    /// ascending-`unique_id` order `CatalogBuilder::on_card` requires, without allocating all
+    /// [`CardJson`] values up front.
+    pub fn sorted_print_indices(&self) -> Vec<(ParsedCardPath, usize)> {
+        let mut out = Vec::with_capacity(self.unique_prints.len());
+        for (idx, print) in self.unique_prints.iter().enumerate() {
+            let Ok(parsed) = parse_card_reference(&print.reference) else {
+                continue;
+            };
+            out.push((parsed, idx));
+        }
+        out.sort_by_key(|(parsed, _)| sort_key(parsed));
+        out
+    }
+
+    /// Build a [`CardJson`] for the print at `print_index` (from [`Self::sorted_print_indices`]).
+    pub fn build_card_json(&self, print_index: usize) -> Result<CardJson> {
+        self.card_json_for_print(&self.unique_prints[print_index])
+    }
+
     /// All unique prints for this set as `(ParsedCardPath, CardJson)`, sorted the way
     /// `CatalogBuilder::on_card` requires (family-contiguous, ascending `unique_id`).
     ///
@@ -212,15 +234,11 @@ impl CardsDataSet {
     /// non-card files (e.g. CardsData carries a `FOILER` placeholder row, same idea as the
     /// `FOILER` paths the JSON-crawl discovery already filters out).
     pub fn unique_cards(&self) -> Result<Vec<(ParsedCardPath, CardJson)>> {
-        let mut out = Vec::with_capacity(self.unique_prints.len());
-        for print in &self.unique_prints {
-            let Ok(parsed) = parse_card_reference(&print.reference) else {
-                continue;
-            };
-            let card = self.card_json_for_print(print)?;
-            out.push((parsed, card));
+        let indices = self.sorted_print_indices();
+        let mut out = Vec::with_capacity(indices.len());
+        for (parsed, idx) in indices {
+            out.push((parsed, self.build_card_json(idx)?));
         }
-        out.sort_by_key(|(parsed, _)| sort_key(parsed));
         Ok(out)
     }
 
@@ -280,9 +298,10 @@ impl CardsDataSet {
             is_errated: print.is_errated != 0,
             is_suspended: print.is_suspended != 0,
             card_family_id: Some(print.card_family_id),
-            // Deferred: CardsData's collector-number source column isn't confirmed yet (CardsData
-            // isn't vendored in this repo). See cli-indexer/plans/24-collector-number-ingestion.md.
-            collector_number_formatted: None,
+            collector_number_formatted: {
+                let s = print.collector_number_formatted.trim();
+                (!s.is_empty()).then(|| s.to_string())
+            },
         })
     }
 
