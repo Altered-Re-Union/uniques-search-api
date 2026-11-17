@@ -1,6 +1,7 @@
 pub mod loader;
 mod query;
 mod reload;
+pub mod text_search;
 pub mod uniques_index;
 
 pub use loader::{

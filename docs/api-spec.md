@@ -10,13 +10,32 @@
 | Yes       | `set[]`     | repeated array  | `set[]=CORE`   | Filter by one or more source set codes (e.g. `CORE`, `COREKS`). Alias: `set=CORE,COREKS` (CSV). OR within listed sets; AND with other filters.                                                                                           |
 | Yes       | `faction[]` | repeated array  | `faction[]=AX` | Filter by one or more faction codes.                                                                                                                                                                                                     |
 | Yes       | `subTypes[]` | repeated array | `subTypes[]=ELEMENTAL` | Filter by one or more card subtype codes (`cardSubTypes[].reference`), OR-combined (AND with other filters). Aliases: `subTypes` (CSV), `cardSubTypes[]`, `cardSubTypes`. Unknown subtypes match 0 cards.                              |
-| Yes       | `name`      | string          | `name=Kelon`   | Case-insensitive substring match on character name (any locale). Accented characters match unaccented queries (e.g. `elementaire` matches `Élémentaire`, `boshi` matches `Issun-bōshi`). Whitespace-only values are ignored (no filter). |
+| Yes       | `name`      | string          | `name=Kelon`   | Word search on character name (see [Text search](#text-search)): every word must appear in the name, in at least one locale. Accented characters match unaccented queries (e.g. `elementaire kelon` matches `Élémentaire de Kélon`, `boshi` matches `Issun-bōshi`). Whitespace-only values are ignored (no filter). |
 | Yes       | `format`    | string          | `format=standard` | Restrict results to a configured format (see [Format filters](#format-filters)). Only one format per request. If the parameter appears more than once, the **last** value wins. Requires `[formats]` in server config; otherwise any `format=` value returns `400 unknown format '{id}'`. |
 | Yes       | `collection` | string         | `collection=deck1` | Restrict results to a bitmap previously created via `POST /api/v2/collection/{id}` (see `collections` module). AND with other filters. `422 collection_not_loaded` if the id was never created. |
 | Yes       | `ref[]`     | repeated array  | `ref[]=ALT_CORE_B_AX_01_U_1` | Restrict results to an explicit, ad-hoc list of card references given directly in the query string — no `POST /api/v2/collection` round-trip needed. Alias: `ref=REF1,REF2,REF3` (CSV). References are OR'd together, then AND'd with every other active filter (`format`, `collection`, `faction`, etc.), same combination pattern as `collection`. Unknown or malformed references are silently ignored (they just never match) instead of causing an error. |
 | Yes       | `collectorNumber[]` | repeated array | `collectorNumber[]=BTG-011-U-5` | Restrict results to an explicit list of collector numbers (`SET-FAMILY-U-UID`, e.g. `BTG-011-U-5` — the code printed on the physical/digital card, distinct from `ref[]`'s internal reference format). Alias: `collectorNumber=A,B,C` (CSV). Same OR-within/AND-across semantics as `ref[]`; unknown or malformed values are silently ignored. Uniques only. |
-| Yes       | `q`         | string          | `q=Ogun`       | Unified search box: matches if **any** of — case/accent-insensitive substring of the character name (same rule as `name`), exact reference (same rule as `ref[]`), or exact collector number (same rule as `collectorNumber[]`) — succeeds. This is the one filter where "OR within" spans different match *kinds* rather than repeated values of one kind; still AND'd with every other active filter same as `name`/`ref[]`. Independent of and additive to `name`/`ref[]`/`collectorNumber[]`, which keep their own semantics unchanged. Empty/whitespace-only values are ignored (no filter). |
+| Yes       | `q`         | string          | `q=Ogun`       | Unified search box: matches if **any** of — word search on the character name (same rule as `name`), exact reference (same rule as `ref[]`), or exact collector number (same rule as `collectorNumber[]`) — succeeds. This is the one filter where "OR within" spans different match *kinds* rather than repeated values of one kind; still AND'd with every other active filter same as `name`/`ref[]`. Independent of and additive to `name`/`ref[]`/`collectorNumber[]`, which keep their own semantics unchanged. Empty/whitespace-only values are ignored (no filter). |
 
+### Text search
+
+`name`, `q` and, on `/api/v2/search`, `effectText` (non-unique effect text) share the same rules:
+
+- Text and query are normalized the same way: lowercased, accents removed, and every run of
+  punctuation or spaces (including non-breaking spaces) turned into a single space. So
+  `gagne 1 boost` matches `gagne 1 boost` written with a non-breaking space, and `l adversaire`
+  matches `l'adversaire`.
+- The query is split into words, and **every** word must be found, in any order, in the text of
+  **one same locale**: `piochez carte` matches `Piochez une carte.`
+- A word may be the start or any part of a longer word: `pioch` matches `piochez`, `carte`
+  matches `cartes`.
+- Text between double quotes is kept as one phrase: `"une carte"` only matches those two words
+  next to each other.
+- Game symbols such as `{J}`, `{R}` or `{2}` are words of their own: `{J}` only matches the symbol,
+  not any text containing the letter `j`.
+- On `/api/v2/search`, `q` on non-unique cards searches the name **and** the effect text: words may
+  be split between the two (`kelon piochez`), as long as they are in the same locale. On unique
+  cards, `q` searches the name only.
 
 ### Format filters
 

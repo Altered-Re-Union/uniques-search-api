@@ -17,6 +17,7 @@ use roaring::RoaringBitmap;
 
 use super::storage::{read_json, read_roar, IndexStorage};
 use super::{faction_sort_rank, normalize_name_for_search, set_release_rank};
+use crate::index::text_search::{search_key, SearchQuery};
 
 const VALUE_BUCKETS: usize = 16;
 const STAT_NAMES: [&str; 5] = [
@@ -75,14 +76,12 @@ pub struct NonUniqueQueryIndex {
     /// Normalized collector number keys (e.g. `BTG-001-C`, `SDU-001-C-EN`, `SDU-001-C`, `BTG-001`)
     /// -> matching `print_index` list.
     pub collector_lookup: HashMap<String, Vec<u32>>,
-    /// Normalized effect text per locale for each print.
-    pub normalized_effects: Vec<BTreeMap<String, String>>,
-    /// Concatenated normalized effect text across all locales per print (fallback `q` scan).
-    pub normalized_all_effects: Vec<String>,
-    /// Normalized localized names per print (populated via `bind_families`).
+    /// Effect text per locale for each print, as [`search_key`]s (text search).
+    pub effect_search_keys: Vec<BTreeMap<String, String>>,
+    /// Normalized localized names per print, used for name sorting (populated via `bind_families`).
     pub normalized_names: Vec<BTreeMap<String, String>>,
-    /// Concatenated normalized names across all locales per print.
-    pub normalized_all_names: Vec<String>,
+    /// Localized names per print, as [`search_key`]s (text search; populated via `bind_families`).
+    pub name_search_keys: Vec<BTreeMap<String, String>>,
     /// Pre-sorted `print_index` vectors for global sorting & pagination.
     pub sort_index: NonUniqueSortIndex,
 }
@@ -114,104 +113,107 @@ impl NonUniqueQueryIndex {
     pub fn bind_families(&mut self, families: &BTreeMap<i64, FamilyCatalogEntry>) {
         let total = self.total() as usize;
         let mut norm_names = Vec::with_capacity(total);
-        let mut norm_all = Vec::with_capacity(total);
+        let mut search_keys = Vec::with_capacity(total);
 
         for i in 0..total {
             let mut per_loc = BTreeMap::new();
-            let mut joined = String::new();
+            let mut keys_per_loc = BTreeMap::new();
             if let Some(meta) = self.prints.get(i) {
                 if let Some(fam) = families.get(&meta.card_family_id) {
                     for (loc, raw) in &fam.name {
-                        let norm = normalize_name_for_search(raw);
-                        if !norm.is_empty() {
-                            if !joined.is_empty() {
-                                joined.push(' ');
-                            }
-                            joined.push_str(&norm);
-                        }
-                        per_loc.insert(loc.clone(), norm);
+                        per_loc.insert(loc.clone(), normalize_name_for_search(raw));
+                        keys_per_loc.insert(loc.clone(), search_key(raw));
                     }
                 }
             }
             norm_names.push(per_loc);
-            norm_all.push(joined);
+            search_keys.push(keys_per_loc);
         }
 
         self.normalized_names = norm_names;
-        self.normalized_all_names = norm_all;
+        self.name_search_keys = search_keys;
         self.sort_index =
             build_nonunique_sort_index(&self.catalog, &self.prints, &self.normalized_names, families);
     }
 
-    /// All non-unique print indices whose effect text in any locale contains `query`
-    /// (case- and diacritic-insensitive). Empty / whitespace-only query returns an empty bitmap.
+    /// Prints whose effect text, in at least one locale, contains every term of `query` (see
+    /// [`SearchQuery`]). A query with nothing searchable in it matches every print.
     pub fn bitmap_for_effect_contains(&self, query: &str) -> RoaringBitmap {
-        let needle = normalize_name_for_search(query);
+        let Some(q) = SearchQuery::parse(query) else {
+            return self.all_prints();
+        };
+        self.bitmap_where(|i| {
+            self.effect_search_keys
+                .get(i)
+                .is_some_and(|per_loc| per_loc.values().any(|key| q.matches(key)))
+        })
+    }
+
+    /// Prints whose name, in at least one locale, contains every term of `query`, or whose
+    /// reference / collector number contains `query`. A query with nothing searchable in it
+    /// matches every print.
+    pub fn bitmap_for_name_or_ident(&self, query: &str) -> RoaringBitmap {
+        let Some(q) = SearchQuery::parse(query) else {
+            return self.all_prints();
+        };
+        let ident = normalize_name_for_search(query.trim());
+        self.bitmap_where(|i| {
+            self.name_search_keys
+                .get(i)
+                .is_some_and(|per_loc| per_loc.values().any(|key| q.matches(key)))
+                || self.ident_matches(i, &ident)
+        })
+    }
+
+    /// Free-text `q`: prints where every term of `query` is found in the name or effect text of
+    /// one same locale (terms may be split between name and effect), or whose reference /
+    /// collector number contains `query`. A query with nothing searchable in it matches every
+    /// print.
+    pub fn bitmap_for_free_text(&self, query: &str) -> RoaringBitmap {
+        let Some(q) = SearchQuery::parse(query) else {
+            return self.all_prints();
+        };
+        let ident = normalize_name_for_search(query.trim());
+        let empty = BTreeMap::new();
+        self.bitmap_where(|i| {
+            let names = self.name_search_keys.get(i).unwrap_or(&empty);
+            let effects = self.effect_search_keys.get(i).unwrap_or(&empty);
+            let text_matches = names.keys().chain(effects.keys()).any(|loc| {
+                let name = names.get(loc).map_or("", String::as_str);
+                let effect = effects.get(loc).map_or("", String::as_str);
+                q.matches_any_field(&[name, effect])
+            });
+            text_matches || self.ident_matches(i, &ident)
+        })
+    }
+
+    /// Reference or collector number contains `needle` (lowercased, as `normalize_name_for_search`).
+    fn ident_matches(&self, i: usize, needle: &str) -> bool {
         if needle.is_empty() {
-            return RoaringBitmap::new();
+            return false;
         }
+        let ref_matches = self
+            .catalog
+            .reference_for_index(i as u32)
+            .is_some_and(|r| r.to_ascii_lowercase().contains(needle));
+        let col_matches = self
+            .prints
+            .get(i)
+            .and_then(|p| p.collector_number.as_deref())
+            .is_some_and(|c| c.to_ascii_lowercase().contains(needle));
+        ref_matches || col_matches
+    }
+
+    fn all_prints(&self) -> RoaringBitmap {
         let mut out = RoaringBitmap::new();
-        for (i, all) in self.normalized_all_effects.iter().enumerate() {
-            if all.contains(&needle) {
-                out.insert(i as u32);
-            }
-        }
+        out.insert_range(0..self.total());
         out
     }
 
-    /// Bitmap of prints whose name, reference, or collector number matches `needle`
-    /// (already normalized with `normalize_name_for_search`).
-    pub fn bitmap_for_name_or_ident(&self, needle: &str, locale: Option<&str>) -> RoaringBitmap {
-        if needle.is_empty() {
-            return RoaringBitmap::new();
-        }
+    fn bitmap_where(&self, mut pred: impl FnMut(usize) -> bool) -> RoaringBitmap {
         let mut out = RoaringBitmap::new();
         for i in 0..(self.total() as usize) {
-            let name_matches = match locale {
-                Some(loc) => self
-                    .normalized_names
-                    .get(i)
-                    .and_then(|m| m.get(loc))
-                    .map(|n| n.contains(needle))
-                    .unwrap_or(false)
-                    || self
-                        .normalized_all_names
-                        .get(i)
-                        .map(|n| n.contains(needle))
-                        .unwrap_or(false),
-                None => self
-                    .normalized_all_names
-                    .get(i)
-                    .map(|n| n.contains(needle))
-                    .unwrap_or(false),
-            };
-            let ref_matches = self
-                .catalog
-                .reference_for_index(i as u32)
-                .map(|r| r.to_ascii_lowercase().contains(needle))
-                .unwrap_or(false);
-            let col_matches = self
-                .prints
-                .get(i)
-                .and_then(|p| p.collector_number.as_deref())
-                .map(|c| c.to_ascii_lowercase().contains(needle))
-                .unwrap_or(false);
-            if name_matches || ref_matches || col_matches {
-                out.insert(i as u32);
-            }
-        }
-        out
-    }
-
-    /// Bitmap of prints whose name OR effect text OR reference OR collector number matches `needle`
-    /// (normalized with `normalize_name_for_search`).
-    pub fn bitmap_for_free_text(&self, needle: &str) -> RoaringBitmap {
-        if needle.is_empty() {
-            return RoaringBitmap::new();
-        }
-        let mut out = self.bitmap_for_name_or_ident(needle, None);
-        for (i, eff) in self.normalized_all_effects.iter().enumerate() {
-            if eff.contains(needle) {
+            if pred(i) {
                 out.insert(i as u32);
             }
         }
@@ -310,29 +312,19 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
 
     let collector_lookup = build_collector_lookup(&prints);
 
-    let normalized_effects: Vec<BTreeMap<String, String>> = effect_text
+    let effect_search_keys: Vec<BTreeMap<String, String>> = effect_text
         .iter()
         .map(|per_loc| {
             per_loc
                 .iter()
-                .map(|(loc, text)| (loc.clone(), normalize_name_for_search(text)))
+                .map(|(loc, text)| (loc.clone(), search_key(text)))
                 .collect()
-        })
-        .collect();
-    let normalized_all_effects: Vec<String> = normalized_effects
-        .iter()
-        .map(|per_loc| {
-            per_loc
-                .values()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
         })
         .collect();
 
     let empty_families = BTreeMap::new();
     let normalized_names = vec![BTreeMap::new(); total as usize];
-    let normalized_all_names = vec![String::new(); total as usize];
+    let name_search_keys = vec![BTreeMap::new(); total as usize];
     let sort_index =
         build_nonunique_sort_index(&catalog, &prints, &normalized_names, &empty_families);
 
@@ -359,10 +351,9 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
         card_types_i18n,
         ref_lookup,
         collector_lookup,
-        normalized_effects,
-        normalized_all_effects,
+        effect_search_keys,
         normalized_names,
-        normalized_all_names,
+        name_search_keys,
         sort_index,
     }))
 }

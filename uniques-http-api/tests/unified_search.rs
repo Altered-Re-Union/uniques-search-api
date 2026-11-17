@@ -291,3 +291,43 @@ async fn post_search_matches_get_and_effect_filter_excludes_nonuniques() {
     let post_res: serde_json::Value = serde_json::from_slice(&post_bytes).unwrap();
     assert_eq!(get_res, post_res);
 }
+
+#[tokio::test]
+async fn text_search_matches_separate_words_within_one_locale() {
+    let (_tmp, state) = build_unified_test_server();
+    // Print 3 (ALT_CORE_A_AX_02_R): name "Alpha Construct" / "Automate Alpha",
+    // effect "{D} Boost target." / "{D} Boostez une cible.".
+    let refs = |res: &serde_json::Value| -> Vec<String> {
+        res["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["reference"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Words found separately, in any order, accents and case ignored.
+    let (status, res) = get_json(&state, "/api/v2/search?effectText=CIBLE%20boostez").await;
+    assert_eq!(status, 200);
+    assert_eq!(refs(&res), ["ALT_CORE_A_AX_02_R"]);
+
+    // Quoted text is a phrase: words must be adjacent.
+    let (_, res) = get_json(&state, "/api/v2/search?effectText=%22boostez%20cible%22").await;
+    assert_eq!(res["iter"]["total"], 0);
+    let (_, res) = get_json(&state, "/api/v2/search?effectText=boostez%20%22une%20cible%22").await;
+    assert_eq!(refs(&res), ["ALT_CORE_A_AX_02_R"]);
+
+    // Symbols are words of their own.
+    let (_, res) = get_json(&state, "/api/v2/search?effectText=%7BD%7D").await;
+    assert_eq!(refs(&res), ["ALT_CORE_A_AX_02_R"]);
+
+    // q: words may be split between name and effect text, within one same locale.
+    let (_, res) = get_json(&state, "/api/v2/search?q=automate%20boostez").await;
+    assert_eq!(refs(&res), ["ALT_CORE_A_AX_02_R"]);
+    let (_, res) = get_json(&state, "/api/v2/search?q=construct%20boostez").await;
+    assert_eq!(res["iter"]["total"], 0, "en name + fr effect must not match");
+
+    // name: separate words, punctuation ignored ("Sierra & Oddball" / "Sierra et Oddball").
+    let (_, res) = get_json(&state, "/api/v2/search?name=oddball%20sierra").await;
+    assert_eq!(refs(&res), ["ALT_CORE_B_AX_01_C"]);
+}

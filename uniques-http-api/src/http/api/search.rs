@@ -1548,20 +1548,14 @@ fn build_nonunique_bitmap(
     }
 
     if let Some(q) = &req.q {
-        let needle = normalize_name_for_search(q);
-        if !needle.is_empty() {
-            intersect(&mut acc, nu.bitmap_for_free_text(&needle));
+        if !q.trim().is_empty() {
+            intersect(&mut acc, nu.bitmap_for_free_text(q));
         }
     }
 
     if let Some(name) = &req.name {
-        let needle = normalize_name_for_search(name);
-        if !needle.is_empty() {
-            let locale = req.sort.as_ref().and_then(|s| match &s.field {
-                SortField::Name(locale) => Some(locale.as_str()),
-                _ => None,
-            });
-            intersect(&mut acc, nu.bitmap_for_name_or_ident(&needle, locale));
+        if !name.trim().is_empty() {
+            intersect(&mut acc, nu.bitmap_for_name_or_ident(name));
         }
     }
 

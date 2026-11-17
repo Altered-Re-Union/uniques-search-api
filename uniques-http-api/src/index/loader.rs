@@ -21,6 +21,7 @@ use crate::config::Settings;
 use crate::formats::{load_format_index, FormatIndex};
 use crate::http::api::effects::{build_effects_list, serialize_effects_list};
 use crate::http::state::{AppState, QuerySnapshot};
+use crate::index::text_search::{search_key, SearchQuery};
 use crate::index::UniquesIndex;
 
 pub mod archive;
@@ -161,7 +162,7 @@ fn load_status_flag(storage: &impl IndexStorage, relative_path: &str) -> Result<
     read_roar(storage, relative_path)
 }
 
-/// Lowercased locale names per catalog family row, built once at index load.
+/// Locale names per catalog family row, as [`search_key`]s, built once at index load.
 #[derive(Debug, Clone)]
 pub struct NameSearchIndex {
     by_family: Vec<Vec<String>>,
@@ -172,11 +173,17 @@ impl NameSearchIndex {
         &self.by_family
     }
 
+    /// Families whose name, in at least one locale, contains every term of `query` (see
+    /// [`SearchQuery`]). A query with nothing searchable in it matches every family.
     pub fn bitmap_for_contains(&self, catalog: &Catalog, query: &str) -> RoaringBitmap {
-        let needle = normalize_name_for_search(query);
+        let parsed = SearchQuery::parse(query);
         let mut bmp = RoaringBitmap::new();
         for (family, names) in catalog.families.iter().zip(&self.by_family) {
-            if names.iter().any(|name| name.contains(&needle)) {
+            let matches = match &parsed {
+                Some(q) => names.iter().any(|name| q.matches(name)),
+                None => true,
+            };
+            if matches {
                 let end = family.start_bit.saturating_add(family.max_unique_id);
                 bmp.insert_range(family.start_bit..end);
             }
@@ -619,7 +626,7 @@ pub fn build_name_search_index(catalog: &Catalog) -> NameSearchIndex {
             family
                 .name
                 .values()
-                .map(|name| normalize_name_for_search(name))
+                .map(|name| search_key(name))
                 .collect()
         })
         .collect();
