@@ -331,3 +331,48 @@ async fn text_search_matches_separate_words_within_one_locale() {
     let (_, res) = get_json(&state, "/api/v2/search?name=oddball%20sierra").await;
     assert_eq!(refs(&res), ["ALT_CORE_B_AX_01_C"]);
 }
+
+#[tokio::test]
+async fn facets_count_subtypes_left_by_the_other_filters() {
+    let (_tmp, state) = build_unified_test_server();
+    // Non-unique fixture: family 101 (ENGINEER) = prints 2 and 3, family 102 (ROBOT) = print 5.
+    let (status, res) = get_json(&state, "/api/v2/search/facets?kind=nonunique").await;
+    assert_eq!(status, 200);
+    assert_eq!(res["subTypes"], serde_json::json!({ "ENGINEER": 2, "ROBOT": 1 }));
+
+    // Other filters narrow the counts; subtypes with no card left are omitted.
+    let (_, res) = get_json(&state, "/api/v2/search/facets?kind=nonunique&faction[]=YZ").await;
+    assert_eq!(res["subTypes"], serde_json::json!({ "ROBOT": 1 }));
+
+    // subTypes[] itself is ignored, so the other subtypes stay available.
+    let (_, res) =
+        get_json(&state, "/api/v2/search/facets?kind=nonunique&subTypes[]=ENGINEER").await;
+    assert_eq!(res["subTypes"], serde_json::json!({ "ENGINEER": 2, "ROBOT": 1 }));
+
+    // Across both branches, each count is the total /api/v2/search returns for that subtype.
+    let (_, res) = get_json(&state, "/api/v2/search/facets").await;
+    let counts = res["subTypes"].as_object().unwrap();
+    assert!(counts.contains_key("ENGINEER"));
+    for (subtype, count) in counts {
+        let (_, search) =
+            get_json(&state, &format!("/api/v2/search?subTypes[]={subtype}&limit=1")).await;
+        assert_eq!(&search["iter"]["total"], count, "subtype {subtype}");
+    }
+
+    // POST takes the same parameters in the body.
+    let post_resp = app(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v2/search/facets")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("kind=nonunique&faction[]=YZ"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_resp.status(), 200);
+    let bytes = post_resp.into_body().collect().await.unwrap().to_bytes();
+    let post_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(post_res["subTypes"], serde_json::json!({ "ROBOT": 1 }));
+}

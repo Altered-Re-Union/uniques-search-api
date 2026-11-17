@@ -293,6 +293,21 @@ Requires `withFamilies` and no `cursor`. Adds `families[]` (omitted when `cursor
 }
 ```
 
+## `GET` / `POST /api/v2/search/facets`
+
+Takes the same filters as `/api/v2/search` (`sort`, `page`, `cursor` and `limit` are ignored) and
+returns, for each subtype, how many matching cards (uniques and non-uniques) carry it. A UI can use
+it to only offer the subtypes that still lead to results, and show their counts.
+
+- Counts are computed with every filter **except** `subTypes[]`, so selecting a subtype doesn't
+  hide the others (`subTypes[]` values are OR'd).
+- Subtypes with no matching card are omitted.
+- `POST` takes the same parameters as a form-urlencoded body.
+
+```json
+{ "subTypes": { "BUREAUCRAT": 12, "ENGINEER": 340, "ROBOT": 98 } }
+```
+
 ## `GET /api/v2/card/{reference}`
 
 Look up a single card by its full reference id (same object shape as one element of `cards[]` in the search response).

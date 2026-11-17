@@ -35,6 +35,7 @@ use crate::http::api::cards::parse::{
     validate_idgd_types, QueryMultiMap,
 };
 use crate::http::api::error::{bad_request, map_query_error, ApiResult};
+use crate::http::state::QuerySnapshot;
 use crate::http::ServerState;
 use crate::index::loader::{faction_sort_rank, normalize_name_for_search, set_release_rank};
 use crate::index::{
@@ -43,7 +44,9 @@ use crate::index::{
 };
 
 pub fn router(cards: &CardsSettings) -> Router<ServerState> {
-    let route = Router::new().route("/api/v2/search", get(get_search).post(post_search));
+    let route = Router::new()
+        .route("/api/v2/search", get(get_search).post(post_search))
+        .route("/api/v2/search/facets", get(get_facets).post(post_facets));
     if cards.max_post_payload_bytes > 0 {
         route.layer(DefaultBodyLimit::max(cards.max_post_payload_bytes as usize))
     } else {
@@ -316,21 +319,7 @@ fn respond_search(server: &ServerState, params: &QueryMultiMap) -> ApiResult<Jso
 
     let unique = snapshot.index.as_ref();
     let nonunique = snapshot.nonunique.as_deref();
-
-    let nonunique_bitmap = if req.nonunique_branch_excluded() {
-        RoaringBitmap::new()
-    } else {
-        match nonunique {
-            Some(nu) => build_nonunique_bitmap(nu, &snapshot.collections, &req)?,
-            None => RoaringBitmap::new(),
-        }
-    };
-
-    let unique_bitmap = if req.unique_branch_excluded() {
-        RoaringBitmap::new()
-    } else {
-        build_unique_search_bitmap(unique, &snapshot.formats, &snapshot.collections, &req)?
-    };
+    let (unique_bitmap, nonunique_bitmap) = search_bitmaps(&snapshot, &req)?;
 
     let nu_total = nonunique_bitmap.len();
     let u_total = unique_bitmap.len();
@@ -416,6 +405,110 @@ fn respond_search(server: &ServerState, params: &QueryMultiMap) -> ApiResult<Jso
         },
         cards,
     }))
+}
+
+/// Matching cards of both branches for `req`: `(unique card indices, non-unique print indices)`.
+/// A branch excluded by `req` (see `unique_branch_excluded` / `nonunique_branch_excluded`) is empty.
+fn search_bitmaps(
+    snapshot: &QuerySnapshot,
+    req: &SearchRequest,
+) -> ApiResult<(RoaringBitmap, RoaringBitmap)> {
+    let nonunique_bitmap = if req.nonunique_branch_excluded() {
+        RoaringBitmap::new()
+    } else {
+        match snapshot.nonunique.as_deref() {
+            Some(nu) => build_nonunique_bitmap(nu, &snapshot.collections, req)?,
+            None => RoaringBitmap::new(),
+        }
+    };
+
+    let unique_bitmap = if req.unique_branch_excluded() {
+        RoaringBitmap::new()
+    } else {
+        build_unique_search_bitmap(
+            snapshot.index.as_ref(),
+            &snapshot.formats,
+            &snapshot.collections,
+            req,
+        )?
+    };
+
+    Ok((unique_bitmap, nonunique_bitmap))
+}
+
+/// `GET` / `POST /api/v2/search/facets`: for the same filters as `/api/v2/search`, how many cards
+/// each value of a facet would keep. Lets a UI only offer the options that still lead somewhere.
+#[derive(Debug, Serialize)]
+struct FacetsResponse {
+    /// Subtype reference -> number of matching cards (uniques + non-uniques) carrying it. Counted
+    /// with every filter **except** `subTypes[]` itself, so that picking one subtype doesn't hide
+    /// the others (`subTypes[]` values are OR'd). Subtypes with no matching card are omitted.
+    #[serde(rename = "subTypes")]
+    sub_types: BTreeMap<String, u64>,
+}
+
+async fn get_facets(
+    State(server): State<ServerState>,
+    RawQuery(query): RawQuery,
+) -> ApiResult<Json<FacetsResponse>> {
+    let params = parse_query_multimap(query.as_deref())?;
+    respond_facets(&server, &params)
+}
+
+async fn post_facets(
+    State(server): State<ServerState>,
+    body: String,
+) -> ApiResult<Json<FacetsResponse>> {
+    let params = parse_query_multimap(Some(&body))?;
+    respond_facets(&server, &params)
+}
+
+fn respond_facets(server: &ServerState, params: &QueryMultiMap) -> ApiResult<Json<FacetsResponse>> {
+    let snapshot = server.app.snapshot();
+    let formats_enabled = server
+        .settings
+        .formats
+        .as_ref()
+        .is_some_and(|f| f.is_enabled());
+    let mut req = parse_request(
+        params,
+        snapshot.index.as_ref(),
+        &snapshot.formats,
+        formats_enabled,
+        &snapshot.collections,
+    )?;
+    req.sub_types.clear();
+
+    let (unique_bitmap, nonunique_bitmap) = search_bitmaps(&snapshot, &req)?;
+    let nonunique_subtypes = snapshot.nonunique.as_deref().map(|nu| &nu.subtype);
+    Ok(Json(FacetsResponse {
+        sub_types: count_by_value(
+            [
+                (&unique_bitmap, Some(snapshot.index.subtype_bitmaps())),
+                (&nonunique_bitmap, nonunique_subtypes),
+            ],
+        ),
+    }))
+}
+
+/// For each value, the number of cards of `matches` that carry it, summed over both branches
+/// (each branch pairs its matching cards with its own per-value bitmaps). Zero counts are omitted.
+fn count_by_value<'a>(
+    branches: [(&RoaringBitmap, Option<&'a BTreeMap<String, RoaringBitmap>>); 2],
+) -> BTreeMap<String, u64> {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for (matches, by_value) in branches {
+        if matches.is_empty() {
+            continue;
+        }
+        for (value, bitmap) in by_value.into_iter().flatten() {
+            let n = matches.intersection_len(bitmap);
+            if n > 0 {
+                *counts.entry(value.clone()).or_default() += n;
+            }
+        }
+    }
+    counts
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
