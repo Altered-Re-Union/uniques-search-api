@@ -162,3 +162,47 @@ fn merge_overlap_group_interleaves_families_and_preserves_set_for_decode() {
     assert_eq!(bmp_m1.len(), 3);
 }
 
+#[test]
+fn merge_remaps_status_bitmaps_across_overlap_and_offset_groups() {
+    let index_dir = tempfile::tempdir().expect("index tempdir");
+    let merged_root = tempfile::tempdir().expect("merge out root");
+
+    make_set_index(index_dir.path(), "COREKS", &[("AX", "04", 3)], &[(90, &[0])]);
+    make_set_index(index_dir.path(), "CORE", &[("AX", "04", 3)], &[(90, &[0])]);
+    make_set_index(index_dir.path(), "ALIZE", &[("BR", "01", 2)], &[(90, &[1])]);
+
+    fs::create_dir_all(index_dir.path().join("COREKS/status")).expect("mkdir status");
+    write_bitmap(&index_dir.path().join("COREKS/status/banned.roar"), &[1]);
+    write_bitmap(&index_dir.path().join("COREKS/status/suspended.roar"), &[2]);
+
+    fs::create_dir_all(index_dir.path().join("CORE/status")).expect("mkdir status");
+    write_bitmap(&index_dir.path().join("CORE/status/banned.roar"), &[0]);
+
+    fs::create_dir_all(index_dir.path().join("ALIZE/status")).expect("mkdir status");
+    write_bitmap(&index_dir.path().join("ALIZE/status/errated.roar"), &[1]);
+
+    let out = merged_root.path().join("ALL_SETS");
+    merge_indexes(
+        index_dir.path(),
+        "COREKS,CORE,ALIZE",
+        &out,
+        MergeOptions::default(),
+    )
+    .expect("merge");
+
+    let read_status = |name: &str| -> RoaringBitmap {
+        let bytes = fs::read(out.join("status").join(format!("{name}.roar")))
+            .expect("read status roar");
+        RoaringBitmap::deserialize_from(&bytes[..]).expect("deserialize")
+    };
+
+    let banned = read_status("banned");
+    assert_eq!(banned.iter().collect::<Vec<_>>(), vec![1, 3]);
+
+    let errated = read_status("errated");
+    assert_eq!(errated.iter().collect::<Vec<_>>(), vec![7]);
+
+    let suspended = read_status("suspended");
+    assert_eq!(suspended.iter().collect::<Vec<_>>(), vec![2]);
+}
+

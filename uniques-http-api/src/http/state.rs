@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
+
+use index_core::family_catalog::FamilyCatalogEntry;
 
 use crate::collections::CollectionStore;
 use crate::config::{CollectionsSettings, Settings};
 use crate::formats::FormatIndex;
-use crate::index::UniquesIndex;
+use crate::index::{NonUniqueQueryIndex, UniquesIndex};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -14,6 +17,12 @@ pub struct ServerState {
 #[derive(Clone)]
 pub struct QuerySnapshot {
     pub index: Arc<UniquesIndex>,
+    /// `None` when this index root has no `nonunique/` files yet (see Lot 2 / plan 19) — every
+    /// index built before that lot still loads fine, just without `/api/v2/search` results.
+    pub nonunique: Option<Arc<NonUniqueQueryIndex>>,
+    /// Shared family name/type/subtypes, by `CardFamilyId` — empty when `families.json` is absent
+    /// (see Lot 5 / plan 23).
+    pub families: Arc<BTreeMap<i64, FamilyCatalogEntry>>,
     pub formats: Arc<FormatIndex>,
     pub collections: CollectionStore,
 }
@@ -41,6 +50,8 @@ impl AppState {
     ) -> Self {
         Self::new(QuerySnapshot {
             index: Arc::new(index),
+            nonunique: None,
+            families: Arc::new(BTreeMap::new()),
             formats: Arc::new(FormatIndex::empty()),
             collections: CollectionStore::new(collections_settings),
         })
@@ -69,11 +80,48 @@ impl AppState {
         *self.query.write().expect("query lock poisoned") = snapshot;
     }
 
-    /// Swap index+formats when the new index has a strictly higher `built_at_secs`.
-    /// Collections are discarded as incompatible with the new index layout.
+    /// Swap index+formats (keeping existing nonunique/families) when newer.
     pub(crate) fn commit_if_newer(
         &self,
         new_index: Arc<UniquesIndex>,
+        new_formats: Arc<FormatIndex>,
+        collections_settings: &CollectionsSettings,
+    ) -> Option<(u64, u64)> {
+        let current = self.snapshot();
+        self.commit_snapshot_if_newer(
+            new_index,
+            current.nonunique.clone(),
+            current.families.clone(),
+            new_formats,
+            collections_settings,
+        )
+    }
+
+    /// Swap a full loaded index bundle (unique + non-unique + family catalog + formats) when
+    /// `bundle.index.manifest.built_at_secs` is strictly higher than the active snapshot.
+    pub(crate) fn commit_bundle_if_newer(
+        &self,
+        mut bundle: crate::index::loader::LoadedIndexBundle,
+        new_formats: Arc<FormatIndex>,
+        collections_settings: &CollectionsSettings,
+    ) -> Option<(u64, u64)> {
+        if let Some(ref mut nu) = bundle.nonunique {
+            nu.bind_families(&bundle.families);
+        }
+        self.commit_snapshot_if_newer(
+            Arc::new(bundle.index),
+            bundle.nonunique.map(Arc::new),
+            Arc::new(bundle.families),
+            new_formats,
+            collections_settings,
+        )
+    }
+
+    pub(crate) fn commit_snapshot_if_newer(
+        &self,
+        new_index: Arc<UniquesIndex>,
+        nonunique: Option<Arc<NonUniqueQueryIndex>>,
+        families: Arc<BTreeMap<i64, FamilyCatalogEntry>>,
         new_formats: Arc<FormatIndex>,
         collections_settings: &CollectionsSettings,
     ) -> Option<(u64, u64)> {
@@ -83,6 +131,8 @@ impl AppState {
         if new_secs > old_secs {
             self.commit(Arc::new(QuerySnapshot {
                 index: new_index,
+                nonunique,
+                families,
                 formats: new_formats,
                 collections: CollectionStore::new(collections_settings),
             }));
@@ -97,7 +147,7 @@ impl ServerState {
     /// Wrap loaded app state with minimal settings for integration tests (formats disabled).
     pub fn for_test(app: AppState) -> Self {
         use crate::config::{
-            CollectionsSettings, HttpIndexSettings, IndexSettings, IndexSourceKind,
+            CardsSettings, CollectionsSettings, HttpIndexSettings, IndexSettings, IndexSourceKind,
             ObjectStoreSettings, ReloadSettings, ServerSettings, Settings,
         };
 
@@ -120,6 +170,7 @@ impl ServerState {
                     max_memory_bytes: 1024 * 1024,
                     ..CollectionsSettings::default()
                 },
+                cards: CardsSettings::default(),
             }),
         }
     }
@@ -127,6 +178,7 @@ impl ServerState {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -140,8 +192,8 @@ mod tests {
     use crate::config::CollectionsSettings;
     use crate::formats::FormatIndex;
     use crate::index::loader::{
-        build_family_lookup_index, build_name_search_index, FactionsSummary, IndexManifest,
-        StatsSummary,
+        build_collector_number_lookup_index, build_family_lookup_index, build_name_search_index,
+        FactionsSummary, IndexManifest, StatsSummary,
     };
     use crate::index::UniquesIndex;
 
@@ -203,9 +255,18 @@ mod tests {
                 by_set: Default::default(),
                 core_and_coreks: None,
             },
+            cost_relations: Default::default(),
+            subtype_bitmaps: Default::default(),
+            no_effect_bitmap: Default::default(),
+            banned: Default::default(),
+            errated: Default::default(),
+            suspended: Default::default(),
             name_search_index: build_name_search_index(&catalog),
             family_lookup_index: build_family_lookup_index(&catalog),
             family_span_groups: vec![],
+            family_sort_index: Default::default(),
+            collector_number_lookup_index: build_collector_number_lookup_index(&catalog),
+            present_cards: roaring::RoaringBitmap::new(),
             effects_body: Arc::new(Bytes::from_static(b"[]")),
         }
     }
@@ -213,6 +274,8 @@ mod tests {
     fn snapshot_with_index(built_at_secs: u64) -> QuerySnapshot {
         QuerySnapshot {
             index: Arc::new(minimal_index(built_at_secs)),
+            nonunique: None,
+            families: Arc::new(BTreeMap::new()),
             formats: Arc::new(FormatIndex::empty()),
             collections: CollectionStore::new(&test_collections_settings()),
         }
@@ -258,12 +321,17 @@ mod tests {
     fn commit_if_newer_discards_collections() {
         use roaring::RoaringBitmap;
 
+        use crate::collections::CollectionBitmaps;
+
         let settings = test_collections_settings();
         let state = AppState::new(snapshot_with_index(10));
-        state
-            .snapshot()
-            .collections
-            .insert("deck", Arc::new(RoaringBitmap::from_iter([1])));
+        state.snapshot().collections.insert(
+            "deck",
+            Arc::new(CollectionBitmaps {
+                unique: RoaringBitmap::from_iter([1]),
+                nonunique: RoaringBitmap::new(),
+            }),
+        );
         assert!(state.snapshot().collections.contains("deck"));
 
         state

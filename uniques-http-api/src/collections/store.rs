@@ -7,15 +7,30 @@ use roaring::RoaringBitmap;
 
 use crate::config::CollectionsSettings;
 
+/// A named collection resolves to one bitmap per card kind — a collection can mix unique and
+/// non-unique references (see `docs/non-unique-refonte-decisions.md`), and the two live in
+/// separate bit spaces just like the rest of the unique/non-unique split.
+#[derive(Debug, Default, Clone)]
+pub struct CollectionBitmaps {
+    pub unique: RoaringBitmap,
+    pub nonunique: RoaringBitmap,
+}
+
+impl CollectionBitmaps {
+    fn serialized_size(&self) -> usize {
+        self.unique.serialized_size() + self.nonunique.serialized_size()
+    }
+}
+
 #[derive(Clone)]
 pub struct CollectionStore {
-    cache: Cache<String, Arc<RoaringBitmap>>,
+    cache: Cache<String, Arc<CollectionBitmaps>>,
 }
 
 impl CollectionStore {
     pub fn new(settings: &CollectionsSettings) -> Self {
         let mut builder = Cache::builder()
-            .weigher(|key: &String, value: &Arc<RoaringBitmap>| -> u32 {
+            .weigher(|key: &String, value: &Arc<CollectionBitmaps>| -> u32 {
                 let key_weight = key.len();
                 let bitmap_weight = value.serialized_size();
                 (key_weight + bitmap_weight)
@@ -36,11 +51,11 @@ impl CollectionStore {
         }
     }
 
-    pub fn insert(&self, id: &str, bitmap: Arc<RoaringBitmap>) {
-        self.cache.insert(id.to_string(), bitmap);
+    pub fn insert(&self, id: &str, bitmaps: Arc<CollectionBitmaps>) {
+        self.cache.insert(id.to_string(), bitmaps);
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<RoaringBitmap>> {
+    pub fn get(&self, id: &str) -> Option<Arc<CollectionBitmaps>> {
         let key = id.to_string();
         self.cache.get(&key)
     }
@@ -70,9 +85,15 @@ mod tests {
         let store = CollectionStore::new(&test_settings(1024 * 1024));
         let mut bmp = RoaringBitmap::new();
         bmp.insert(42);
-        store.insert("deck1", Arc::new(bmp));
+        store.insert(
+            "deck1",
+            Arc::new(CollectionBitmaps {
+                unique: bmp,
+                nonunique: RoaringBitmap::new(),
+            }),
+        );
         let got = store.get("deck1").expect("collection present");
-        assert!(got.contains(42));
+        assert!(got.unique.contains(42));
     }
 
     #[test]

@@ -181,14 +181,26 @@ pub fn load_uniques_index_from_object_store(client: &ObjectStoreIndexClient) -> 
     load_uniques_index_from(&storage)
 }
 
+pub fn load_bundle_from_object_store(
+    client: &ObjectStoreIndexClient,
+) -> Result<super::LoadedIndexBundle> {
+    let fetch = client.fetch_version_sync()?;
+    let bytes = client.fetch_archive_bytes_sync(&fetch.sidecar)?;
+    let storage = TarZstIndexStorage::from_bytes(&bytes, client.archive_source_label())?;
+    super::load_bundle_from_storage(&storage)
+}
+
 pub fn load_app_state_from_object_store(
     client: &ObjectStoreIndexClient,
     settings: &crate::config::Settings,
 ) -> Result<crate::http::state::AppState> {
     use super::build_app_state;
 
+    let bundle = load_bundle_from_object_store(client)?;
     Ok(build_app_state(
-        load_uniques_index_from_object_store(client)?,
+        bundle.index,
+        bundle.nonunique,
+        bundle.families,
         settings,
     ))
 }

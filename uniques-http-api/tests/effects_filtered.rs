@@ -101,8 +101,13 @@ fn build_fixture() -> PathBuf {
     )
     .unwrap();
 
-    // cards.bin must be total_bit_span * 32 bytes; contents are unused by this endpoint.
-    fs::write(dir.join("cards.bin"), vec![0u8; 4 * 32]).unwrap();
+    // cards.bin must be total_bit_span * 32 bytes with non-zero bytes for populated slots
+    // so `build_present_cards` treats all 4 cards as indexed (byte 0 = faction_code 1 = AX).
+    let mut cards_bin = vec![0u8; 4 * 32];
+    for card_idx in 0..4 {
+        cards_bin[card_idx * 32] = 1;
+    }
+    fs::write(dir.join("cards.bin"), cards_bin).unwrap();
 
     let write_roar = |name: &str, bits: &[u32]| {
         let mut bm = RoaringBitmap::new();
@@ -231,4 +236,17 @@ async fn wrong_type_co_constraint_is_bad_request() {
     // effect[0][t]=3 -> id 3 is an OUTPUT, not a TRIGGER.
     let (status, _) = call(test_server(), "effect%5B0%5D%5Bt%5D=3&editing=output:0").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn has_no_effect_filters_effect_suggestions() {
+    let (status_true, body_true) =
+        call(test_server(), "hasNoEffect=true&editing=trigger:0").await;
+    assert_eq!(status_true, 200);
+    assert!(ids(&body_true).is_empty());
+
+    let (status_false, body_false) =
+        call(test_server(), "hasNoEffect=false&editing=trigger:0").await;
+    assert_eq!(status_false, 200);
+    assert_eq!(ids(&body_false), vec![1, 7]);
 }

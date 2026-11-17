@@ -11,6 +11,10 @@ pub struct CardsIter {
     pub total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<u32>,
+    /// Echoes the request's `page` when page-based pagination was used (mutually exclusive with
+    /// `cursor` — see `CardsRequest::page`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,6 +49,20 @@ pub struct CardSubTypeV2 {
     pub name: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardTypeV2 {
+    pub reference: String,
+    pub name: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardRarityV2 {
+    pub reference: String,
+    pub name: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CardV2 {
@@ -53,14 +71,37 @@ pub struct CardV2 {
     pub artist: String,
     pub set: CardSetV2,
     pub card_sub_types: Vec<CardSubTypeV2>,
-    pub main_cost: u8,
-    pub recall_cost: u8,
-    pub forest_power: u8,
-    pub mountain_power: u8,
-    pub ocean_power: u8,
+    pub main_cost: Option<u8>,
+    pub recall_cost: Option<u8>,
+    pub forest_power: Option<u8>,
+    pub mountain_power: Option<u8>,
+    pub ocean_power: Option<u8>,
     pub faction: CardFaction,
     pub main_effect: BTreeMap<String, String>,
     pub echo_effect: BTreeMap<String, String>,
+    /// `SET-FAMILY-...` (e.g. `BTG-011-U-5`, `BTG-001-C`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collector_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_type: Option<CardTypeV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rarity: Option<CardRarityV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_serialized: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_banned: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_errated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_suspended: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permanent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legal_formats: Option<Vec<String>>,
     #[serde(rename = "debug_bga_trigram", skip_serializing_if = "Option::is_none")]
     pub debug_bga_trigram: Option<String>,
 }
@@ -144,7 +185,7 @@ pub(crate) struct AbilityFilters {
     pub(crate) support_o: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompareOp {
     Gt,
     Gte,
@@ -152,27 +193,70 @@ pub(crate) enum CompareOp {
     Lte,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CostRelation {
+    Equal,
+    MainHigher,
+    RecallHigher,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum CostPredicate {
     Exact(u8),
     AnyOf(Vec<u8>),
-    Range { op: CompareOp, value: u8 },
+    RangeBounds(Vec<(CompareOp, u8)>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortField {
+    MainCost,
+    RecallCost,
+    ForestPower,
+    MountainPower,
+    OceanPower,
+    SetDate,
+    Collector,
+    Reference,
+    Name(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardsSort {
+    pub field: SortField,
+    pub dir: SortDir,
 }
 
 #[derive(Debug, Clone)]
 pub struct CardsRequest {
     pub limit: usize,
     pub cursor: Option<u32>,
+    /// 1-indexed direct page access (via bitmap rank/select), mutually exclusive with `cursor`.
+    /// See `uniques-http-api/plans/20-page-pagination.md`.
+    pub page: Option<u32>,
+    pub sort: Option<CardsSort>,
     pub filters: AbilityFilters,
     pub factions: Vec<Faction>,
     pub sets: Vec<String>,
     pub refs: Vec<String>,
+    pub collector_numbers: Vec<String>,
     pub main_cost: Option<CostPredicate>,
     pub recall_cost: Option<CostPredicate>,
     pub forest_power: Option<CostPredicate>,
     pub mountain_power: Option<CostPredicate>,
     pub ocean_power: Option<CostPredicate>,
     pub name: Option<String>,
+    pub cost_relation: Option<CostRelation>,
+    pub sub_types: Vec<String>,
+    pub has_no_effect: Option<bool>,
+    /// Unified search box: OR across name substring, exact reference, exact collector number.
+    /// Independent of `name`/`refs`/`collector_numbers`, which keep their own AND semantics.
+    pub q: Option<String>,
     pub debug_bga_trigram: bool,
     pub with_families: bool,
     pub format: Option<String>,

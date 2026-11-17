@@ -7,6 +7,7 @@ pub fn faction_display_name(code: &str) -> Option<&'static str> {
         "MU" => Some("Muna"),
         "OR" => Some("Ordis"),
         "YZ" => Some("Yzmir"),
+        "NE" => Some("Neutral"),
         _ => None,
     }
 }

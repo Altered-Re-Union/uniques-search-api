@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,13 +26,18 @@ use crate::index::UniquesIndex;
 pub mod archive;
 pub mod disk;
 pub mod http;
+pub mod nonunique;
 pub mod object_store;
 pub mod storage;
 
 pub use archive::TarZstIndexStorage;
 pub use disk::DiskIndexStorage;
 pub use http::{load_app_state_from_http, load_index_from_http, HttpIndexClient};
-pub use object_store::{load_app_state_from_object_store, load_index_from_object_store, ObjectStoreIndexClient};
+pub use nonunique::{load_nonunique_index, NonUniqueQueryIndex};
+pub use object_store::{
+    load_app_state_from_object_store, load_bundle_from_object_store, load_index_from_object_store,
+    ObjectStoreIndexClient,
+};
 pub use storage::IndexStorage;
 
 use storage::{read_json, read_roar, read_roar_id_gd};
@@ -119,6 +125,42 @@ pub fn build_set_bitmaps(catalog: &Catalog) -> SetBitmaps {
     }
 }
 
+/// One bitmap per `CardSubTypeReference`, expanded from each family's bit-span — mirrors
+/// `build_set_bitmaps` exactly, but a family can carry more than one subtype, so a print can end
+/// up in more than one bitmap here (unlike sets, which partition the cards).
+///
+/// Derived entirely from `catalog.json` (`family.card_sub_types` is already there for display) —
+/// no new bitmap files, no `cli-indexer` changes needed.
+pub fn build_subtype_bitmaps(catalog: &Catalog) -> BTreeMap<String, RoaringBitmap> {
+    let mut by_subtype: BTreeMap<String, RoaringBitmap> = BTreeMap::new();
+    for family in &catalog.families {
+        if family.card_sub_types.is_empty() || family.max_unique_id == 0 {
+            continue;
+        }
+        let end = family.start_bit.saturating_add(family.max_unique_id);
+        for sub_type in &family.card_sub_types {
+            let key = sub_type.reference.trim().to_ascii_uppercase();
+            if key.is_empty() {
+                continue;
+            }
+            by_subtype
+                .entry(key)
+                .or_insert_with(RoaringBitmap::new)
+                .insert_range(family.start_bit..end);
+        }
+    }
+    by_subtype
+}
+
+/// `Ok(empty bitmap)` when `relative_path` isn't present — a status flag with zero matches on
+/// this set, or an index built before status flags existed, are indistinguishable and both fine.
+fn load_status_flag(storage: &impl IndexStorage, relative_path: &str) -> Result<RoaringBitmap> {
+    if !storage.has_file(relative_path) {
+        return Ok(RoaringBitmap::new());
+    }
+    read_roar(storage, relative_path)
+}
+
 /// Lowercased locale names per catalog family row, built once at index load.
 #[derive(Debug, Clone)]
 pub struct NameSearchIndex {
@@ -203,6 +245,225 @@ impl FamilyLookupIndex {
     }
 }
 
+/// Precomputed contiguous `card_index` half-open range `[start, end)` for one catalog family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FamilySpanRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Pre-sorted catalog family ranges built once at index load so family-level
+/// sorts (`setDate`, `collector`, `reference`, `name`) paginate without scanning
+/// or sorting millions of individual cards per request.
+#[derive(Debug, Clone, Default)]
+pub struct FamilySortIndex {
+    pub set_date_asc: Vec<FamilySpanRange>,
+    pub set_date_desc: Vec<FamilySpanRange>,
+    pub collector_asc: Vec<FamilySpanRange>,
+    pub reference_asc: Vec<FamilySpanRange>,
+    pub name_asc_by_locale: BTreeMap<String, Vec<FamilySpanRange>>,
+}
+
+fn family_set_code<'a>(catalog: &'a Catalog, family: &'a index_core::catalog::FamilyEntry) -> &'a str {
+    family.source_set.as_deref().unwrap_or(&catalog.set)
+}
+
+pub(crate) fn set_release_rank(set_ref: &str) -> (usize, &str) {
+    let rank = match set_ref {
+        "CORE" => 0,
+        "COREKS" => 1,
+        "ALIZE" => 2,
+        "BISE" => 3,
+        "JUDGE" => 4,
+        "WCQ25" => 5,
+        "WCF25" => 6,
+        "WCS25" => 7,
+        "CYCLONE" => 8,
+        "DUSTER" => 9,
+        "DUSTERCB" => 10,
+        "DUSTEROP" => 11,
+        "DUSTERTOP" => 12,
+        "TCS3" => 13,
+        "MUSUBI" => 14,
+        "EOLE" => 15,
+        "EOLECB" => 16,
+        "EOLEOP" => 17,
+        "EOLETOP" => 18,
+        "FUGUE" => 19,
+        "WCS26" => 20,
+        _ => usize::MAX,
+    };
+    (rank, set_ref)
+}
+
+pub(crate) fn faction_sort_rank(faction: &str) -> (usize, &str) {
+    let rank = match faction {
+        "AX" => 0,
+        "BR" => 1,
+        "LY" => 2,
+        "MU" => 3,
+        "OR" => 4,
+        "YZ" => 5,
+        "NE" => 6,
+        _ => usize::MAX,
+    };
+    (rank, faction)
+}
+
+fn numeric_family_key(family_number: &str) -> (u32, &str) {
+    (family_number.parse::<u32>().unwrap_or(u32::MAX), family_number)
+}
+
+fn family_range(family: &index_core::catalog::FamilyEntry) -> FamilySpanRange {
+    FamilySpanRange {
+        start: family.start_bit,
+        end: family.start_bit.saturating_add(family.max_unique_id),
+    }
+}
+
+pub fn build_family_sort_index(catalog: &Catalog) -> FamilySortIndex {
+    let count = catalog.families.len();
+    let mut indices: Vec<usize> = (0..count).collect();
+
+    indices.sort_by(|&a, &b| {
+        let fa = &catalog.families[a];
+        let fb = &catalog.families[b];
+        let ka = (
+            set_release_rank(family_set_code(catalog, fa)),
+            faction_sort_rank(&fa.faction),
+            numeric_family_key(&fa.family_number),
+            fa.start_bit,
+        );
+        let kb = (
+            set_release_rank(family_set_code(catalog, fb)),
+            faction_sort_rank(&fb.faction),
+            numeric_family_key(&fb.family_number),
+            fb.start_bit,
+        );
+        ka.cmp(&kb)
+    });
+    let set_date_asc = indices.iter().map(|&i| family_range(&catalog.families[i])).collect();
+
+    indices.sort_by(|&a, &b| {
+        let fa = &catalog.families[a];
+        let fb = &catalog.families[b];
+        let ka = (
+            Reverse(set_release_rank(family_set_code(catalog, fa))),
+            faction_sort_rank(&fa.faction),
+            numeric_family_key(&fa.family_number),
+            fa.start_bit,
+        );
+        let kb = (
+            Reverse(set_release_rank(family_set_code(catalog, fb))),
+            faction_sort_rank(&fb.faction),
+            numeric_family_key(&fb.family_number),
+            fb.start_bit,
+        );
+        ka.cmp(&kb)
+    });
+    let set_date_desc = indices.iter().map(|&i| family_range(&catalog.families[i])).collect();
+
+    indices.sort_by(|&a, &b| {
+        let fa = &catalog.families[a];
+        let fb = &catalog.families[b];
+        let set_a = family_set_code(catalog, fa);
+        let set_b = family_set_code(catalog, fb);
+        let code_a = fa.set.code.as_deref().unwrap_or(set_a);
+        let code_b = fb.set.code.as_deref().unwrap_or(set_b);
+        let col_a = fa.collector_family_number.as_deref().unwrap_or(&fa.family_number);
+        let col_b = fb.collector_family_number.as_deref().unwrap_or(&fb.family_number);
+        let ka = (
+            code_a,
+            faction_sort_rank(&fa.faction),
+            numeric_family_key(col_a),
+            set_release_rank(set_a),
+            fa.start_bit,
+        );
+        let kb = (
+            code_b,
+            faction_sort_rank(&fb.faction),
+            numeric_family_key(col_b),
+            set_release_rank(set_b),
+            fb.start_bit,
+        );
+        ka.cmp(&kb)
+    });
+    let collector_asc = indices.iter().map(|&i| family_range(&catalog.families[i])).collect();
+
+    indices.sort_by(|&a, &b| {
+        let fa = &catalog.families[a];
+        let fb = &catalog.families[b];
+        let ka = (
+            family_set_code(catalog, fa),
+            fa.faction.as_str(),
+            fa.family_number.as_str(),
+            fa.start_bit,
+        );
+        let kb = (
+            family_set_code(catalog, fb),
+            fb.faction.as_str(),
+            fb.family_number.as_str(),
+            fb.start_bit,
+        );
+        ka.cmp(&kb)
+    });
+    let reference_asc = indices.iter().map(|&i| family_range(&catalog.families[i])).collect();
+
+    let mut locales = BTreeSet::new();
+    locales.insert("en_US".to_string());
+    for family in &catalog.families {
+        for loc in family.name.keys() {
+            locales.insert(loc.clone());
+        }
+    }
+
+    let mut name_asc_by_locale = BTreeMap::new();
+    for locale in locales {
+        let normalized: Vec<String> = catalog
+            .families
+            .iter()
+            .map(|f| {
+                let raw = f
+                    .name
+                    .get(&locale)
+                    .or_else(|| f.name.get("en_US"))
+                    .or_else(|| f.name.values().next())
+                    .map(String::as_str)
+                    .unwrap_or("");
+                normalize_name_for_search(raw)
+            })
+            .collect();
+
+        let mut loc_indices: Vec<usize> = (0..count).collect();
+        loc_indices.sort_by(|&a, &b| {
+            let fa = &catalog.families[a];
+            let fb = &catalog.families[b];
+            (
+                normalized[a].as_str(),
+                set_release_rank(family_set_code(catalog, fa)),
+                fa.start_bit,
+            )
+                .cmp(&(
+                    normalized[b].as_str(),
+                    set_release_rank(family_set_code(catalog, fb)),
+                    fb.start_bit,
+                ))
+        });
+        name_asc_by_locale.insert(
+            locale,
+            loc_indices.iter().map(|&i| family_range(&catalog.families[i])).collect(),
+        );
+    }
+
+    FamilySortIndex {
+        set_date_asc,
+        set_date_desc,
+        collector_asc,
+        reference_asc,
+        name_asc_by_locale,
+    }
+}
+
 /// One logical family in merge order; CORE+COREKS rows with the same `family_id` share one range.
 #[derive(Debug, Clone)]
 pub struct FamilySpanGroup {
@@ -259,6 +520,97 @@ pub fn build_family_lookup_index(catalog: &Catalog) -> FamilyLookupIndex {
     FamilyLookupIndex { by_key }
 }
 
+/// Keyed on the collector number's own `SET-FAMILY` segments (e.g. `("BTG", "011")`), which use a
+/// **different** namespace than `FamilyKey`'s `(set reference, faction, family_number)` — the set
+/// segment is the display `code` (`BTG`), not the internal set reference (`COREKS`), and the family
+/// segment is `collector_family_number`, unrelated to `family_number`. See
+/// `cli-indexer/plans/24-collector-number-ingestion.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CollectorNumberKey {
+    pub set_code: String,
+    pub family_collector_number: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectorNumberLookupIndex {
+    by_key: HashMap<CollectorNumberKey, Vec<FamilySpan>>,
+}
+
+impl CollectorNumberLookupIndex {
+    pub fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    pub fn spans(
+        &self,
+        set_code: &str,
+        family_collector_number: &str,
+    ) -> Option<&[FamilySpan]> {
+        let key = CollectorNumberKey {
+            set_code: set_code.trim().to_ascii_uppercase(),
+            family_collector_number: family_collector_number.trim().to_ascii_uppercase(),
+        };
+        self.by_key.get(&key).map(Vec::as_slice)
+    }
+
+    pub fn resolve_all(
+        &self,
+        set_code: &str,
+        family_collector_number: &str,
+        unique_id: u32,
+    ) -> Result<Vec<u32>, FamilyResolveError> {
+        let Some(spans) = self.spans(set_code, family_collector_number) else {
+            return Err(FamilyResolveError::NotFound);
+        };
+        if unique_id == 0 {
+            return Err(FamilyResolveError::Padding);
+        }
+        let matches: Vec<u32> = spans
+            .iter()
+            .filter(|span| unique_id <= span.max_unique_id)
+            .map(|span| span.start_bit + unique_id - 1)
+            .collect();
+        if matches.is_empty() {
+            return Err(FamilyResolveError::Padding);
+        }
+        Ok(matches)
+    }
+
+    pub fn resolve(
+        &self,
+        set_code: &str,
+        family_collector_number: &str,
+        unique_id: u32,
+    ) -> Result<u32, FamilyResolveError> {
+        self.resolve_all(set_code, family_collector_number, unique_id)
+            .map(|v| v[0])
+    }
+}
+
+/// Families missing either `set.code` or `collector_family_number` (older index, or the deferred
+/// `cardsdata.rs` path) are simply absent from this index — resolution for them falls through to
+/// `NotFound`, matching the `Option`-all-the-way-down tolerance the rest of this field uses.
+pub fn build_collector_number_lookup_index(catalog: &Catalog) -> CollectorNumberLookupIndex {
+    let mut by_key: HashMap<CollectorNumberKey, Vec<FamilySpan>> = HashMap::new();
+    for family in &catalog.families {
+        let (Some(set_code), Some(family_collector_number)) = (
+            family.set.code.as_deref(),
+            family.collector_family_number.as_deref(),
+        ) else {
+            continue;
+        };
+        let key = CollectorNumberKey {
+            set_code: set_code.trim().to_ascii_uppercase(),
+            family_collector_number: family_collector_number.trim().to_ascii_uppercase(),
+        };
+        by_key.entry(key).or_default().push(FamilySpan {
+            start_bit: family.start_bit,
+            max_unique_id: family.max_unique_id,
+        });
+    }
+    CollectorNumberLookupIndex { by_key }
+}
+
 pub fn build_name_search_index(catalog: &Catalog) -> NameSearchIndex {
     let by_family = catalog
         .families
@@ -272,6 +624,87 @@ pub fn build_name_search_index(catalog: &Catalog) -> NameSearchIndex {
         })
         .collect();
     NameSearchIndex { by_family }
+}
+
+/// Precomputed bitmaps comparing `MainCost` and `RecallCost` (`stats[MainCost]` vs `stats[RecallCost]`).
+#[derive(Debug, Clone, Default)]
+pub struct CostRelationBitmaps {
+    pub equal: RoaringBitmap,
+    pub main_higher: RoaringBitmap,
+    pub recall_higher: RoaringBitmap,
+}
+
+/// Build cost-relation bitmaps from the 16-bucket stat bitmaps without scanning `cards.bin`.
+pub fn build_cost_relation_bitmaps(
+    stats: &BTreeMap<StatField, [RoaringBitmap; 16]>,
+) -> CostRelationBitmaps {
+    let (Some(main_by_cost), Some(recall_by_cost)) = (
+        stats.get(&StatField::MainCost),
+        stats.get(&StatField::RecallCost),
+    ) else {
+        return CostRelationBitmaps::default();
+    };
+
+    let mut out = CostRelationBitmaps::default();
+    let mut recall_lt = RoaringBitmap::new();
+    for m in 0..16 {
+        let main_bm = &main_by_cost[m];
+        if !main_bm.is_empty() {
+            if !recall_by_cost[m].is_empty() {
+                out.equal |= main_bm & &recall_by_cost[m];
+            }
+            if !recall_lt.is_empty() {
+                out.main_higher |= main_bm & &recall_lt;
+            }
+        }
+        recall_lt |= &recall_by_cost[m];
+    }
+
+    let mut main_lt = RoaringBitmap::new();
+    for r in 0..16 {
+        let recall_bm = &recall_by_cost[r];
+        if !recall_bm.is_empty() && !main_lt.is_empty() {
+            out.recall_higher |= recall_bm & &main_lt;
+        }
+        main_lt |= &main_by_cost[r];
+    }
+
+    out
+}
+
+/// Build bitmap of populated cards in `cards.bin` (any record with a non-zero byte),
+/// excluding unindexed / gap slots inside family spans.
+pub fn build_present_cards(cards: &[u8]) -> RoaringBitmap {
+    let mut present = RoaringBitmap::new();
+    for (idx, rec) in cards.chunks_exact(RECORD_SIZE).enumerate() {
+        if rec.iter().any(|&b| b != 0) {
+            present.insert(idx as u32);
+        }
+    }
+    present
+}
+
+/// Build bitmap of populated cards with zero effects across `id_gd_whole`, `id_gd_per_line`, and `cards.bin`.
+pub fn build_no_effect_bitmap(
+    present_cards: &RoaringBitmap,
+    cards: &[u8],
+    id_gd_whole: &BTreeMap<u32, RoaringBitmap>,
+    id_gd_per_line: &BTreeMap<(u32, EffectLine), RoaringBitmap>,
+) -> RoaringBitmap {
+    let mut has_effect = RoaringBitmap::new();
+    for bm in id_gd_whole.values() {
+        has_effect |= bm;
+    }
+    for bm in id_gd_per_line.values() {
+        has_effect |= bm;
+    }
+    for (idx, rec) in cards.chunks_exact(RECORD_SIZE).enumerate() {
+        if rec.len() > 6 && rec[6..].iter().any(|&b| b != 0) {
+            has_effect.insert(idx as u32);
+        }
+    }
+
+    present_cards - &has_effect
 }
 
 pub enum AnyIndexStorage {
@@ -377,6 +810,19 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
     eprintln!("  faction bitmaps: {}", factions.len());
 
     let set_bitmaps = build_set_bitmaps(&catalog);
+    let subtype_bitmaps = build_subtype_bitmaps(&catalog);
+    eprintln!("  subtype bitmaps: {} subtypes", subtype_bitmaps.len());
+
+    let banned = load_status_flag(storage, "status/banned.roar")?;
+    let errated = load_status_flag(storage, "status/errated.roar")?;
+    let suspended = load_status_flag(storage, "status/suspended.roar")?;
+    eprintln!(
+        "  status flags: banned={} errated={} suspended={}",
+        banned.len(),
+        errated.len(),
+        suspended.len()
+    );
+
     eprintln!(
         "  set bitmaps: {} sets{}",
         set_bitmaps.by_set.len(),
@@ -404,6 +850,25 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
         "  family span groups: {} ({} catalog rows)",
         family_span_groups.len(),
         catalog.families.len()
+    );
+
+    let family_sort_index = build_family_sort_index(&catalog);
+
+    let cost_relations = build_cost_relation_bitmaps(&stats);
+    let present_cards = build_present_cards(&cards);
+    let no_effect_bitmap =
+        build_no_effect_bitmap(&present_cards, &cards, &id_gd_whole, &id_gd_per_line);
+    eprintln!(
+        "  derived bitmaps: {} present_cards, {} subtypes, {} no_effect cards",
+        present_cards.len(),
+        subtype_bitmaps.len(),
+        no_effect_bitmap.len()
+    );
+
+    let collector_number_lookup_index = build_collector_number_lookup_index(&catalog);
+    eprintln!(
+        "  collector number lookup index: {} families",
+        collector_number_lookup_index.len()
     );
 
     let id_gd_aliases = IdGdAliasMap::from_catalog(&idgd_catalog);
@@ -434,9 +899,18 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
         stats,
         factions,
         set_bitmaps,
+        cost_relations,
+        subtype_bitmaps,
+        no_effect_bitmap,
+        banned,
+        errated,
+        suspended,
         name_search_index,
         family_lookup_index,
         family_span_groups,
+        family_sort_index,
+        collector_number_lookup_index,
+        present_cards,
         effects_body,
     })
 }
@@ -446,11 +920,57 @@ pub fn load_uniques_index(index_dir: &Path) -> Result<UniquesIndex> {
     load_uniques_index_from(&DiskIndexStorage::new(index_dir)?)
 }
 
+/// `Ok(empty)` when this storage root has no `families.json` — older build, or nothing built via
+/// the CardsData path yet.
+pub fn load_family_catalog(
+    storage: &impl IndexStorage,
+) -> Result<BTreeMap<i64, index_core::family_catalog::FamilyCatalogEntry>> {
+    if !storage.has_file("families.json") {
+        return Ok(BTreeMap::new());
+    }
+    let catalog: index_core::family_catalog::FamilyCatalog = read_json(storage, "families.json")?;
+    Ok(catalog.families.into_iter().map(|f| (f.id, f)).collect())
+}
+
+/// Full loaded index bundle: unique index + optional non-unique index + shared family catalog.
+pub struct LoadedIndexBundle {
+    pub index: UniquesIndex,
+    pub nonunique: Option<NonUniqueQueryIndex>,
+    pub families: BTreeMap<i64, index_core::family_catalog::FamilyCatalogEntry>,
+}
+
+/// Load unique index, optional `nonunique/`, and optional `families.json` from any [`IndexStorage`].
+pub fn load_bundle_from_storage(storage: &impl IndexStorage) -> Result<LoadedIndexBundle> {
+    let index = load_uniques_index_from(storage)?;
+    let nonunique = load_nonunique_index(storage)?;
+    let families = load_family_catalog(storage)?;
+    Ok(LoadedIndexBundle {
+        index,
+        nonunique,
+        families,
+    })
+}
+
 /// Load index and format filters; wrap in [`AppState`].
 pub fn load_app_state(settings: &Settings) -> Result<AppState> {
-    let index = match settings.index.source {
+    let mut bundle = match settings.index.source {
         crate::config::IndexSourceKind::Disk | crate::config::IndexSourceKind::Archive => {
-            load_uniques_index_from(&open_index_storage(&settings.index_path()?)?)?
+            let index_path = settings.index_path()?;
+            let storage = open_index_storage(&index_path)?;
+            let mut bundle = load_bundle_from_storage(&storage)?;
+            if index_path.is_file() {
+                if let Some(parent_dir) = index_path.parent().filter(|p| p.is_dir()) {
+                    if let Ok(disk_storage) = DiskIndexStorage::new(parent_dir) {
+                        if bundle.nonunique.is_none() {
+                            bundle.nonunique = load_nonunique_index(&disk_storage)?;
+                        }
+                        if bundle.families.is_empty() {
+                            bundle.families = load_family_catalog(&disk_storage)?;
+                        }
+                    }
+                }
+            }
+            bundle
         }
         crate::config::IndexSourceKind::ObjectStore => {
             bail!("load_app_state for object_store: use load_index_from_object_store in main")
@@ -459,16 +979,31 @@ pub fn load_app_state(settings: &Settings) -> Result<AppState> {
             bail!("load_app_state for http: use load_index_from_http in main")
         }
     };
-    Ok(build_app_state(index, settings))
+    Ok(build_app_state(
+        bundle.index,
+        bundle.nonunique.take(),
+        bundle.families,
+        settings,
+    ))
 }
 
-pub fn build_app_state(index: UniquesIndex, settings: &Settings) -> AppState {
+pub fn build_app_state(
+    index: UniquesIndex,
+    mut nonunique: Option<NonUniqueQueryIndex>,
+    families: BTreeMap<i64, index_core::family_catalog::FamilyCatalogEntry>,
+    settings: &Settings,
+) -> AppState {
+    if let Some(ref mut nu) = nonunique {
+        nu.bind_families(&families);
+    }
     let formats = match settings.formats.as_ref().filter(|f| f.is_enabled()) {
         Some(formats_settings) => Arc::new(load_format_index(&index, formats_settings)),
         None => Arc::new(FormatIndex::empty()),
     };
     AppState::new(QuerySnapshot {
         index: Arc::new(index),
+        families: Arc::new(families),
+        nonunique: nonunique.map(Arc::new),
         formats,
         collections: CollectionStore::new(&settings.collections),
     })
@@ -634,6 +1169,8 @@ mod tests {
                 name: String::new(),
                 code: None,
             },
+            card_family_id: None,
+            collector_family_number: None,
         }
     }
 

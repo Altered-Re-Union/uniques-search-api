@@ -55,6 +55,12 @@ pub fn load_uniques_index_from_http(client: &HttpIndexClient) -> Result<UniquesI
     load_uniques_index_from(&storage)
 }
 
+pub fn load_bundle_from_http(client: &HttpIndexClient) -> Result<super::LoadedIndexBundle> {
+    let bytes = client.fetch_archive_bytes_sync()?;
+    let storage = TarZstIndexStorage::from_bytes(&bytes, client.url())?;
+    super::load_bundle_from_storage(&storage)
+}
+
 pub fn load_index_from_http(client: &HttpIndexClient) -> Result<crate::http::state::AppState> {
     Ok(crate::http::state::AppState::new_with_index(
         load_uniques_index_from_http(client)?,
@@ -67,5 +73,11 @@ pub fn load_app_state_from_http(
 ) -> Result<crate::http::state::AppState> {
     use super::build_app_state;
 
-    Ok(build_app_state(load_uniques_index_from_http(client)?, settings))
+    let bundle = load_bundle_from_http(client)?;
+    Ok(build_app_state(
+        bundle.index,
+        bundle.nonunique,
+        bundle.families,
+        settings,
+    ))
 }

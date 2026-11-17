@@ -1,7 +1,8 @@
 use anyhow::Result;
 
-use crate::index::loader::{load_uniques_index_from, ObjectStoreIndexClient, TarZstIndexStorage};
-use crate::index::UniquesIndex;
+use crate::index::loader::{
+    load_bundle_from_object_store, LoadedIndexBundle, ObjectStoreIndexClient,
+};
 
 use super::source::IndexSource;
 
@@ -21,11 +22,7 @@ impl IndexSource for RemoteIndexSource {
         self.client.read_version_sync()
     }
 
-    fn load_index(&self) -> Result<UniquesIndex> {
-        let fetch = self.client.fetch_version_sync()?;
-        let bytes = self.client.fetch_archive_bytes_sync(&fetch.sidecar)?;
-        let storage =
-            TarZstIndexStorage::from_bytes(&bytes, self.client.archive_source_label())?;
-        load_uniques_index_from(&storage)
+    fn load_bundle(&self) -> Result<LoadedIndexBundle> {
+        load_bundle_from_object_store(&self.client)
     }
 }

@@ -2,6 +2,7 @@ mod cards;
 mod error;
 
 pub(crate) use cards::{
-    build_bitmap, card_v2_from_index, cards_from_indices, families_from_bitmap, page_cards_v2,
+    build_bitmap, card_v2_from_index, cards_from_indices, enrich_unique_card_v2,
+    families_from_bitmap, nonunique_card_v2, page_cards_v2_sorted, subtype_names_from_index,
 };
 pub use error::QueryError;

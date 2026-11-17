@@ -10,8 +10,8 @@ use crate::http::api::error::{bad_request, collection_not_loaded, internal_serve
 use crate::collections::validate_collection_id;
 use crate::index::UniquesIndex;
 use super::models::{
-    AbilityFilters, CardsRequest, CompareOp, CostPredicate, EffectCombineMode,
-    EffectSlotFilter, IdGdSelector,
+    AbilityFilters, CardsRequest, CardsSort, CompareOp, CostPredicate, CostRelation,
+    EffectCombineMode, EffectSlotFilter, IdGdSelector, SortDir, SortField,
 };
 
 
@@ -31,11 +31,11 @@ pub(crate) fn parse_query_multimap(query: Option<&str>) -> ApiResult<QueryMultiM
     Ok(out)
 }
 
-fn get_first<'a>(params: &'a QueryMultiMap, key: &str) -> Option<&'a str> {
+pub(crate) fn get_first<'a>(params: &'a QueryMultiMap, key: &str) -> Option<&'a str> {
     params.get(key)?.first().map(|s| s.as_str())
 }
 
-fn has_any(params: &QueryMultiMap, key: &str) -> bool {
+pub(crate) fn has_any(params: &QueryMultiMap, key: &str) -> bool {
     params.get(key).is_some_and(|v| v.iter().any(|s| !s.trim().is_empty()))
 }
 
@@ -55,7 +55,7 @@ pub(crate) fn parse_collection(params: &QueryMultiMap) -> Option<String> {
     Some(last)
 }
 
-fn resolve_collection_filter(
+pub(crate) fn resolve_collection_filter(
     collection_id: Option<String>,
     collections: &CollectionStore,
 ) -> ApiResult<Option<String>> {
@@ -88,7 +88,7 @@ pub(crate) fn parse_format(params: &QueryMultiMap) -> Option<String> {
     Some(last)
 }
 
-fn resolve_format_filter(
+pub(crate) fn resolve_format_filter(
     format_id: Option<String>,
     formats_enabled: bool,
     format_index: &FormatIndex,
@@ -139,6 +139,19 @@ pub(crate) fn parse_request(
         }
     }
 
+    let page = match get_first(params, "page") {
+        None => None,
+        Some(v) => Some(parse_u32("page", v)?),
+    };
+    if page.is_some_and(|p| p == 0) {
+        return Err(bad_request("page must be >= 1".to_string()));
+    }
+    if cursor.is_some() && page.is_some() {
+        return Err(bad_request(
+            "cursor and page are mutually exclusive: page jumps directly to a page (via rank/select), cursor resumes after the last seen card_index".to_string(),
+        ));
+    }
+
     let mut filters = AbilityFilters::default();
     filters.effects = parse_effect_slots(params)?;
     filters.effect_mode = parse_effect_mode(params)?;
@@ -149,6 +162,7 @@ pub(crate) fn parse_request(
     let factions = parse_factions(params)?;
     let sets = parse_sets(params)?;
     let refs = parse_refs(params);
+    let collector_numbers = parse_collector_numbers(params);
     for code in &sets {
         if !state.set_bitmaps().by_set.contains_key(code) {
             return Err(bad_request(format!("invalid set value '{code}'")));
@@ -160,6 +174,11 @@ pub(crate) fn parse_request(
     let mountain_power = parse_cost_predicate(params, "mountainPower")?;
     let ocean_power = parse_cost_predicate(params, "oceanPower")?;
     let name = parse_name(params);
+    let cost_relation = parse_cost_relation(params)?;
+    let sub_types = parse_sub_types(params);
+    let has_no_effect = parse_has_no_effect(params)?;
+    let sort = parse_sort(params)?;
+    let q = parse_q(params);
     let debug_bga_trigram = params.contains_key("debug_bga_trigram");
     let with_families = params.contains_key("withFamilies");
 
@@ -171,16 +190,23 @@ pub(crate) fn parse_request(
     Ok(CardsRequest {
         limit,
         cursor,
+        page,
+        sort,
         filters,
         factions,
         sets,
         refs,
+        collector_numbers,
         main_cost,
         recall_cost,
         forest_power,
         mountain_power,
         ocean_power,
         name,
+        cost_relation,
+        sub_types,
+        has_no_effect,
+        q,
         debug_bga_trigram,
         with_families,
         format,
@@ -188,7 +214,7 @@ pub(crate) fn parse_request(
     })
 }
 
-fn parse_name(params: &QueryMultiMap) -> Option<String> {
+pub(crate) fn parse_name(params: &QueryMultiMap) -> Option<String> {
     let raw = get_first(params, "name")?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -198,7 +224,114 @@ fn parse_name(params: &QueryMultiMap) -> Option<String> {
     }
 }
 
-fn parse_id_list(params: &QueryMultiMap, key: &str) -> ApiResult<Vec<u32>> {
+fn parse_sort_dir(raw: &str, full_value: &str) -> ApiResult<SortDir> {
+    match raw.to_ascii_lowercase().as_str() {
+        "asc" => Ok(SortDir::Asc),
+        "desc" => Ok(SortDir::Desc),
+        _ => Err(bad_request(format!(
+            "invalid sort value '{full_value}': expected direction ':asc' or ':desc'"
+        ))),
+    }
+}
+
+fn canonical_sort_locale(raw: &str) -> &'static str {
+    match raw.to_ascii_lowercase().as_str() {
+        "fr" | "fr_fr" => "fr_FR",
+        "de" | "de_de" => "de_DE",
+        "es" | "es_es" => "es_ES",
+        "it" | "it_it" => "it_IT",
+        _ => "en_US",
+    }
+}
+
+pub(crate) fn parse_sort(params: &QueryMultiMap) -> ApiResult<Option<CardsSort>> {
+    let Some(raw) = get_first(params, "sort") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return Ok(None);
+    }
+
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    let (field_part, locale_part, dir_part) = match parts.as_slice() {
+        [field, dir] => (*field, None, *dir),
+        [field, locale, dir] if field.eq_ignore_ascii_case("name") => (*field, Some(*locale), *dir),
+        _ => {
+            return Err(bad_request(format!(
+                "invalid sort value '{trimmed}': expected '<field>:<asc|desc>' or 'name:<locale>:<asc|desc>'"
+            )));
+        }
+    };
+
+    let dir = parse_sort_dir(dir_part, trimmed)?;
+    let field = match field_part.to_ascii_lowercase().as_str() {
+        "maincost" | "main_cost" | "mana" => SortField::MainCost,
+        "recallcost" | "recall_cost" | "reserve" => SortField::RecallCost,
+        "forestpower" | "forest_power" | "forest" => SortField::ForestPower,
+        "mountainpower" | "mountain_power" | "mountain" => SortField::MountainPower,
+        "oceanpower" | "ocean_power" | "ocean" => SortField::OceanPower,
+        "setdate" | "set_date" => SortField::SetDate,
+        "collector" => SortField::Collector,
+        "reference" | "number" => SortField::Reference,
+        "name" => SortField::Name(canonical_sort_locale(locale_part.unwrap_or("en_US")).to_string()),
+        _ => {
+            return Err(bad_request(format!(
+                "unsupported sort field '{field_part}' in '{trimmed}'"
+            )));
+        }
+    };
+
+    Ok(Some(CardsSort { field, dir }))
+}
+
+/// Unified search box term: OR across name substring / exact ref / exact collector number. Same
+/// trim/empty rule as `parse_name`.
+pub(crate) fn parse_q(params: &QueryMultiMap) -> Option<String> {
+    let raw = get_first(params, "q")?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub(crate) fn parse_collector_numbers(params: &QueryMultiMap) -> Vec<String> {
+    // Spec: collectorNumber[] repeated keys
+    // Convenience: collectorNumber=A,B,C (CSV)
+    let mut values: Vec<String> = Vec::new();
+    if let Some(vs) = params.get("collectorNumber[]") {
+        for v in vs {
+            for part in v.split(',') {
+                let s = part.trim();
+                if !s.is_empty() {
+                    values.push(s.to_string());
+                }
+            }
+        }
+    }
+    if let Some(vs) = params.get("collectorNumber") {
+        for v in vs {
+            for part in v.split(',') {
+                let s = part.trim();
+                if !s.is_empty() {
+                    values.push(s.to_string());
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for value in values {
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+pub(crate) fn parse_id_list(params: &QueryMultiMap, key: &str) -> ApiResult<Vec<u32>> {
     let Some(values) = params.get(key) else {
         return Ok(Vec::new());
     };
@@ -218,7 +351,7 @@ fn parse_id_list(params: &QueryMultiMap, key: &str) -> ApiResult<Vec<u32>> {
     Ok(out)
 }
 
-fn parse_effect_mode(params: &QueryMultiMap) -> ApiResult<EffectCombineMode> {
+pub(crate) fn parse_effect_mode(params: &QueryMultiMap) -> ApiResult<EffectCombineMode> {
     let Some(raw) = get_first(params, "effectMode") else {
         return Ok(EffectCombineMode::And);
     };
@@ -237,7 +370,7 @@ enum EffectFieldSelector {
 }
 
 /// Parses `effect[N][t|c|o|matchCount]` keys into ordered slots (sparse indices allowed).
-fn parse_effect_slots(params: &QueryMultiMap) -> ApiResult<Vec<EffectSlotFilter>> {
+pub(crate) fn parse_effect_slots(params: &QueryMultiMap) -> ApiResult<Vec<EffectSlotFilter>> {
     let mut by_index: BTreeMap<u32, EffectSlotFilter> = BTreeMap::new();
 
     for key in params.keys() {
@@ -364,7 +497,7 @@ fn parse_factions(params: &QueryMultiMap) -> ApiResult<Vec<Faction>> {
     Ok(out)
 }
 
-fn parse_refs(params: &QueryMultiMap) -> Vec<String> {
+pub(crate) fn parse_refs(params: &QueryMultiMap) -> Vec<String> {
     // Spec: ref[] repeated keys
     // Convenience: ref=REF1,REF2,REF3 (CSV)
     let mut refs: Vec<String> = Vec::new();
@@ -398,7 +531,7 @@ fn parse_refs(params: &QueryMultiMap) -> Vec<String> {
     out
 }
 
-fn parse_sets(params: &QueryMultiMap) -> ApiResult<Vec<String>> {
+pub(crate) fn parse_sets(params: &QueryMultiMap) -> ApiResult<Vec<String>> {
     // Spec: set[] repeated keys
     // Convenience: set=CORE,COREKS
     let mut codes: Vec<String> = Vec::new();
@@ -432,7 +565,7 @@ fn parse_sets(params: &QueryMultiMap) -> ApiResult<Vec<String>> {
     Ok(out)
 }
 
-fn parse_cost_u8(field: &str, s: &str) -> ApiResult<u8> {
+pub(crate) fn parse_cost_u8(field: &str, s: &str) -> ApiResult<u8> {
     let v = s
         .parse::<u8>()
         .map_err(|_| bad_request(format!("invalid {field} value '{s}'")))?;
@@ -444,7 +577,7 @@ fn parse_cost_u8(field: &str, s: &str) -> ApiResult<u8> {
     Ok(v)
 }
 
-fn parse_cost_array(params: &QueryMultiMap, key: &str) -> ApiResult<Option<Vec<u8>>> {
+pub(crate) fn parse_cost_array(params: &QueryMultiMap, key: &str) -> ApiResult<Option<Vec<u8>>> {
     let Some(values) = params.get(key) else {
         return Ok(None);
     };
@@ -471,7 +604,7 @@ fn parse_cost_array(params: &QueryMultiMap, key: &str) -> ApiResult<Option<Vec<u
     }
 }
 
-fn parse_cost_predicate(params: &QueryMultiMap, base: &str) -> ApiResult<Option<CostPredicate>> {
+pub(crate) fn parse_cost_predicate(params: &QueryMultiMap, base: &str) -> ApiResult<Option<CostPredicate>> {
     let exact_key = base;
     let array_key = format!("{base}[]");
     let gt_key = format!("{base}[gt]");
@@ -508,6 +641,7 @@ fn parse_cost_predicate(params: &QueryMultiMap, base: &str) -> ApiResult<Option<
         return Ok(Some(CostPredicate::AnyOf(values)));
     }
 
+    let mut bounds = Vec::new();
     for (key, op) in [
         (&gt_key, CompareOp::Gt),
         (&gte_key, CompareOp::Gte),
@@ -519,17 +653,69 @@ fn parse_cost_predicate(params: &QueryMultiMap, base: &str) -> ApiResult<Option<
             if v.is_empty() {
                 continue;
             }
-            return Ok(Some(CostPredicate::Range {
-                op,
-                value: parse_cost_u8(key, v)?,
-            }));
+            bounds.push((op, parse_cost_u8(key, v)?));
         }
+    }
+    if !bounds.is_empty() {
+        return Ok(Some(CostPredicate::RangeBounds(bounds)));
     }
 
     Ok(None)
 }
 
-fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters) -> ApiResult<()> {
+pub(crate) fn parse_cost_relation(params: &QueryMultiMap) -> ApiResult<Option<CostRelation>> {
+    let Some(raw) = get_first(params, "costRelation") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "equal" | "eq" => Ok(Some(CostRelation::Equal)),
+        "mainhigher" | "main_higher" | "main_gt" => Ok(Some(CostRelation::MainHigher)),
+        "recallhigher" | "recall_higher" | "recall_gt" => Ok(Some(CostRelation::RecallHigher)),
+        _ => Err(bad_request(format!(
+            "invalid parameter 'costRelation': expected equal|eq, mainHigher|main_gt, or recallHigher|recall_gt, got '{trimmed}'"
+        ))),
+    }
+}
+
+pub(crate) fn parse_sub_types(params: &QueryMultiMap) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["subTypes[]", "subTypes", "cardSubTypes[]", "cardSubTypes"] {
+        if let Some(values) = params.get(key) {
+            for raw in values {
+                for part in raw.split(',') {
+                    let normalized = part.trim().to_ascii_uppercase();
+                    if !normalized.is_empty() && !out.contains(&normalized) {
+                        out.push(normalized);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn parse_has_no_effect(params: &QueryMultiMap) -> ApiResult<Option<bool>> {
+    let Some(raw) = get_first(params, "hasNoEffect") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(Some(true)),
+        "false" | "0" => Ok(Some(false)),
+        _ => Err(bad_request(format!(
+            "invalid parameter 'hasNoEffect': expected true or false, got '{trimmed}'"
+        ))),
+    }
+}
+
+pub(crate) fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters) -> ApiResult<()> {
     let mut types: BTreeMap<u32, &str> = BTreeMap::new();
     for entry in &state.idgd_catalog().entries {
         types.insert(entry.id_gd, entry.element_type.as_str());
@@ -582,12 +768,12 @@ fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters) -> ApiRes
 
     Ok(())
 }
-fn parse_u32(field: &str, s: &str) -> ApiResult<u32> {
+pub(crate) fn parse_u32(field: &str, s: &str) -> ApiResult<u32> {
     s.parse::<u32>()
         .map_err(|_| bad_request(format!("invalid {field} value '{s}'")))
 }
 
-fn parse_usize(field: &str, s: &str) -> ApiResult<usize> {
+pub(crate) fn parse_usize(field: &str, s: &str) -> ApiResult<usize> {
     s.parse::<usize>()
         .map_err(|_| bad_request(format!("invalid {field} value '{s}'")))
 }
@@ -717,6 +903,61 @@ mod tests {
         let req = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &params).unwrap();
         assert!(req.refs.is_empty());
     }
+
+    #[test]
+    fn parses_collector_numbers_from_repeated_or_csv_alias() {
+        let state = test_state();
+
+        let mut params: QueryMultiMap = HashMap::new();
+        params.insert(
+            "collectorNumber[]".to_string(),
+            vec!["BTG-011-U-3".to_string(), "BTG-011-U-6".to_string()],
+        );
+        let req = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &params).unwrap();
+        assert_eq!(req.collector_numbers, vec!["BTG-011-U-3", "BTG-011-U-6"]);
+
+        let mut params2: QueryMultiMap = HashMap::new();
+        params2.insert(
+            "collectorNumber".to_string(),
+            vec!["BTG-011-U-3,BTG-011-U-6".to_string()],
+        );
+        let req2 = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &params2).unwrap();
+        assert_eq!(req2.collector_numbers, vec!["BTG-011-U-3", "BTG-011-U-6"]);
+    }
+
+    #[test]
+    fn collector_numbers_dedup_and_ignore_blank_entries() {
+        let state = test_state();
+        let mut params: QueryMultiMap = HashMap::new();
+        params.insert(
+            "collectorNumber".to_string(),
+            vec!["BTG-011-U-3, ,BTG-011-U-3".to_string()],
+        );
+        let req = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &params).unwrap();
+        assert_eq!(req.collector_numbers, vec!["BTG-011-U-3".to_string()]);
+    }
+
+    #[test]
+    fn no_collector_number_param_yields_empty() {
+        let state = test_state();
+        let params: QueryMultiMap = HashMap::new();
+        let req = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &params).unwrap();
+        assert!(req.collector_numbers.is_empty());
+    }
+
+    #[test]
+    fn q_trims_and_treats_whitespace_as_absent() {
+        let state = test_state();
+        let mut params: QueryMultiMap = HashMap::new();
+        params.insert("q".to_string(), vec!["  Kelon  ".to_string()]);
+        let req = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &params).unwrap();
+        assert_eq!(req.q.as_deref(), Some("Kelon"));
+
+        let mut blank: QueryMultiMap = HashMap::new();
+        blank.insert("q".to_string(), vec!["   ".to_string()]);
+        let req_blank = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &blank).unwrap();
+        assert!(req_blank.q.is_none());
+    }
     #[test]
     fn cost_exact_array_range_parsing_and_mixing_rejected() {
         let state = test_state();
@@ -740,7 +981,17 @@ mod tests {
         p3.insert("recallCost[lte]".to_string(), vec!["3".to_string()]);
         p3.insert("effect[0][t]".to_string(), vec!["24".to_string()]);
         let r3 = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &p3).unwrap();
-        assert!(matches!(r3.recall_cost, Some(CostPredicate::Range { .. })));
+        assert!(matches!(r3.recall_cost, Some(CostPredicate::RangeBounds(_))));
+
+        // multi-bound range
+        let mut p3b: QueryMultiMap = HashMap::new();
+        p3b.insert("mainCost[gte]".to_string(), vec!["2".to_string()]);
+        p3b.insert("mainCost[lte]".to_string(), vec!["4".to_string()]);
+        let r3b = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &p3b).unwrap();
+        match r3b.main_cost {
+            Some(CostPredicate::RangeBounds(bounds)) => assert_eq!(bounds.len(), 2),
+            other => panic!("expected RangeBounds, got {other:?}"),
+        }
 
         // reject mixing
         let mut p4: QueryMultiMap = HashMap::new();
@@ -759,6 +1010,32 @@ mod tests {
         params.insert("effect[0][t]".to_string(), vec!["24".to_string()]);
         let err = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &params).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+    #[test]
+    fn cursor_and_page_together_rejected() {
+        let state = test_state();
+        let mut params: QueryMultiMap = HashMap::new();
+        params.insert("cursor".to_string(), vec!["2".to_string()]);
+        params.insert("page".to_string(), vec!["2".to_string()]);
+        let err = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &params).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+    #[test]
+    fn page_zero_rejected() {
+        let state = test_state();
+        let mut params: QueryMultiMap = HashMap::new();
+        params.insert("page".to_string(), vec!["0".to_string()]);
+        let err = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &params).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+    #[test]
+    fn page_parses_when_valid() {
+        let state = test_state();
+        let mut params: QueryMultiMap = HashMap::new();
+        params.insert("page".to_string(), vec!["3".to_string()]);
+        let req = parse_request(state.index().as_ref(), state.formats().as_ref(), false, &state.snapshot().collections, &params).unwrap();
+        assert_eq!(req.page, Some(3));
+        assert_eq!(req.cursor, None);
     }
     #[test]
     fn invalid_effect_mode_rejected() {
@@ -951,6 +1228,113 @@ mod tests {
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(err.1["error"], "collection_not_loaded");
         assert_eq!(err.1["collection"], "deck1");
+    }
+
+    #[test]
+    fn parse_sort_handles_default_valid_and_invalid_values() {
+        assert_eq!(parse_sort(&HashMap::new()).unwrap(), None);
+
+        let mut def: QueryMultiMap = HashMap::new();
+        def.insert("sort".to_string(), vec!["default".to_string()]);
+        assert_eq!(parse_sort(&def).unwrap(), None);
+
+        let mut stat: QueryMultiMap = HashMap::new();
+        stat.insert("sort".to_string(), vec!["mainCost:desc".to_string()]);
+        assert_eq!(
+            parse_sort(&stat).unwrap(),
+            Some(CardsSort {
+                field: SortField::MainCost,
+                dir: SortDir::Desc,
+            })
+        );
+
+        let mut name_fr: QueryMultiMap = HashMap::new();
+        name_fr.insert("sort".to_string(), vec!["name:fr:asc".to_string()]);
+        assert_eq!(
+            parse_sort(&name_fr).unwrap(),
+            Some(CardsSort {
+                field: SortField::Name("fr_FR".to_string()),
+                dir: SortDir::Asc,
+            })
+        );
+
+        let mut bad_field: QueryMultiMap = HashMap::new();
+        bad_field.insert("sort".to_string(), vec!["unknown:asc".to_string()]);
+        assert_eq!(parse_sort(&bad_field).unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        let mut bad_dir: QueryMultiMap = HashMap::new();
+        bad_dir.insert("sort".to_string(), vec!["mainCost:sideways".to_string()]);
+        assert_eq!(parse_sort(&bad_dir).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn parse_cost_relation_sub_types_and_has_no_effect() {
+        let state = test_state();
+        let mut params: QueryMultiMap = HashMap::new();
+        params.insert("costRelation".to_string(), vec!["mainHigher".to_string()]);
+        params.insert(
+            "subTypes[]".to_string(),
+            vec!["engineer".to_string(), "SPIRIT,dragon".to_string()],
+        );
+        params.insert("hasNoEffect".to_string(), vec!["true".to_string()]);
+
+        let req = parse_request(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            false,
+            &state.snapshot().collections,
+            &params,
+        )
+        .unwrap();
+        assert_eq!(req.cost_relation, Some(CostRelation::MainHigher));
+        assert_eq!(req.sub_types, vec!["ENGINEER", "SPIRIT", "DRAGON"]);
+        assert_eq!(req.has_no_effect, Some(true));
+
+        let mut alias: QueryMultiMap = HashMap::new();
+        alias.insert("costRelation".to_string(), vec!["recall_gt".to_string()]);
+        alias.insert("cardSubTypes".to_string(), vec!["robot".to_string()]);
+        alias.insert("hasNoEffect".to_string(), vec!["false".to_string()]);
+        let req2 = parse_request(
+            state.index().as_ref(),
+            state.formats().as_ref(),
+            false,
+            &state.snapshot().collections,
+            &alias,
+        )
+        .unwrap();
+        assert_eq!(req2.cost_relation, Some(CostRelation::RecallHigher));
+        assert_eq!(req2.sub_types, vec!["ROBOT"]);
+        assert_eq!(req2.has_no_effect, Some(false));
+
+        let mut bad_rel: QueryMultiMap = HashMap::new();
+        bad_rel.insert("costRelation".to_string(), vec!["nope".to_string()]);
+        assert_eq!(
+            parse_request(
+                state.index().as_ref(),
+                state.formats().as_ref(),
+                false,
+                &state.snapshot().collections,
+                &bad_rel,
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut bad_no_fx: QueryMultiMap = HashMap::new();
+        bad_no_fx.insert("hasNoEffect".to_string(), vec!["maybe".to_string()]);
+        assert_eq!(
+            parse_request(
+                state.index().as_ref(),
+                state.formats().as_ref(),
+                false,
+                &state.snapshot().collections,
+                &bad_no_fx,
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::BAD_REQUEST
+        );
     }
 }
 

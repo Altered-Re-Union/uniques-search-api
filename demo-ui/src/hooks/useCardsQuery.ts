@@ -1,9 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  buildCardByReferencePath,
-  buildCardByReferenceUrl,
-  buildFullUrl,
-} from '../api/buildQuery';
+import { buildFullUrl } from '../api/buildQuery';
 import type { ApiError, CardV2, CardsIter, FamilyMatchV2, FilterState } from '../types';
 
 const DEBOUNCE_MS = 300;
@@ -48,34 +44,6 @@ const initialState: Omit<CardsQueryState, 'loadMore' | 'hasMore'> = {
 
 function serializeFilters(state: FilterState): string {
   return JSON.stringify(state);
-}
-
-async function fetchCardByReference(
-  url: string,
-  signal: AbortSignal,
-): Promise<{
-  card: CardV2;
-  durationMs: number;
-}> {
-  const start = performance.now();
-  const response = await fetch(url, { signal });
-  const durationMs = performance.now() - start;
-
-  if (!response.ok) {
-    let message = `HTTP ${response.status}`;
-    try {
-      const body = (await response.json()) as ApiError;
-      if (body.error) {
-        message = body.error;
-      }
-    } catch {
-      // ignore JSON parse errors
-    }
-    throw new Error(message);
-  }
-
-  const card = (await response.json()) as CardV2;
-  return { card, durationMs };
 }
 
 async function fetchCardsPage(
@@ -146,75 +114,6 @@ export function useCardsQuery(filters: FilterState): CardsQueryState {
     }
 
     debounceRef.current = setTimeout(() => {
-      const reference = filters.reference.trim();
-      if (reference) {
-        abortRef.current?.abort();
-        loadMoreAbortRef.current?.abort();
-        const controller = new AbortController();
-        abortRef.current = controller;
-
-        const url = buildCardByReferenceUrl(reference, {
-          debugBgaTrigram: filters.debugBgaTrigram,
-        });
-        const queryString = buildCardByReferencePath(reference, {
-          debugBgaTrigram: filters.debugBgaTrigram,
-        });
-
-        setQueryState({
-          ...initialState,
-          status: 'loading',
-          url,
-          queryString,
-          skipped: false,
-        });
-
-        void (async () => {
-          try {
-            const { card, durationMs } = await fetchCardByReference(
-              url,
-              controller.signal,
-            );
-
-            if (controller.signal.aborted) {
-              return;
-            }
-
-            setQueryState({
-              status: 'success',
-              cards: [card],
-              families: null,
-              iter: { total: 1 },
-              error: null,
-              durationMs,
-              fetchedAt: Date.now(),
-              url,
-              queryString,
-              handCostError: null,
-              reserveCostError: null,
-              skipped: false,
-              loadingMore: false,
-              lastPageCount: 1,
-            });
-          } catch (err) {
-            if (controller.signal.aborted) {
-              return;
-            }
-            const message =
-              err instanceof Error ? err.message : 'Request failed';
-            setQueryState({
-              ...initialState,
-              status: 'error',
-              error: message,
-              fetchedAt: Date.now(),
-              url,
-              queryString,
-              skipped: false,
-            });
-          }
-        })();
-        return;
-      }
-
       const parsed = buildFullUrl(filters);
 
       if (!parsed.ok) {
@@ -302,7 +201,7 @@ export function useCardsQuery(filters: FilterState): CardsQueryState {
   }, [serialized, filters]);
 
   const loadMore = useCallback(() => {
-    if (filtersRef.current.reference.trim() || filtersRef.current.withFamilies) {
+    if (filtersRef.current.withFamilies) {
       return;
     }
 
@@ -376,10 +275,7 @@ export function useCardsQuery(filters: FilterState): CardsQueryState {
     };
   }, []);
 
-  const hasMore =
-    !filters.reference.trim() &&
-    !filters.withFamilies &&
-    queryState.iter?.cursor !== undefined;
+  const hasMore = !filters.withFamilies && queryState.iter?.cursor !== undefined;
 
   return {
     ...queryState,

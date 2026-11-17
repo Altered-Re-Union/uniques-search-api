@@ -28,10 +28,10 @@ impl IndexSource for AnyIndexSource {
         }
     }
 
-    fn load_index(&self) -> anyhow::Result<crate::index::UniquesIndex> {
+    fn load_bundle(&self) -> anyhow::Result<crate::index::loader::LoadedIndexBundle> {
         match self {
-            Self::Disk(source) => source.load_index(),
-            Self::Remote(source) => source.load_index(),
+            Self::Disk(source) => source.load_bundle(),
+            Self::Remote(source) => source.load_bundle(),
         }
     }
 }

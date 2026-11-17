@@ -11,9 +11,10 @@ pub use state::{AppState, QuerySnapshot, ServerState};
 
 pub fn app(server: ServerState) -> Router {
     let collections = server.settings.collections.clone();
+    let cards = server.settings.cards.clone();
     Router::new()
         .merge(admin::router())
-        .merge(api::router(&collections))
+        .merge(api::router(&collections, &cards))
         .layer(CorsLayer::permissive())
         .with_state(server)
 }

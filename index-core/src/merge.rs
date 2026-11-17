@@ -113,6 +113,8 @@ pub fn merge_indexes(
 
     merge_stats(out, &plan, &sources)?;
     merge_factions(out, &plan, &sources)?;
+    merge_status(out, &plan, &sources)?;
+    copy_family_catalog(out, &sources)?;
 
     let source_dirs: Vec<PathBuf> = sources.iter().map(|s| s.dir.clone()).collect();
     let duplicated_id_gd = build_merged_duplicated_id_gd(&source_dirs, &merge_remap)?;
@@ -541,21 +543,8 @@ fn merge_id_gd(
                 continue;
             }
             let bmp = load_bitmap(&src_path).with_context(|| format!("load {}", src_path.display()))?;
-            match plan.mapping.get(&src.set).expect("mapping exists") {
-                Mapping::Offset { base } => {
-                    for b in bmp.iter() {
-                        merged.insert(base + b);
-                    }
-                }
-                Mapping::RemapVec { map } => {
-                    for b in bmp.iter() {
-                        let dst = map[b as usize];
-                        if dst != u32::MAX {
-                            merged.insert(dst);
-                        }
-                    }
-                }
-            }
+            let mapping = plan.mapping.get(&src.set).expect("mapping exists");
+            insert_remapped_bitmap(&mut merged, &bmp, mapping);
         }
 
         if merged.is_empty() {
@@ -584,21 +573,8 @@ fn merge_id_gd(
                 }
                 let bmp = load_bitmap(&src_path)
                     .with_context(|| format!("load {}", src_path.display()))?;
-                match plan.mapping.get(&src.set).expect("mapping exists") {
-                    Mapping::Offset { base } => {
-                        for b in bmp.iter() {
-                            merged.insert(base + b);
-                        }
-                    }
-                    Mapping::RemapVec { map } => {
-                        for b in bmp.iter() {
-                            let dst = map[b as usize];
-                            if dst != u32::MAX {
-                                merged.insert(dst);
-                            }
-                        }
-                    }
-                }
+                let mapping = plan.mapping.get(&src.set).expect("mapping exists");
+                insert_remapped_bitmap(&mut merged, &bmp, mapping);
             }
 
             if merged.is_empty() {
@@ -618,6 +594,75 @@ fn merge_id_gd(
 fn load_bitmap(path: &Path) -> Result<RoaringBitmap> {
     let bytes = fs::read(path)?;
     Ok(RoaringBitmap::deserialize_from(&bytes[..])?)
+}
+
+fn insert_remapped_bitmap(merged: &mut RoaringBitmap, bmp: &RoaringBitmap, mapping: &Mapping) {
+    match mapping {
+        Mapping::Offset { base } => {
+            for b in bmp.iter() {
+                merged.insert(base + b);
+            }
+        }
+        Mapping::RemapVec { map } => {
+            for b in bmp.iter() {
+                let dst = map[b as usize];
+                if dst != u32::MAX {
+                    merged.insert(dst);
+                }
+            }
+        }
+    }
+}
+
+fn merge_status(out: &Path, plan: &MergePlan, sources: &[SourceIndex]) -> Result<()> {
+    let status_out = out.join("status");
+    fs::create_dir_all(&status_out)?;
+
+    for name in ["banned", "errated", "suspended"] {
+        let mut merged = RoaringBitmap::new();
+        for src in sources {
+            let src_path = src.dir.join("status").join(format!("{name}.roar"));
+            if !src_path.exists() {
+                continue;
+            }
+            let bmp = load_bitmap(&src_path).with_context(|| format!("load {}", src_path.display()))?;
+            let mapping = plan.mapping.get(&src.set).expect("mapping exists");
+            insert_remapped_bitmap(&mut merged, &bmp, mapping);
+        }
+
+        if merged.is_empty() {
+            continue;
+        }
+
+        let mut bytes = Vec::new();
+        merged.serialize_into(&mut bytes)?;
+        fs::write(status_out.join(format!("{name}.roar")), bytes)?;
+    }
+
+    Ok(())
+}
+
+fn copy_family_catalog(out: &Path, sources: &[SourceIndex]) -> Result<()> {
+    let mut merged: BTreeMap<i64, crate::family_catalog::FamilyCatalogEntry> = BTreeMap::new();
+    let mut found = false;
+    for src in sources {
+        let src_path = src.dir.join("families.json");
+        if !src_path.exists() {
+            continue;
+        }
+        found = true;
+        let cat = crate::family_catalog::FamilyCatalog::load(&src_path)?;
+        for entry in cat.families {
+            merged.entry(entry.id).or_insert(entry);
+        }
+    }
+    if found {
+        let catalog = crate::family_catalog::FamilyCatalog {
+            families: merged.into_values().collect(),
+        };
+        catalog.save(&out.join("families.json"))?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -661,21 +706,8 @@ fn merge_stats(out: &Path, plan: &MergePlan, sources: &[SourceIndex]) -> Result<
                     continue;
                 }
                 let bmp = load_bitmap(&src_path)?;
-                match plan.mapping.get(&src.set).expect("mapping exists") {
-                    Mapping::Offset { base } => {
-                        for b in bmp.iter() {
-                            merged.insert(base + b);
-                        }
-                    }
-                    Mapping::RemapVec { map } => {
-                        for b in bmp.iter() {
-                            let dst = map[b as usize];
-                            if dst != u32::MAX {
-                                merged.insert(dst);
-                            }
-                        }
-                    }
-                }
+                let mapping = plan.mapping.get(&src.set).expect("mapping exists");
+                insert_remapped_bitmap(&mut merged, &bmp, mapping);
             }
 
             if merged.is_empty() {

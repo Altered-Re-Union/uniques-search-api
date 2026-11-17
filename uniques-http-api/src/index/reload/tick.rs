@@ -24,18 +24,29 @@ pub(super) async fn reload_tick(
 
     let source = source.clone();
     let formats_settings = settings.formats.clone();
-    let new_index = tokio::task::spawn_blocking(move || source.load_index())
+    let bundle = tokio::task::spawn_blocking(move || source.load_bundle())
         .await??;
 
-    let new_index = Arc::new(new_index);
+    let new_index = Arc::new(bundle.index);
     let new_formats = rebuild_formats_for_index(
         Arc::clone(&new_index),
         formats_settings.as_ref().filter(|f| f.is_enabled()),
     );
 
+    let mut nonunique = bundle.nonunique;
+    if let Some(ref mut nu) = nonunique {
+        nu.bind_families(&bundle.families);
+    }
+
     let elapsed = started.elapsed();
 
-    match state.commit_if_newer(new_index, new_formats, &settings.collections) {
+    match state.commit_snapshot_if_newer(
+        new_index,
+        nonunique.map(Arc::new),
+        Arc::new(bundle.families),
+        new_formats,
+        &settings.collections,
+    ) {
         Some((old_secs, new_secs)) => {
             eprintln!(
                 "index hot-reloaded: version {old_secs} -> {new_secs} (loaded in {:.2}s)",

@@ -48,8 +48,8 @@ export type FilterState = {
   support: EffectSlot;
   factions: string[];
   sets: string[];
-  reference: string;
-  name: string;
+  /** Unified search box: sent as `q` (OR across name substring / exact ref / exact collector number). */
+  search: string;
   format: string;
   collection: string;
   handCost: string;
@@ -82,8 +82,7 @@ export const DEFAULT_FILTER_STATE: FilterState = {
   support: { t: '', c: '', o: '', matchCount: 1 },
   factions: [],
   sets: [],
-  reference: '',
-  name: '',
+  search: '',
   format: '',
   collection: '',
   handCost: '',
@@ -128,6 +127,9 @@ export type CardV2 = {
   faction: CardFaction;
   mainEffect: Record<string, string>;
   echoEffect: Record<string, string>;
+  /** `SET-FAMILY-U-UID` (e.g. `BTG-011-U-5`); absent when the loaded index has no collector-number
+   * data for that family. */
+  collectorNumber?: string;
   debug_bga_trigram?: string;
 };
 

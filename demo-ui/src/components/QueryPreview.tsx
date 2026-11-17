@@ -18,10 +18,6 @@ function buildDisplayPath(queryString: string | null): string {
   if (!queryString) {
     return "/api/v2/cards";
   }
-  // Card-by-reference mode stores a full path, not a cards search query string.
-  if (queryString.startsWith("/api/v2/card/")) {
-    return queryString;
-  }
   return `/api/v2/cards?${decodeQueryText(queryString)}`;
 }
 

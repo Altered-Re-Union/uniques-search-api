@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+csv = "1"
 regex = "1"
 roaring.workspace = true
 serde.workspace = true
