@@ -115,6 +115,7 @@ pub fn merge_indexes(
     merge_factions(out, &plan, &sources)?;
     merge_status(out, &plan, &sources)?;
     copy_family_catalog(out, &sources)?;
+    copy_artist_credits(out, &sources)?;
 
     let source_dirs: Vec<PathBuf> = sources.iter().map(|s| s.dir.clone()).collect();
     let duplicated_id_gd = build_merged_duplicated_id_gd(&source_dirs, &merge_remap)?;
@@ -661,6 +662,23 @@ fn copy_family_catalog(out: &Path, sources: &[SourceIndex]) -> Result<()> {
             families: merged.into_values().collect(),
         };
         catalog.save(&out.join("families.json"))?;
+    }
+    Ok(())
+}
+
+/// Union of the sources' `artist_credits.json` (global CardsData data, identical across sets built
+/// from the same checkout); not written when no source has one.
+fn copy_artist_credits(out: &Path, sources: &[SourceIndex]) -> Result<()> {
+    use crate::artist_credits::{ArtistCreditsFile, ARTIST_CREDITS_FILE};
+    let mut files = Vec::new();
+    for src in sources {
+        let src_path = src.dir.join(ARTIST_CREDITS_FILE);
+        if src_path.exists() {
+            files.push(ArtistCreditsFile::load(&src_path)?);
+        }
+    }
+    if !files.is_empty() {
+        ArtistCreditsFile::merge(files).save(&out.join(ARTIST_CREDITS_FILE))?;
     }
     Ok(())
 }

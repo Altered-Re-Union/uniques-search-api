@@ -176,6 +176,14 @@ pub(crate) fn build_bitmap(
         groups.push(combined);
     }
 
+    if req.has_zero_power {
+        groups.push(zero_power_bitmap(state));
+    }
+
+    if !req.artists.is_empty() {
+        groups.push(artist_bitmap(state, &req.artists));
+    }
+
     let mut no_effect_exclude: Option<&RoaringBitmap> = None;
     if let Some(has_no_effect) = req.has_no_effect {
         if has_no_effect {
@@ -228,6 +236,33 @@ pub(crate) fn build_bitmap(
         out -= exclude;
     }
     Ok(out)
+}
+
+/// Cards with at least one power (forest, mountain, ocean) at 0.
+fn zero_power_bitmap(state: &UniquesIndex) -> RoaringBitmap {
+    let mut out = RoaringBitmap::new();
+    for field in [StatField::ForestPower, StatField::MountainPower, StatField::OceanPower] {
+        if let Some(buckets) = state.stats().get(&field) {
+            out |= &buckets[0];
+        }
+    }
+    out
+}
+
+/// Cards matching one of `artists` (case-insensitive, trimmed): one of the searchable names of the
+/// family's printed credit (its members for a team credit), or the credit itself — same rule as
+/// the non-unique `bitmap_for_artists`. The artist is stored per family, so this selects whole
+/// family spans (`& present_cards` drops the gaps).
+fn artist_bitmap(state: &UniquesIndex, artists: &[String]) -> RoaringBitmap {
+    let wanted = index_core::artist_credits::normalize_wanted_artists(artists);
+    let mut out = RoaringBitmap::new();
+    for family in &state.catalog().families {
+        if state.artist_credits.credit_matches(&family.artist, &wanted) {
+            let end = family.start_bit.saturating_add(family.max_unique_id);
+            out.insert_range(family.start_bit..end);
+        }
+    }
+    out
 }
 
 /// Exact-match (4-part `SET-FAM-U-UID` or 2-part `SET-FAM`), lenient like `ref[]`. Uniques only.
@@ -430,6 +465,7 @@ pub(crate) fn card_v2_from_index(
         reference,
         name: family.name.clone(),
         artist: family.artist.clone(),
+        artists: state.artist_credits.searchable_names(&family.artist),
         set: CardSetV2::from(&family.set),
         card_sub_types: family
             .card_sub_types
@@ -589,6 +625,7 @@ pub fn nonunique_card_v2(
             reference,
             name,
             artist: meta.artist.clone(),
+            artists: nu.artist_credits.searchable_names(&meta.artist),
             set: CardSetV2 {
                 reference: meta.set.clone(),
                 name: meta.set_name.clone(),
@@ -663,6 +700,7 @@ pub fn nonunique_card_v2(
             reference,
             name: fam.map(|f| f.name.clone()).unwrap_or_default(),
             artist: String::new(),
+            artists: Vec::new(),
             set: CardSetV2 {
                 name: set_ref.clone(),
                 code: index_core::set_code(&set_ref).map(str::to_string),
@@ -2069,6 +2107,52 @@ mod tests {
         assert!(bmp_has_fx.contains(5));
         assert!(bmp_has_fx.contains(7));
         assert!(!bmp_has_fx.contains(0));
+    }
+
+    #[test]
+    fn build_bitmap_supports_has_zero_power_and_artist() {
+        let state = test_state();
+        let bitmap_for = |pairs: &[(&str, &[&str])]| {
+            let mut params: QueryMultiMap = HashMap::new();
+            for (key, values) in pairs {
+                params.insert(
+                    key.to_string(),
+                    values.iter().map(|v| v.to_string()).collect(),
+                );
+            }
+            let req = parse_request(
+                state.index().as_ref(),
+                state.formats().as_ref(),
+                false,
+                &state.snapshot().collections,
+                &params,
+            )
+            .unwrap();
+            build_bitmap(
+                state.index().as_ref(),
+                state.formats().as_ref(),
+                &state.snapshot().collections,
+                &req,
+            )
+            .unwrap()
+        };
+
+        // hasZeroPower=true: in test_state, idx 2 and 5 have oceanPower 0 (other powers > 0).
+        let zero = bitmap_for(&[("hasZeroPower", &["true"])]);
+        assert_eq!(zero.iter().collect::<Vec<_>>(), vec![2, 5]);
+        // false = no filter; AND with the other filters.
+        assert_eq!(bitmap_for(&[("hasZeroPower", &["false"])]).len(), 10);
+        let zero_and_cost = bitmap_for(&[("hasZeroPower", &["1"]), ("recallCost", &["3"])]);
+        assert_eq!(zero_and_cost.iter().collect::<Vec<_>>(), vec![5]);
+
+        // artist[]: whole field, case-insensitive, OR between values.
+        assert_eq!(bitmap_for(&[("artist[]", &["test artist"])]).len(), 10);
+        assert_eq!(bitmap_for(&[("artist[]", &["Nobody", "TEST ARTIST"])]).len(), 10);
+        assert!(bitmap_for(&[("artist[]", &["Test"])]).is_empty());
+        assert!(bitmap_for(&[("artist[]", &["Nobody"])]).is_empty());
+        let artist_and_zero =
+            bitmap_for(&[("artist", &["Test Artist"]), ("hasZeroPower", &["true"])]);
+        assert_eq!(artist_and_zero.iter().collect::<Vec<_>>(), vec![2, 5]);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use index_core::artist_credits::{ArtistCredits, ArtistCreditsFile, ARTIST_CREDITS_FILE};
 use index_core::bitmap::EffectLine;
 use index_core::idgd_collapse::IdGdAliasMap;
 use index_core::catalog::Catalog;
@@ -17,7 +18,7 @@ use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::collections::CollectionStore;
-use crate::config::Settings;
+use crate::config::{ArtistsSettings, Settings};
 use crate::formats::{load_format_index, FormatIndex};
 use crate::http::api::effects::{build_effects_list, serialize_effects_list};
 use crate::http::state::{AppState, QuerySnapshot};
@@ -919,6 +920,7 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
         collector_number_lookup_index,
         present_cards,
         effects_body,
+        artist_credits: Default::default(),
     })
 }
 
@@ -939,28 +941,102 @@ pub fn load_family_catalog(
     Ok(catalog.families.into_iter().map(|f| (f.id, f)).collect())
 }
 
-/// Full loaded index bundle: unique index + optional non-unique index + shared family catalog.
+/// `Ok(None)` when this storage root has no `artist_credits.json` (index built before it existed,
+/// or not from CardsData).
+pub fn load_artist_credits_file(storage: &impl IndexStorage) -> Result<Option<ArtistCreditsFile>> {
+    if !storage.has_file(ARTIST_CREDITS_FILE) {
+        return Ok(None);
+    }
+    read_json(storage, ARTIST_CREDITS_FILE).map(Some)
+}
+
+/// Artist credit -> searchable names for a freshly loaded index: built from
+/// `artists.cardsdata_csv_dir` when that setting is set (it wins over the index's file), else the
+/// index's `artist_credits.json`, else the fallback where each credit is its own searchable name.
+pub fn resolve_artist_credits(
+    index_file: Option<&ArtistCreditsFile>,
+    settings: &ArtistsSettings,
+) -> Result<ArtistCredits> {
+    if let Some(csv_dir) = settings.cardsdata_csv_dir() {
+        let file = index_core::artist_credits::build_artist_credits(&csv_dir).with_context(|| {
+            format!(
+                "build artist credits from artists.cardsdata_csv_dir = {}",
+                csv_dir.display()
+            )
+        })?;
+        eprintln!(
+            "artist credits: {} credits from {}",
+            file.credits.len(),
+            csv_dir.display()
+        );
+        return Ok(ArtistCredits::from_file(&file));
+    }
+    match index_file {
+        Some(file) => {
+            eprintln!("artist credits: {} credits from {ARTIST_CREDITS_FILE}", file.credits.len());
+            Ok(ArtistCredits::from_file(file))
+        }
+        None => {
+            eprintln!(
+                "artist credits: no {ARTIST_CREDITS_FILE} in the index and no \
+                 artists.cardsdata_csv_dir: each printed credit is its own artist name"
+            );
+            Ok(ArtistCredits::default())
+        }
+    }
+}
+
+/// Attach the artist credit mapping to both indexes (one shared copy).
+pub fn bind_artist_credits(
+    index: &mut UniquesIndex,
+    nonunique: Option<&mut NonUniqueQueryIndex>,
+    credits: ArtistCredits,
+) {
+    let credits = Arc::new(credits);
+    if let Some(nu) = nonunique {
+        nu.artist_credits = Arc::clone(&credits);
+    }
+    index.artist_credits = credits;
+}
+
+/// Full loaded index bundle: unique index + optional non-unique index + shared family catalog +
+/// optional artist credit mapping.
 pub struct LoadedIndexBundle {
     pub index: UniquesIndex,
     pub nonunique: Option<NonUniqueQueryIndex>,
     pub families: BTreeMap<i64, index_core::family_catalog::FamilyCatalogEntry>,
+    /// `artist_credits.json`, `None` when the index has none (see [`resolve_artist_credits`]).
+    pub artist_credits: Option<ArtistCreditsFile>,
 }
 
-/// Load unique index, optional `nonunique/`, and optional `families.json` from any [`IndexStorage`].
+impl LoadedIndexBundle {
+    /// Resolve the artist credit mapping (see [`resolve_artist_credits`]) and attach it to the
+    /// unique and non-unique indexes.
+    pub fn bind_artist_credits(&mut self, settings: &ArtistsSettings) -> Result<()> {
+        let credits = resolve_artist_credits(self.artist_credits.as_ref(), settings)?;
+        bind_artist_credits(&mut self.index, self.nonunique.as_mut(), credits);
+        Ok(())
+    }
+}
+
+/// Load unique index, optional `nonunique/`, optional `families.json` and optional
+/// `artist_credits.json` from any [`IndexStorage`].
 pub fn load_bundle_from_storage(storage: &impl IndexStorage) -> Result<LoadedIndexBundle> {
     let index = load_uniques_index_from(storage)?;
     let nonunique = load_nonunique_index(storage)?;
     let families = load_family_catalog(storage)?;
+    let artist_credits = load_artist_credits_file(storage)?;
     Ok(LoadedIndexBundle {
         index,
         nonunique,
         families,
+        artist_credits,
     })
 }
 
 /// Load index and format filters; wrap in [`AppState`].
 pub fn load_app_state(settings: &Settings) -> Result<AppState> {
-    let mut bundle = match settings.index.source {
+    let bundle = match settings.index.source {
         crate::config::IndexSourceKind::Disk | crate::config::IndexSourceKind::Archive => {
             let index_path = settings.index_path()?;
             let storage = open_index_storage(&index_path)?;
@@ -974,6 +1050,9 @@ pub fn load_app_state(settings: &Settings) -> Result<AppState> {
                         if bundle.families.is_empty() {
                             bundle.families = load_family_catalog(&disk_storage)?;
                         }
+                        if bundle.artist_credits.is_none() {
+                            bundle.artist_credits = load_artist_credits_file(&disk_storage)?;
+                        }
                     }
                 }
             }
@@ -986,20 +1065,17 @@ pub fn load_app_state(settings: &Settings) -> Result<AppState> {
             bail!("load_app_state for http: use load_index_from_http in main")
         }
     };
-    Ok(build_app_state(
-        bundle.index,
-        bundle.nonunique.take(),
-        bundle.families,
-        settings,
-    ))
+    build_app_state(bundle, settings)
 }
 
-pub fn build_app_state(
-    index: UniquesIndex,
-    mut nonunique: Option<NonUniqueQueryIndex>,
-    families: BTreeMap<i64, index_core::family_catalog::FamilyCatalogEntry>,
-    settings: &Settings,
-) -> AppState {
+pub fn build_app_state(mut bundle: LoadedIndexBundle, settings: &Settings) -> Result<AppState> {
+    bundle.bind_artist_credits(&settings.artists)?;
+    let LoadedIndexBundle {
+        index,
+        mut nonunique,
+        families,
+        ..
+    } = bundle;
     if let Some(ref mut nu) = nonunique {
         nu.bind_families(&families);
     }
@@ -1007,13 +1083,13 @@ pub fn build_app_state(
         Some(formats_settings) => Arc::new(load_format_index(&index, formats_settings)),
         None => Arc::new(FormatIndex::empty()),
     };
-    AppState::new(QuerySnapshot {
+    Ok(AppState::new(QuerySnapshot {
         index: Arc::new(index),
         families: Arc::new(families),
         nonunique: nonunique.map(Arc::new),
         formats,
         collections: CollectionStore::new(&settings.collections),
-    })
+    }))
 }
 
 /// Load index only (empty format catalog) for tests.

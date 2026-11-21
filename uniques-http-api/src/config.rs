@@ -13,6 +13,31 @@ pub struct Settings {
     pub collections: CollectionsSettings,
     #[serde(default)]
     pub cards: CardsSettings,
+    #[serde(default)]
+    pub artists: ArtistsSettings,
+}
+
+/// `[artists]`: where the artist credit -> searchable names mapping (`artist[]` filter,
+/// `/api/v2/artists`) comes from.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ArtistsSettings {
+    /// Optional CardsData `data/csv` directory (holding `Artists.csv` and
+    /// `ArtistCreditMembers.csv`). When set, the mapping is built from those CSVs when the index
+    /// is loaded (startup and hot-reload) and replaces the index's own `artist_credits.json`;
+    /// meant for a dev environment running a prebuilt index that has no such file. Env:
+    /// `ARTISTS__CARDSDATA_CSV_DIR`.
+    #[serde(default)]
+    pub cardsdata_csv_dir: Option<String>,
+}
+
+impl ArtistsSettings {
+    pub fn cardsdata_csv_dir(&self) -> Option<PathBuf> {
+        self.cardsdata_csv_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -303,6 +328,39 @@ mod tests {
         assert!(!settings.index.reload.enabled);
         assert!(settings.index.reload.interval_secs.is_none());
         assert!(settings.index.object_store.url.is_empty());
+        assert!(settings.artists.cardsdata_csv_dir().is_none());
+    }
+
+    #[test]
+    fn artists_cardsdata_csv_dir_is_optional() {
+        let toml = r#"
+            [server]
+            port = 3000
+
+            [index]
+            source = "disk"
+            path = "./index"
+
+            [index.reload]
+            enabled = false
+
+            [artists]
+            cardsdata_csv_dir = " ../CardsData/data/csv "
+        "#;
+        let settings: Settings = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(
+            settings.artists.cardsdata_csv_dir(),
+            Some(PathBuf::from("../CardsData/data/csv"))
+        );
+        let blank = ArtistsSettings {
+            cardsdata_csv_dir: Some("  ".to_string()),
+        };
+        assert!(blank.cardsdata_csv_dir().is_none());
     }
 
     #[test]

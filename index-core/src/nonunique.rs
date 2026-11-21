@@ -1246,6 +1246,7 @@ pub fn build_nonunique_index(
 
     crate::family_catalog::build_family_catalog(cardsdata_root)?
         .save(&set_out.join("families.json"))?;
+    crate::artist_credits::write_artist_credits(cardsdata_root, &set_out)?;
 
     Ok(NonUniqueBuildSummary {
         output_dir: nonunique_out,

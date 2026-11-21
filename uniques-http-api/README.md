@@ -11,6 +11,7 @@ There is no runtime dependency from `cli-indexer` on the HTTP API. The HTTP crat
 - **Defaults**:
   - `PORT=8234` (local dev)
   - `INDEX_PATH=../build/full_index/ALL_SETS`
+- **Artist credits** (optional): `ARTISTS__CARDSDATA_CSV_DIR=<CardsData>/data/csv` (or `[artists] cardsdata_csv_dir` in `config/*.toml`) builds the artist credit -> searchable names mapping (`artist[]`, `/api/v2/artists`) from CardsData's `Artists.csv` + `ArtistCreditMembers.csv` at load time, for an index that has no `artist_credits.json` (e.g. the prebuilt production archive). See [`docs/api-spec.md`](../docs/api-spec.md#get-apiv2artists).
 
 Run:
 

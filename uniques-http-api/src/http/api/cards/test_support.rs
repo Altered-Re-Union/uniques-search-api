@@ -252,6 +252,7 @@ pub(crate) fn test_state() -> AppState {
         idgd_catalog,
         id_gd_aliases,
         effects_body,
+        artist_credits: Default::default(),
         stats_summary,
         factions_summary,
         cards,
@@ -357,6 +358,7 @@ pub(crate) fn test_state_with_sets() -> AppState {
         },
         id_gd_aliases: IdGdAliasMap::default(),
         effects_body: Arc::new(Bytes::from_static(b"{}")),
+        artist_credits: Default::default(),
         stats_summary: StatsSummary {
             version: 1,
             set: "ALL_SETS".to_string(),

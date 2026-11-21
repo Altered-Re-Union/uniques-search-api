@@ -24,8 +24,13 @@ pub(super) async fn reload_tick(
 
     let source = source.clone();
     let formats_settings = settings.formats.clone();
-    let bundle = tokio::task::spawn_blocking(move || source.load_bundle())
-        .await??;
+    let artists_settings = settings.artists.clone();
+    let bundle = tokio::task::spawn_blocking(move || {
+        let mut bundle = source.load_bundle()?;
+        bundle.bind_artist_credits(&artists_settings)?;
+        anyhow::Ok(bundle)
+    })
+    .await??;
 
     let new_index = Arc::new(bundle.index);
     let new_formats = rebuild_formats_for_index(

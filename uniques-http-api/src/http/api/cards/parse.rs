@@ -177,6 +177,8 @@ pub(crate) fn parse_request(
     let cost_relation = parse_cost_relation(params)?;
     let sub_types = parse_sub_types(params);
     let has_no_effect = parse_has_no_effect(params)?;
+    let has_zero_power = parse_has_zero_power(params)?;
+    let artists = parse_artists(params);
     let sort = parse_sort(params)?;
     let q = parse_q(params);
     let debug_bga_trigram = params.contains_key("debug_bga_trigram");
@@ -206,6 +208,8 @@ pub(crate) fn parse_request(
         cost_relation,
         sub_types,
         has_no_effect,
+        has_zero_power,
+        artists,
         q,
         debug_bga_trigram,
         with_families,
@@ -713,6 +717,37 @@ pub(crate) fn parse_has_no_effect(params: &QueryMultiMap) -> ApiResult<Option<bo
             "invalid parameter 'hasNoEffect': expected true or false, got '{trimmed}'"
         ))),
     }
+}
+
+/// `hasZeroPower=true` (or `1`): only cards with at least one power at 0. `false` / `0` / empty:
+/// no filter.
+pub(crate) fn parse_has_zero_power(params: &QueryMultiMap) -> ApiResult<bool> {
+    let Some(raw) = get_first(params, "hasZeroPower") else {
+        return Ok(false);
+    };
+    let trimmed = raw.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "" | "false" | "0" => Ok(false),
+        "true" | "1" => Ok(true),
+        _ => Err(bad_request(format!(
+            "invalid parameter 'hasZeroPower': expected true or false, got '{trimmed}'"
+        ))),
+    }
+}
+
+/// `artist[]` (repeatable; alias `artist`): artist names, trimmed, deduplicated
+/// case-insensitively. Values are not split on commas: a name is taken whole.
+pub(crate) fn parse_artists(params: &QueryMultiMap) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in ["artist[]", "artist"] {
+        for raw in params.get(key).into_iter().flatten() {
+            let name = raw.trim();
+            if !name.is_empty() && !out.iter().any(|a| a.to_lowercase() == name.to_lowercase()) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters) -> ApiResult<()> {
@@ -1335,6 +1370,38 @@ mod tests {
             .0,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn parse_artists_and_has_zero_power() {
+        let mut params: QueryMultiMap = HashMap::new();
+        params.insert(
+            "artist[]".to_string(),
+            vec![
+                " Edward Chee - Seok Yeong ".to_string(),
+                "Last, First".to_string(),
+                "edward chee - seok yeong".to_string(),
+                "  ".to_string(),
+            ],
+        );
+        params.insert("artist".to_string(), vec!["Other".to_string()]);
+        // Trimmed, not split on commas, deduplicated case-insensitively, empty values dropped.
+        assert_eq!(
+            parse_artists(&params),
+            vec!["Edward Chee - Seok Yeong", "Last, First", "Other"]
+        );
+
+        let flag = |value: &str| {
+            let mut p: QueryMultiMap = HashMap::new();
+            p.insert("hasZeroPower".to_string(), vec![value.to_string()]);
+            parse_has_zero_power(&p)
+        };
+        assert!(flag("true").unwrap());
+        assert!(flag("1").unwrap());
+        assert!(!flag("false").unwrap());
+        assert!(!flag("").unwrap());
+        assert!(!parse_has_zero_power(&HashMap::new()).unwrap());
+        assert_eq!(flag("maybe").unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 }
 

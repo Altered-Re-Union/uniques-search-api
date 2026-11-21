@@ -16,6 +16,7 @@
 | Yes       | `ref[]`     | repeated array  | `ref[]=ALT_CORE_B_AX_01_U_1` | Restrict results to an explicit, ad-hoc list of card references given directly in the query string — no `POST /api/v2/collection` round-trip needed. Alias: `ref=REF1,REF2,REF3` (CSV). References are OR'd together, then AND'd with every other active filter (`format`, `collection`, `faction`, etc.), same combination pattern as `collection`. Unknown or malformed references are silently ignored (they just never match) instead of causing an error. |
 | Yes       | `collectorNumber[]` | repeated array | `collectorNumber[]=BTG-011-U-5` | Restrict results to an explicit list of collector numbers (`SET-FAMILY-U-UID`, e.g. `BTG-011-U-5` — the code printed on the physical/digital card, distinct from `ref[]`'s internal reference format). Alias: `collectorNumber=A,B,C` (CSV). Same OR-within/AND-across semantics as `ref[]`; unknown or malformed values are silently ignored. Uniques only. |
 | Yes       | `q`         | string          | `q=Ogun`       | Unified search box: matches if **any** of — word search on the character name (same rule as `name`), exact reference (same rule as `ref[]`), or exact collector number (same rule as `collectorNumber[]`) — succeeds. This is the one filter where "OR within" spans different match *kinds* rather than repeated values of one kind; still AND'd with every other active filter same as `name`/`ref[]`. Independent of and additive to `name`/`ref[]`/`collectorNumber[]`, which keep their own semantics unchanged. Empty/whitespace-only values are ignored (no filter). |
+| Yes       | `artist[]`  | repeated array  | `artist[]=Seok%20Yeong` | Filter by artist **person or studio**, not by printed credit: a card matches when a value (trimmed, case-insensitive) is one of the searchable names of its credit — the members of a team credit (`Seok Yeong` finds cards credited `Edward Chee - Seok Yeong` and `Ed Chee, S.Yong, Stephen`; `Gamon Studio` finds its own cards and the team credits it is part of), the credit itself otherwise. A value equal to the whole printed credit also matches (backward compatibility). Values are not split on commas. OR between values, AND with the other filters. Alias: `artist`. Unknown artists match 0 cards. Uniques and non-uniques; also on `/api/v2/search`, `/api/v2/search/facets` and `/api/v2/effects/filtered`. Valid values: [`GET /api/v2/artists`](#get-apiv2artists); the mapping is described there. |
 
 ### Text search
 
@@ -123,6 +124,7 @@ to `manifest.json`). `FORMATS_PATH` env overrides `formats.source.path` (disk so
 | Yes       | `oceanPower` / `oceanPower[...]` / `oceanPower[]`                   | integer or ranged/array | `oceanPower[]=0&oceanPower[]=1` | Ocean power filter.                      |
 | Yes       | `mountainPower` / `mountainPower[...]` / `mountainPower[]`          | integer or ranged/array | `mountainPower[gt]=5`           | Mountain power filter.                   |
 | Yes       | `forestPower` / `forestPower[...]` / `forestPower[]`                | integer or ranged/array | `forestPower=2`                 | Forest power filter.                     |
+| Yes       | `hasZeroPower`                                                      | boolean                 | `hasZeroPower=true`             | `true`: only cards with at least one power at 0 (`forestPower == 0` OR `mountainPower == 0` OR `oceanPower == 0`). Cards without powers (Heroes, Spells, …) never match. AND with the other filters, like `hasNoEffect`. `false` or empty: no filter. Any other value: `400`. |
 
 
 ### Effect filters
@@ -179,6 +181,7 @@ The response is a JSON object with `iter` (match totals and paging), and `cards`
         ...
       },
       artist: "Artist Name",
+      artists: ["Artist Name"],
       set: {
         reference: "COREKS",
         name: "Beyond the Gates - KS Edition",
@@ -293,6 +296,78 @@ Requires `withFamilies` and no `cursor`. Adds `families[]` (omitted when `cursor
 }
 ```
 
+## `GET` / `POST /api/v2/search` — variations
+
+`variation[]` (`standard`, `alt-art`, `promo`, `serialized`; OR between values) is derived from a
+non-unique print's product letter: `standard` = product `B` (not serialized), `alt-art` = `A`,
+`promo` = `P`. Uniques are always `standard`.
+
+Exception: a card printed only with a `P` product has no `B` print, so its `P` print is the base
+version of the card. Those prints are listed in
+[`index-core/data/variation_overrides.json`](../index-core/data/variation_overrides.json) and count
+as `standard` (and not as `alt-art`/`promo`): Kuraokami, Libéré des Glaces
+(`ALT_ALIZE_P_OR_48_C/_R1/_R2`) and Sofia, Premier Avant-poste (`ALT_BISE_P_BR_64_C/_R1/_R2`).
+Only the variation changes: their reference, `product` field and the `product[]` filter keep `P`.
+The list is compiled into the API and applied when the index is loaded (no re-index needed).
+
+## `GET /api/v2/artists`
+
+No parameters. The artist names `artist[]` accepts: the distinct searchable names (people and
+studios) of the credits used by the loaded cards (uniques and non-uniques), deduplicated and sorted
+case-insensitively. A team credit is listed as its members, never as the printed string.
+
+```json
+{ "artists": ["Edward Cheekokseang", "Gamon Studio", "Seok Yeong", "Stephen Yeoh", "Zero Wen"] }
+```
+
+### Artist credits: printed credit -> searchable names
+
+A card's `artist` is the credit printed on it (CardsData `Artists.csv` `NickName` of its
+`ArtistId`). CardsData's `ArtistCreditMembers.csv` (`CreditArtistId,MemberArtistId`) lists the
+members of each team credit. Searchable names of a credit:
+
+- a credit with rows in `ArtistCreditMembers.csv` -> its members' nicknames, studios included
+  (`Edward Chee - Seok Yeong` -> `Edward Cheekokseang`, `Gamon Studio`, `Seok Yeong`);
+- any other credit -> itself.
+
+Card JSON (`/api/v2/cards`, `/api/v2/search`, `/api/v2/card/{reference}`) keeps `artist` as the
+printed credit and adds `artists`, the searchable names of that credit (omitted when the card has no
+artist):
+
+```json
+{ "artist": "Edward Chee - Seok Yeong", "artists": ["Edward Cheekokseang", "Gamon Studio", "Seok Yeong"] }
+```
+
+Where the mapping comes from, when the index is loaded (startup and hot-reload):
+
+1. `artists.cardsdata_csv_dir` (config) / `ARTISTS__CARDSDATA_CSV_DIR` (env), when set: a CardsData
+   `data/csv` directory; the API reads `Artists.csv` and `ArtistCreditMembers.csv` there and builds
+   the mapping itself. It replaces the index's file. Meant for a dev environment running a prebuilt
+   index without the file. A directory that can't be read fails the startup (a failed hot-reload
+   keeps the current index).
+
+   ```toml
+   [artists]
+   cardsdata_csv_dir = "../CardsData/data/csv"
+   ```
+
+2. `artist_credits.json` at the index root, written by `cli-indexer build --source cardsdata` and
+   `build-nonunique` (from the same CSVs) and kept by `merge`:
+
+   ```json
+   { "version": 1,
+     "credits": {
+       "Edward Chee - Seok Yeong": ["Edward Cheekokseang", "Gamon Studio", "Seok Yeong"],
+       "Gamon Studio": ["Gamon Studio"] } }
+   ```
+
+   One entry per `Artists.csv` row, keyed by its trimmed `NickName`; names sorted
+   case-insensitively.
+
+3. Neither (index built before the file existed): each printed credit is its own searchable name
+   (`artist[]` then matches the whole printed credit, `/api/v2/artists` lists the printed credits,
+   `artists` is `[artist]`).
+
 ## `GET` / `POST /api/v2/search/facets`
 
 Takes the same filters as `/api/v2/search` (`sort`, `page`, `cursor` and `limit` are ignored) and
@@ -338,6 +413,7 @@ GET /api/v2/card/ALT_COREKS_B_AX_05_U_161
   "reference": "ALT_COREKS_B_AX_05_U_161",
   "name": { "en_US": "Ayxas, Repented Tyrant", "fr_FR": "..." },
   "artist": "Artist Name",
+  "artists": ["Artist Name"],
   "set": { "reference": "COREKS", "name": "Beyond the Gates - KS Edition", "code": "BTG" },
   "cardSubTypes": [{ "reference": "NOBLE", "name": { "en_US": "Noble", ... } }],
   "mainCost": 2,

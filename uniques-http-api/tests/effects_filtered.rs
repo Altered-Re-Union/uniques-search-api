@@ -250,3 +250,16 @@ async fn has_no_effect_filters_effect_suggestions() {
     assert_eq!(status_false, 200);
     assert_eq!(ids(&body_false), vec![1, 7]);
 }
+
+#[tokio::test]
+async fn artist_filters_effect_suggestions() {
+    // Every fixture card is by "Fixture Artist" (matched whole, case-insensitively).
+    let (status, body) =
+        call(test_server(), "artist%5B%5D=fixture%20artist&editing=trigger:0").await;
+    assert_eq!(status, 200);
+    assert_eq!(ids(&body), vec![1, 7]);
+
+    let (status, body) = call(test_server(), "artist%5B%5D=Nobody&editing=trigger:0").await;
+    assert_eq!(status, 200);
+    assert!(ids(&body).is_empty());
+}

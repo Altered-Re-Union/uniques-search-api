@@ -68,7 +68,12 @@ pub struct CardRarityV2 {
 pub struct CardV2 {
     pub reference: String,
     pub name: BTreeMap<String, String>,
+    /// Artist credit as printed on the card (a team credit such as `"A - B"` is kept whole).
     pub artist: String,
+    /// Searchable artist names of that credit (its members for a team credit, the credit itself
+    /// otherwise): the values `artist[]` and `/api/v2/artists` use. Omitted when `artist` is empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artists: Vec<String>,
     pub set: CardSetV2,
     pub card_sub_types: Vec<CardSubTypeV2>,
     pub main_cost: Option<u8>,
@@ -254,6 +259,12 @@ pub struct CardsRequest {
     pub cost_relation: Option<CostRelation>,
     pub sub_types: Vec<String>,
     pub has_no_effect: Option<bool>,
+    /// `hasZeroPower=true`: keep cards with at least one power (forest, mountain, ocean) at 0.
+    /// `false` / absent: no filter.
+    pub has_zero_power: bool,
+    /// `artist[]`: artist names, OR'd; a card matches when a name is one of the searchable names
+    /// of its credit, or the printed credit itself (case-insensitive, trimmed).
+    pub artists: Vec<String>,
     /// Unified search box: OR across name substring, exact reference, exact collector number.
     /// Independent of `name`/`refs`/`collector_numbers`, which keep their own AND semantics.
     pub q: Option<String>,

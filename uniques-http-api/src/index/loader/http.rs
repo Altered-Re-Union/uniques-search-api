@@ -74,10 +74,5 @@ pub fn load_app_state_from_http(
     use super::build_app_state;
 
     let bundle = load_bundle_from_http(client)?;
-    Ok(build_app_state(
-        bundle.index,
-        bundle.nonunique,
-        bundle.families,
-        settings,
-    ))
+    build_app_state(bundle, settings)
 }

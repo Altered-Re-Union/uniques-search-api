@@ -1,3 +1,4 @@
+pub mod artists;
 pub mod cards;
 pub mod collections;
 pub(crate) mod error;
@@ -12,6 +13,7 @@ use crate::http::ServerState;
 
 pub fn router(collections: &CollectionsSettings, cards: &CardsSettings) -> Router<ServerState> {
     Router::new()
+        .merge(artists::router())
         .merge(cards::router(cards))
         .merge(collections::router(collections))
         .merge(effects::router())

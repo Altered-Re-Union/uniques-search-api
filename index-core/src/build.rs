@@ -288,6 +288,8 @@ pub fn build_from_cardsdata(
     // same content to the same path.
     crate::family_catalog::build_family_catalog(cardsdata_root)?
         .save(&set_out.join("families.json"))?;
+    // Same for the artist credit -> searchable names mapping (`artist_credits.json`).
+    crate::artist_credits::write_artist_credits(cardsdata_root, &set_out)?;
 
     let id_gd_count = bitmaps.len();
 

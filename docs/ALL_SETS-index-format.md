@@ -92,7 +92,12 @@ ALL_SETS/
   factions_summary.json
   factions/
     AX.roar BR.roar LY.roar MU.roar OR.roar YZ.roar
+  families.json         # CardsData builds only
+  artist_credits.json   # CardsData builds only: printed artist credit -> searchable names
 ```
+
+`artist_credits.json` is described in [`api-spec.md`](api-spec.md#get-apiv2artists) (optional: an
+index without it still loads).
 
 All `.roar` files are **serialized Roaring bitmaps**.
 

@@ -7,7 +7,7 @@ mod index;
 
 pub use collections::CollectionStore;
 pub use config::{
-    load_settings, CollectionsSettings, FormatsSettings, FormatsSourceConfig, IndexSourceKind,
+    load_settings, ArtistsSettings, CollectionsSettings, FormatsSettings, FormatsSourceConfig, IndexSourceKind,
     Settings,
 };
 pub use env::load_env;

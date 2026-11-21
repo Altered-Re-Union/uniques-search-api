@@ -105,6 +105,17 @@ impl AppState {
         new_formats: Arc<FormatIndex>,
         collections_settings: &CollectionsSettings,
     ) -> Option<(u64, u64)> {
+        // No settings here: the index's own `artist_credits.json`, or the fallback.
+        let credits = bundle
+            .artist_credits
+            .as_ref()
+            .map(index_core::artist_credits::ArtistCredits::from_file)
+            .unwrap_or_default();
+        crate::index::loader::bind_artist_credits(
+            &mut bundle.index,
+            bundle.nonunique.as_mut(),
+            credits,
+        );
         if let Some(ref mut nu) = bundle.nonunique {
             nu.bind_families(&bundle.families);
         }
@@ -147,7 +158,7 @@ impl ServerState {
     /// Wrap loaded app state with minimal settings for integration tests (formats disabled).
     pub fn for_test(app: AppState) -> Self {
         use crate::config::{
-            CardsSettings, CollectionsSettings, HttpIndexSettings, IndexSettings, IndexSourceKind,
+            ArtistsSettings, CardsSettings, CollectionsSettings, HttpIndexSettings, IndexSettings, IndexSourceKind,
             ObjectStoreSettings, ReloadSettings, ServerSettings, Settings,
         };
 
@@ -171,6 +182,7 @@ impl ServerState {
                     ..CollectionsSettings::default()
                 },
                 cards: CardsSettings::default(),
+                artists: ArtistsSettings::default(),
             }),
         }
     }
@@ -268,6 +280,7 @@ mod tests {
             collector_number_lookup_index: build_collector_number_lookup_index(&catalog),
             present_cards: roaring::RoaringBitmap::new(),
             effects_body: Arc::new(Bytes::from_static(b"[]")),
+            artist_credits: Default::default(),
         }
     }
 

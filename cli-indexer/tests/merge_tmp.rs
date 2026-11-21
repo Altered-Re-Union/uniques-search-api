@@ -206,3 +206,40 @@ fn merge_remaps_status_bitmaps_across_overlap_and_offset_groups() {
     assert_eq!(suspended.iter().collect::<Vec<_>>(), vec![2]);
 }
 
+
+#[test]
+fn merge_keeps_the_union_of_artist_credits_and_skips_it_when_absent() {
+    use index_core::artist_credits::{ArtistCreditsFile, ARTIST_CREDITS_FILE};
+
+    let index_dir = tempfile::tempdir().expect("index tempdir");
+    let merged_root = tempfile::tempdir().expect("merge out root");
+    make_set_index(index_dir.path(), "CORE", &[("AX", "04", 1)], &[(90, &[0])]);
+    make_set_index(index_dir.path(), "ALIZE", &[("BR", "01", 1)], &[(90, &[0])]);
+
+    // No source has the file: the merged index has none either.
+    let out = merged_root.path().join("NO_CREDITS");
+    merge_indexes(index_dir.path(), "CORE,ALIZE", &out, MergeOptions::default()).expect("merge");
+    assert!(!out.join(ARTIST_CREDITS_FILE).exists());
+
+    write_json(
+        &index_dir.path().join("CORE").join(ARTIST_CREDITS_FILE),
+        json!({ "version": 1, "credits": {
+            "Edward Chee - Seok Yeong": ["Edward Cheekokseang", "Gamon Studio", "Seok Yeong"],
+            "Gamon Studio": ["Gamon Studio"]
+        }}),
+    );
+    write_json(
+        &index_dir.path().join("ALIZE").join(ARTIST_CREDITS_FILE),
+        json!({ "version": 1, "credits": { "Zero Wen": ["Zero Wen"] } }),
+    );
+    let out = merged_root.path().join("ALL");
+    merge_indexes(index_dir.path(), "CORE,ALIZE", &out, MergeOptions::default()).expect("merge");
+    let merged = ArtistCreditsFile::load(&out.join(ARTIST_CREDITS_FILE)).expect("merged file");
+    assert_eq!(merged.version, 1);
+    assert_eq!(merged.credits.len(), 3);
+    assert_eq!(
+        merged.credits["Edward Chee - Seok Yeong"],
+        ["Edward Cheekokseang", "Gamon Studio", "Seok Yeong"]
+    );
+    assert_eq!(merged.credits["Zero Wen"], ["Zero Wen"]);
+}

@@ -197,12 +197,7 @@ pub fn load_app_state_from_object_store(
     use super::build_app_state;
 
     let bundle = load_bundle_from_object_store(client)?;
-    Ok(build_app_state(
-        bundle.index,
-        bundle.nonunique,
-        bundle.families,
-        settings,
-    ))
+    build_app_state(bundle, settings)
 }
 
 fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {

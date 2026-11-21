@@ -1,4 +1,5 @@
 pub mod add_extra_filter;
+pub mod artist_credits;
 pub mod audit_missing;
 pub mod bitmap;
 pub mod build;
@@ -25,6 +26,7 @@ pub mod refs_bitmap;
 pub mod set_code;
 pub mod stat_index;
 pub mod status_index;
+pub mod variation_overrides;
 
 pub use faction_display::faction_display_name;
 pub use refs_bitmap::{

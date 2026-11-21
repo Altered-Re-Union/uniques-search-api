@@ -347,6 +347,7 @@ mod tests {
             collector_number_lookup_index: build_collector_number_lookup_index(&catalog),
             present_cards: RoaringBitmap::from_iter(0..catalog.total_bit_span),
             effects_body: Arc::new(Bytes::from_static(b"[]")),
+            artist_credits: Default::default(),
         }
     }
 

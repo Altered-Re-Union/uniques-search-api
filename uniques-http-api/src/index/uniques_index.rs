@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Bytes;
+use index_core::artist_credits::ArtistCredits;
 use index_core::bitmap::EffectLine;
 use index_core::catalog::Catalog;
 use index_core::compact::{CompactCardView, RECORD_SIZE};
@@ -56,6 +57,9 @@ pub struct UniquesIndex {
     /// inside family spans.
     pub present_cards: RoaringBitmap,
     pub effects_body: Arc<Bytes>,
+    /// Printed artist credit -> searchable names (`artist[]`, `/api/v2/artists`). Empty (each
+    /// credit is its own name) until bound by `bind_artist_credits` at load time.
+    pub artist_credits: Arc<ArtistCredits>,
 }
 
 #[derive(Debug)]

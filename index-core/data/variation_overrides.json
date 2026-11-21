@@ -1,0 +1,29 @@
+{
+  "_doc": "Per-print exceptions to the variation derived from a non-unique reference's product letter (B = standard, A = alt-art, P = promo). See index-core/src/variation_overrides.rs. Applied when the HTTP API loads the index: editing this file needs a rebuild of the API, not a re-index.",
+  "standard": [
+    {
+      "reference": "ALT_ALIZE_P_OR_48_C",
+      "note": "Kuraokami, Libéré des Glaces (TBF-109-C): no B print, this is the base version of the card"
+    },
+    {
+      "reference": "ALT_ALIZE_P_OR_48_R1",
+      "note": "Kuraokami, Libéré des Glaces (TBF-109-R): no B print, this is the base version of the card"
+    },
+    {
+      "reference": "ALT_ALIZE_P_OR_48_R2",
+      "note": "Kuraokami, Libéré des Glaces (TBF-109-F): no B print, this is the base version of the card"
+    },
+    {
+      "reference": "ALT_BISE_P_BR_64_C",
+      "note": "Sofia, Premier Avant-poste (WFM-107-C): no B print, this is the base version of the card"
+    },
+    {
+      "reference": "ALT_BISE_P_BR_64_R1",
+      "note": "Sofia, Premier Avant-poste (WFM-107-R): no B print, this is the base version of the card"
+    },
+    {
+      "reference": "ALT_BISE_P_BR_64_R2",
+      "note": "Sofia, Premier Avant-poste (WFM-107-F): no B print, this is the base version of the card"
+    }
+  ]
+}

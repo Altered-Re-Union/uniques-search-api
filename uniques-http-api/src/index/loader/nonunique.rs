@@ -7,8 +7,10 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use anyhow::Result;
+use index_core::artist_credits::{normalize_wanted_artists, ArtistCredits};
 use index_core::family_catalog::FamilyCatalogEntry;
 use index_core::nonunique::{
     CompactNonUniqueFields, CompactNonUniqueView, NonUniqueCatalog, NonUniquePrintMeta,
@@ -62,6 +64,9 @@ pub struct NonUniqueQueryIndex {
     pub subtype: BTreeMap<String, RoaringBitmap>,
     pub keywords: BTreeMap<String, RoaringBitmap>,
     pub has_no_effect: RoaringBitmap,
+    /// Prints whose product letter isn't `B` but that count as the `standard` variation (base
+    /// version of a card that has no `B` print, see `index_core::variation_overrides`).
+    pub standard_variation_overrides: RoaringBitmap,
     pub cost_relations: NonUniqueCostRelationBitmaps,
     pub family: BTreeMap<String, RoaringBitmap>,
     pub banned: RoaringBitmap,
@@ -84,6 +89,9 @@ pub struct NonUniqueQueryIndex {
     pub name_search_keys: Vec<BTreeMap<String, String>>,
     /// Pre-sorted `print_index` vectors for global sorting & pagination.
     pub sort_index: NonUniqueSortIndex,
+    /// Printed artist credit -> searchable names, shared with the unique index (see
+    /// `bind_artist_credits`).
+    pub artist_credits: Arc<ArtistCredits>,
 }
 
 impl NonUniqueQueryIndex {
@@ -101,6 +109,51 @@ impl NonUniqueQueryIndex {
 
     pub fn total(&self) -> u32 {
         self.catalog.total_cards()
+    }
+
+    /// Prints of the `standard` variation: product `B`, plus the listed exceptions (base version
+    /// of a card printed only as `P`), minus serialized prints.
+    pub fn variation_standard(&self) -> RoaringBitmap {
+        let mut out = self.product.get("B").cloned().unwrap_or_default();
+        out |= &self.standard_variation_overrides;
+        if let Some(serialized) = &self.serialized {
+            out -= serialized;
+        }
+        out
+    }
+
+    /// Prints of the `alt-art` variation: product `A`, minus the `standard` exceptions.
+    pub fn variation_alt_art(&self) -> RoaringBitmap {
+        self.product.get("A").cloned().unwrap_or_default() - &self.standard_variation_overrides
+    }
+
+    /// Prints of the `promo` variation: product `P`, minus the `standard` exceptions.
+    pub fn variation_promo(&self) -> RoaringBitmap {
+        self.product.get("P").cloned().unwrap_or_default() - &self.standard_variation_overrides
+    }
+
+    /// Prints matching one of `artists` (case-insensitive, trimmed): one of the searchable names
+    /// of the print's credit (its members for a team credit such as `"A - B"`), or the printed
+    /// credit itself. See [`ArtistCredits::credit_matches`].
+    pub fn bitmap_for_artists(&self, artists: &[String]) -> RoaringBitmap {
+        let wanted = normalize_wanted_artists(artists);
+        self.bitmap_where(|i| {
+            self.prints
+                .get(i)
+                .is_some_and(|p| self.artist_credits.credit_matches(&p.artist, &wanted))
+        })
+    }
+
+    /// Prints with at least one power (forest, mountain, ocean) equal to 0. Prints without powers
+    /// (Heroes, Spells, ...) never match.
+    pub fn bitmap_for_zero_power(&self) -> RoaringBitmap {
+        let mut out = RoaringBitmap::new();
+        for stat in ["forest_power", "mountain_power", "ocean_power"] {
+            if let Some(zero) = self.stats.get(stat).and_then(|b| b.get(&0)) {
+                out |= zero;
+            }
+        }
+        out
     }
 
     pub fn resolve_reference(&self, reference: &str) -> Option<u32> {
@@ -312,6 +365,12 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
 
     let collector_lookup = build_collector_lookup(&prints);
 
+    let standard_variation_overrides: RoaringBitmap =
+        index_core::variation_overrides::standard_variation_overrides()
+            .iter()
+            .filter_map(|reference| ref_lookup.get(reference).copied())
+            .collect();
+
     let effect_search_keys: Vec<BTreeMap<String, String>> = effect_text
         .iter()
         .map(|per_loc| {
@@ -342,6 +401,7 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
         subtype,
         keywords,
         has_no_effect,
+        standard_variation_overrides,
         cost_relations,
         family,
         banned,
@@ -355,6 +415,7 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
         normalized_names,
         name_search_keys,
         sort_index,
+        artist_credits: Default::default(),
     }))
 }
 

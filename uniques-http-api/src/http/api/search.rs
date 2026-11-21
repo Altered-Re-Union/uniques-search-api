@@ -29,8 +29,8 @@ use crate::http::api::cards::models::{
 };
 use crate::http::api::cards::parse::{
     get_first, has_any, parse_collection, parse_collector_numbers, parse_cost_predicate,
-    parse_cost_relation, parse_effect_mode, parse_effect_slots, parse_format, parse_has_no_effect,
-    parse_id_list, parse_name, parse_q, parse_query_multimap, parse_refs, parse_sets, parse_sort,
+    parse_artists, parse_cost_relation, parse_effect_mode, parse_effect_slots, parse_format,
+    parse_has_no_effect, parse_has_zero_power, parse_id_list, parse_name, parse_q, parse_query_multimap, parse_refs, parse_sets, parse_sort,
     parse_sub_types, parse_u32, parse_usize, resolve_collection_filter, resolve_format_filter,
     validate_idgd_types, QueryMultiMap,
 };
@@ -108,6 +108,8 @@ struct SearchRequest {
     forest_power: Option<CostPredicate>,
     cost_relation: Option<CostRelation>,
     has_no_effect: Option<bool>,
+    has_zero_power: bool,
+    artists: Vec<String>,
     refs: Vec<String>,
     collector_numbers: Vec<String>,
     format: Option<String>,
@@ -241,6 +243,8 @@ impl SearchRequest {
             cost_relation: self.cost_relation,
             sub_types: self.sub_types.clone(),
             has_no_effect: self.has_no_effect,
+            has_zero_power: self.has_zero_power,
+            artists: self.artists.clone(),
             q: self.q.clone(),
             format: self.format.clone(),
             collection: self.collection.clone(),
@@ -1167,6 +1171,8 @@ fn parse_request(
     let forest_power = parse_cost_predicate(params, "forestPower")?;
     let cost_relation = parse_cost_relation(params)?;
     let has_no_effect = parse_has_no_effect(params)?;
+    let has_zero_power = parse_has_zero_power(params)?;
+    let artists = parse_artists(params);
     let refs = parse_refs(params);
     let collector_numbers = parse_collector_numbers(params);
 
@@ -1238,6 +1244,8 @@ fn parse_request(
         forest_power,
         cost_relation,
         has_no_effect,
+        has_zero_power,
+        artists,
         refs,
         collector_numbers,
         format,
@@ -1546,26 +1554,18 @@ fn build_nonunique_bitmap(
     }
 
     if !req.variations.is_empty() {
+        // Variation = product letter (B/A/P), except the prints listed in
+        // `index_core::variation_overrides` (e.g. Kuraokami, Sofia: `P` but base cards).
         let mut combined = RoaringBitmap::new();
-        let ser_bmp = nu.serialized.clone().unwrap_or_default();
         for v in &req.variations {
             match v {
-                VariationKind::Standard => {
-                    let base = nu.product.get("B").cloned().unwrap_or_default();
-                    combined |= base - &ser_bmp;
-                }
-                VariationKind::AltArt => {
-                    if let Some(bmp) = nu.product.get("A") {
-                        combined |= bmp;
-                    }
-                }
-                VariationKind::Promo => {
-                    if let Some(bmp) = nu.product.get("P") {
-                        combined |= bmp;
-                    }
-                }
+                VariationKind::Standard => combined |= nu.variation_standard(),
+                VariationKind::AltArt => combined |= nu.variation_alt_art(),
+                VariationKind::Promo => combined |= nu.variation_promo(),
                 VariationKind::Serialized => {
-                    combined |= &ser_bmp;
+                    if let Some(ser_bmp) = &nu.serialized {
+                        combined |= ser_bmp;
+                    }
                 }
             }
         }
@@ -1609,6 +1609,14 @@ fn build_nonunique_bitmap(
 
     if let Some(has_no_effect) = req.has_no_effect {
         intersect(&mut acc, bool_bitmap(has_no_effect, &nu.has_no_effect, total));
+    }
+
+    if req.has_zero_power {
+        intersect(&mut acc, nu.bitmap_for_zero_power());
+    }
+
+    if !req.artists.is_empty() {
+        intersect(&mut acc, nu.bitmap_for_artists(&req.artists));
     }
 
     if let Some(id) = &req.collection {

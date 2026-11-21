@@ -29,6 +29,13 @@ time_to_idle_secs = 0
 # Maximum size to POST /api/v2/collection/{id} -- 0 = keep 2MiB default
 max_post_payload_bytes = 0
 
+# Artist credit -> searchable names (artist[] filter, /api/v2/artists). By default it comes from the
+# index's artist_credits.json (fallback without it: each printed credit is its own name). Set a
+# CardsData data/csv directory to build it from Artists.csv + ArtistCreditMembers.csv at load time
+# instead (env: ARTISTS__CARDSDATA_CSV_DIR), e.g. with a prebuilt index that has no such file.
+# [artists]
+# cardsdata_csv_dir = "../CardsData/data/csv"
+
 # Optional format filters (omit entire [formats] section to disable)
 # [formats]
 # reload_interval_secs = 60
