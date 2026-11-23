@@ -2,34 +2,70 @@ use std::collections::BTreeMap;
 
 use index_core::card::LocaleText;
 use index_core::idgd_catalog::{IdGdCatalog, IdGdCatalogEntry};
+use index_core::nonunique::NonUniqueIdGdEntry;
 use anyhow::Context;
 use axum::body::Bytes;
 
 use super::models::{EffectPartWithRegion, EffectsListResponse};
 
-/// Build the effects list from `idgd_catalog.json` entries.
+/// Build the effects list from `idgd_catalog.json` entries (uniques only).
 pub fn build_effects_list(catalog: &IdGdCatalog) -> EffectsListResponse {
-    let mut triggers = Vec::new();
-    let mut conditions = Vec::new();
-    let mut output = Vec::new();
+    build_unified_effects_list(catalog, None)
+}
 
-    for entry in &catalog.entries {
-        match entry.element_type.as_str() {
-            "TRIGGER" => triggers.push(effect_part_with_region(entry)),
-            "CONDITION" => conditions.push(effect_part_with_region(entry)),
-            "OUTPUT" => output.push(effect_part_with_region(entry)),
-            _ => {}
+/// Build the unified effects list merging unique `idgd_catalog.json` with optional non-unique
+/// `nonunique/idgd_catalog.json` entries. Shared canonical `idGd`s merge `is_main`/`is_echo`
+/// region flags; non-unique-only `idGd`s are appended and sorted by `id_gd`.
+pub fn build_unified_effects_list(
+    unique_catalog: &IdGdCatalog,
+    nonunique_entries: Option<&[NonUniqueIdGdEntry]>,
+) -> EffectsListResponse {
+    let mut triggers: BTreeMap<u32, EffectPartWithRegion> = BTreeMap::new();
+    let mut conditions: BTreeMap<u32, EffectPartWithRegion> = BTreeMap::new();
+    let mut output: BTreeMap<u32, EffectPartWithRegion> = BTreeMap::new();
+
+    for entry in &unique_catalog.entries {
+        let target = match entry.element_type.as_str() {
+            "TRIGGER" => &mut triggers,
+            "CONDITION" => &mut conditions,
+            "OUTPUT" => &mut output,
+            _ => continue,
+        };
+        target.insert(entry.id_gd, effect_part_with_region(entry));
+    }
+
+    if let Some(nu_entries) = nonunique_entries {
+        let aliases = index_core::idgd_collapse::IdGdAliasMap::from_catalog(unique_catalog);
+        for entry in nu_entries {
+            let canon_id = aliases.resolve(entry.id_gd);
+            let target = match entry.element_type.as_str() {
+                "TRIGGER" => &mut triggers,
+                "CONDITION" => &mut conditions,
+                "OUTPUT" => &mut output,
+                _ => continue,
+            };
+            if let Some(existing) = target.get_mut(&canon_id) {
+                existing.is_main |= entry.is_main;
+                existing.is_echo |= entry.is_echo;
+            } else {
+                target.insert(
+                    canon_id,
+                    EffectPartWithRegion {
+                        id_gd: canon_id,
+                        text: entry.translations.clone(),
+                        is_echo: entry.is_echo,
+                        is_main: entry.is_main,
+                        duplicated_id_gd: Vec::new(),
+                    },
+                );
+            }
         }
     }
 
-    triggers.sort_by_key(|e| e.id_gd);
-    conditions.sort_by_key(|e| e.id_gd);
-    output.sort_by_key(|e| e.id_gd);
-
     EffectsListResponse {
-        triggers,
-        conditions,
-        output,
+        triggers: triggers.into_values().collect(),
+        conditions: conditions.into_values().collect(),
+        output: output.into_values().collect(),
     }
 }
 

@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use crate::collections::CollectionStore;
 use crate::config::CardsSettings;
-use crate::formats::FormatIndex;
+use crate::formats::{FormatIndex, FormatLoadStatus};
 use crate::http::api::cards::models::{
     AbilityFilters, CardV2, CardsRequest, CardsSort, CompareOp, CostPredicate, CostRelation,
     EffectCombineMode, EffectSlotFilter, SortDir, SortField,
@@ -32,15 +32,17 @@ use crate::http::api::cards::parse::{
     parse_artists, parse_cost_relation, parse_effect_mode, parse_effect_slots, parse_format,
     parse_has_no_effect, parse_has_zero_power, parse_id_list, parse_name, parse_q, parse_query_multimap, parse_refs, parse_sets, parse_sort,
     parse_sub_types, parse_u32, parse_usize, resolve_collection_filter, resolve_format_filter,
-    validate_idgd_types, QueryMultiMap,
+    validate_idgd_types_unified, QueryMultiMap,
 };
 use crate::http::api::error::{bad_request, map_query_error, ApiResult};
 use crate::http::state::QuerySnapshot;
 use crate::http::ServerState;
-use crate::index::loader::{faction_sort_rank, normalize_name_for_search, set_release_rank};
+use crate::index::loader::{
+    faction_sort_rank, normalize_name_for_search, set_release_rank, NonUniqueEffectLine,
+};
 use crate::index::{
-    build_bitmap, card_v2_from_index, enrich_unique_card_v2, nonunique_card_v2,
-    subtype_names_from_index, NonUniqueQueryIndex, UniquesIndex,
+    build_bitmap, card_v2_from_index, combine_effect_bitmaps, enrich_unique_card_v2,
+    nonunique_card_v2, subtype_names_from_index, NonUniqueQueryIndex, UniquesIndex,
 };
 
 pub fn router(cards: &CardsSettings) -> Router<ServerState> {
@@ -78,15 +80,16 @@ enum VariationKind {
     Serialized,
 }
 
-struct SearchRequest {
-    q: Option<String>,
-    name: Option<String>,
-    effect_text: Option<String>,
-    effects: Vec<EffectSlotFilter>,
-    effect_mode: EffectCombineMode,
-    support_t: Vec<u32>,
-    support_c: Vec<u32>,
-    support_o: Vec<u32>,
+#[derive(Clone)]
+pub(crate) struct SearchRequest {
+    pub(crate) q: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) effect_text: Option<String>,
+    pub(crate) effects: Vec<EffectSlotFilter>,
+    pub(crate) effect_mode: EffectCombineMode,
+    pub(crate) support_t: Vec<u32>,
+    pub(crate) support_c: Vec<u32>,
+    pub(crate) support_o: Vec<u32>,
     factions: Vec<String>,
     sets: Vec<String>,
     rarities: Vec<String>,
@@ -123,19 +126,8 @@ struct SearchRequest {
 }
 
 impl SearchRequest {
-    fn has_unique_only_effects(&self) -> bool {
-        !self.effects.is_empty()
-            || !self.support_t.is_empty()
-            || !self.support_c.is_empty()
-            || !self.support_o.is_empty()
-    }
-
     fn nonunique_branch_excluded(&self) -> bool {
-        if self.kind == KindFilter::UniqueOnly || self.has_unique_only_effects() {
-            return true;
-        }
-        // Formats only index uniques for now (e.g. Frontier include-list of uniques).
-        if self.format.is_some() {
+        if self.kind == KindFilter::UniqueOnly {
             return true;
         }
         if !self.rarities.is_empty()
@@ -176,12 +168,6 @@ impl SearchRequest {
             return true;
         }
         if self.serialized == Some(true) {
-            return true;
-        }
-        if self.effect_text.is_some() {
-            // `effectText` is targeted for non-unique card effect substring search, though we can
-            // fall through if combined; keeping uniques excluded when strictly filtering by effectText
-            // unless empty.
             return true;
         }
         false
@@ -316,6 +302,7 @@ fn respond_search(server: &ServerState, params: &QueryMultiMap) -> ApiResult<Jso
     let req = parse_request(
         params,
         snapshot.index.as_ref(),
+        snapshot.nonunique.as_deref(),
         &snapshot.formats,
         formats_enabled,
         &snapshot.collections,
@@ -371,6 +358,7 @@ fn respond_search(server: &ServerState, params: &QueryMultiMap) -> ApiResult<Jso
                         print_index,
                         &snapshot.families,
                         &subtype_names,
+                        snapshot.formats.as_ref(),
                     ) {
                         cards.push(SearchCard::NonUnique { card });
                     }
@@ -413,7 +401,7 @@ fn respond_search(server: &ServerState, params: &QueryMultiMap) -> ApiResult<Jso
 
 /// Matching cards of both branches for `req`: `(unique card indices, non-unique print indices)`.
 /// A branch excluded by `req` (see `unique_branch_excluded` / `nonunique_branch_excluded`) is empty.
-fn search_bitmaps(
+pub(crate) fn search_bitmaps(
     snapshot: &QuerySnapshot,
     req: &SearchRequest,
 ) -> ApiResult<(RoaringBitmap, RoaringBitmap)> {
@@ -421,7 +409,13 @@ fn search_bitmaps(
         RoaringBitmap::new()
     } else {
         match snapshot.nonunique.as_deref() {
-            Some(nu) => build_nonunique_bitmap(nu, &snapshot.collections, req)?,
+            Some(nu) => build_nonunique_bitmap(
+                nu,
+                snapshot.index.as_ref(),
+                &snapshot.formats,
+                &snapshot.collections,
+                req,
+            )?,
             None => RoaringBitmap::new(),
         }
     };
@@ -477,6 +471,7 @@ fn respond_facets(server: &ServerState, params: &QueryMultiMap) -> ApiResult<Jso
     let mut req = parse_request(
         params,
         snapshot.index.as_ref(),
+        snapshot.nonunique.as_deref(),
         &snapshot.formats,
         formats_enabled,
         &snapshot.collections,
@@ -1115,9 +1110,10 @@ fn window_across(
     (picked_first, picked_second)
 }
 
-fn parse_request(
+pub(crate) fn parse_request(
     params: &QueryMultiMap,
     index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
     format_index: &FormatIndex,
     formats_enabled: bool,
     collections: &CollectionStore,
@@ -1139,7 +1135,7 @@ fn parse_request(
             support_c: support_c.clone(),
             support_o: support_o.clone(),
         };
-        validate_idgd_types(index, &ability_filters)?;
+        validate_idgd_types_unified(index, nonunique, &ability_filters)?;
     }
 
     let factions = parse_factions_str(params)?;
@@ -1446,6 +1442,8 @@ fn parse_kind(params: &QueryMultiMap) -> ApiResult<KindFilter> {
 
 fn build_nonunique_bitmap(
     nu: &NonUniqueQueryIndex,
+    unique: &UniquesIndex,
+    format_index: &FormatIndex,
     collections: &CollectionStore,
     req: &SearchRequest,
 ) -> ApiResult<RoaringBitmap> {
@@ -1454,6 +1452,56 @@ fn build_nonunique_bitmap(
         return Ok(RoaringBitmap::new());
     }
     let mut acc: Option<RoaringBitmap> = None;
+
+    // Structured effect[N][t|c|o] + matchCount + effectMode across main lines (1..=max_main_lines).
+    let effect_bitmaps: Vec<RoaringBitmap> = req
+        .effects
+        .iter()
+        .filter_map(|slot| {
+            nonunique_effect_slot_bitmap(
+                nu,
+                unique,
+                &slot.t,
+                &slot.c,
+                &slot.o,
+                slot.match_count,
+            )
+        })
+        .collect();
+    if let Some(bmp) = combine_effect_bitmaps(&effect_bitmaps, req.effect_mode) {
+        intersect(&mut acc, bmp);
+    }
+
+    // Structured support[t|c|o] on echo/support line.
+    if let Some(bmp) = nonunique_intersect_buckets_on_line(
+        nu,
+        unique,
+        NonUniqueEffectLine::Echo,
+        &req.support_t,
+        &req.support_c,
+        &req.support_o,
+    ) {
+        intersect(&mut acc, bmp);
+    }
+
+    let mut format_exclude: Option<RoaringBitmap> = None;
+    if let Some(id) = &req.format {
+        if let Some(loaded) = format_index.get(id) {
+            match &loaded.status {
+                FormatLoadStatus::Ready {
+                    negated: true,
+                    nonunique_bitmap,
+                    ..
+                } => format_exclude = Some(nonunique_bitmap.clone()),
+                FormatLoadStatus::Ready {
+                    negated: false,
+                    nonunique_bitmap,
+                    ..
+                } => intersect(&mut acc, nonunique_bitmap.clone()),
+                FormatLoadStatus::Failed => {}
+            }
+        }
+    }
 
     if !req.factions.is_empty() {
         let mut combined = RoaringBitmap::new();
@@ -1683,11 +1731,108 @@ fn build_nonunique_bitmap(
         }
     }
 
-    Ok(acc.unwrap_or_else(|| {
+    let mut out = acc.unwrap_or_else(|| {
         let mut all = RoaringBitmap::new();
         all.insert_range(0..total);
         all
-    }))
+    });
+    if let Some(exclude) = format_exclude {
+        out -= exclude;
+    }
+    Ok(out)
+}
+
+fn nonunique_effect_slot_bitmap(
+    nu: &NonUniqueQueryIndex,
+    unique: &UniquesIndex,
+    triggers: &[u32],
+    conditions: &[u32],
+    outputs: &[u32],
+    match_count: u8,
+) -> Option<RoaringBitmap> {
+    if triggers.is_empty() && conditions.is_empty() && outputs.is_empty() {
+        return None;
+    }
+    let mut line_matches: Vec<RoaringBitmap> = Vec::new();
+    for line in 1..=nu.max_main_lines {
+        if let Some(bmp) = nonunique_intersect_buckets_on_line(
+            nu,
+            unique,
+            NonUniqueEffectLine::Main(line),
+            triggers,
+            conditions,
+            outputs,
+        ) {
+            if !bmp.is_empty() {
+                line_matches.push(bmp);
+            }
+        }
+    }
+    if match_count <= 1 {
+        let mut out = RoaringBitmap::new();
+        for bmp in line_matches {
+            out |= bmp;
+        }
+        return Some(out);
+    }
+    let mut counts: BTreeMap<u32, u8> = BTreeMap::new();
+    for bmp in &line_matches {
+        for idx in bmp.iter() {
+            *counts.entry(idx).or_insert(0) += 1;
+        }
+    }
+    let out: RoaringBitmap = counts
+        .into_iter()
+        .filter_map(|(idx, cnt)| (cnt >= match_count).then_some(idx))
+        .collect();
+    Some(out)
+}
+
+pub(crate) fn nonunique_union_on_line(
+    nu: &NonUniqueQueryIndex,
+    unique: &UniquesIndex,
+    line: NonUniqueEffectLine,
+    ids: &[u32],
+) -> RoaringBitmap {
+    let mut out = RoaringBitmap::new();
+    for &id in ids {
+        let resolved = unique.resolve_id_gd(id);
+        if let Some(bmp) = nu.id_gd_per_line.get(&(resolved, line)) {
+            out |= bmp;
+        }
+        if resolved != id {
+            if let Some(bmp) = nu.id_gd_per_line.get(&(id, line)) {
+                out |= bmp;
+            }
+        }
+    }
+    out
+}
+
+fn nonunique_intersect_buckets_on_line(
+    nu: &NonUniqueQueryIndex,
+    unique: &UniquesIndex,
+    line: NonUniqueEffectLine,
+    triggers: &[u32],
+    conditions: &[u32],
+    outputs: &[u32],
+) -> Option<RoaringBitmap> {
+    let mut groups: Vec<RoaringBitmap> = Vec::new();
+    if !triggers.is_empty() {
+        groups.push(nonunique_union_on_line(nu, unique, line, triggers));
+    }
+    if !conditions.is_empty() {
+        groups.push(nonunique_union_on_line(nu, unique, line, conditions));
+    }
+    if !outputs.is_empty() {
+        groups.push(nonunique_union_on_line(nu, unique, line, outputs));
+    }
+    let mut it = groups.into_iter();
+    let mut bmp = it.next()?;
+    for g in it {
+        bmp &= g;
+    }
+    Some(bmp)
 }
 
 fn build_unique_search_bitmap(
@@ -1703,6 +1848,9 @@ fn build_unique_search_bitmap(
     let mut bitmap =
         build_bitmap(unique, format_index, collections, &cards_req).map_err(map_query_error)?;
     let total_bit_span = unique.catalog().total_bit_span;
+    if let Some(effect_text) = &req.effect_text {
+        bitmap &= unique.bitmap_for_effect_text(effect_text);
+    }
     if let Some(banned) = req.banned {
         bitmap &= bool_bitmap(banned, unique.banned(), total_bit_span);
     }

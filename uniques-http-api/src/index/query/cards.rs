@@ -204,10 +204,12 @@ pub(crate) fn build_bitmap(
                 FormatLoadStatus::Ready {
                     negated: true,
                     bitmap,
+                    ..
                 } => format_exclude = Some(bitmap.clone()),
                 FormatLoadStatus::Ready {
                     negated: false,
                     bitmap,
+                    ..
                 } => groups.push(bitmap.clone()),
                 FormatLoadStatus::Failed => {}
             }
@@ -276,9 +278,10 @@ fn collector_number_bitmap(state: &UniquesIndex, collector_numbers: &[String]) -
     out
 }
 
-/// `q`'s single OR'd group: name substring, exact reference, exact collector number.
+/// `q`'s single OR'd group: name substring, effect text match, exact reference, exact collector number.
 fn unified_search_bitmap(state: &UniquesIndex, q: &str) -> RoaringBitmap {
     let mut out = state.name_search_index().bitmap_for_contains(state.catalog(), q);
+    out |= state.bitmap_for_effect_text(q);
     out |= index_core::build_bitmap_from_ref_strs_lenient(state.catalog(), &[q]);
     for card_index in state.resolve_card_indices_by_collector_number(q) {
         out.insert(card_index);
@@ -533,8 +536,32 @@ pub fn unique_legal_formats(card_index: u32, formats: &FormatIndex) -> Option<Ve
     }
     let mut out = Vec::new();
     for (id, loaded) in &formats.by_id {
-        if let FormatLoadStatus::Ready { negated, bitmap } = &loaded.status {
+        if let FormatLoadStatus::Ready {
+            negated, bitmap, ..
+        } = &loaded.status
+        {
             let matches = bitmap.contains(card_index);
+            if (*negated && !matches) || (!*negated && matches) {
+                out.push(id.clone());
+            }
+        }
+    }
+    Some(out)
+}
+
+pub fn nonunique_legal_formats(print_index: u32, formats: &FormatIndex) -> Option<Vec<String>> {
+    if formats.by_id.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (id, loaded) in &formats.by_id {
+        if let FormatLoadStatus::Ready {
+            negated,
+            nonunique_bitmap,
+            ..
+        } = &loaded.status
+        {
+            let matches = nonunique_bitmap.contains(print_index);
             if (*negated && !matches) || (!*negated && matches) {
                 out.push(id.clone());
             }
@@ -579,8 +606,10 @@ pub fn nonunique_card_v2(
     print_index: u32,
     families: &BTreeMap<i64, FamilyCatalogEntry>,
     subtype_names: &BTreeMap<String, BTreeMap<String, String>>,
+    formats: &FormatIndex,
 ) -> Option<CardV2> {
     let reference = nu.reference_for(print_index)?.to_string();
+    let legal_formats = nonunique_legal_formats(print_index, formats);
     if let Some(meta) = nu.print_for(print_index) {
         let fam = families.get(&meta.card_family_id);
         let name = fam.map(|f| f.name.clone()).unwrap_or_default();
@@ -621,6 +650,7 @@ pub fn nonunique_card_v2(
                 }),
             })
             .collect();
+        let abilities = build_nonunique_abilities(nu, &meta.abilities);
 
         Some(CardV2 {
             reference,
@@ -654,9 +684,9 @@ pub fn nonunique_card_v2(
             is_suspended: Some(meta.is_suspended),
             permanent: meta.permanent,
             reserve: meta.reserve,
-            legal_formats: None,
+            legal_formats,
             debug_bga_trigram: None,
-            abilities: Vec::new(),
+            abilities,
         })
     } else {
         // Fallback when legacy index lacks `prints.json`.
@@ -730,11 +760,49 @@ pub fn nonunique_card_v2(
             is_suspended: Some(nu.suspended.contains(print_index)),
             permanent: None,
             reserve: None,
-            legal_formats: None,
+            legal_formats,
             debug_bga_trigram: None,
             abilities: Vec::new(),
         })
     }
+}
+
+fn build_nonunique_abilities(
+    nu: &NonUniqueQueryIndex,
+    lines: &[index_core::nonunique::NonUniqueAbilityLine],
+) -> Vec<CardAbilityV2> {
+    let element = |id: Option<u32>| -> Option<CardAbilityElementV2> {
+        let id_gd = id?;
+        let text = nu
+            .idgd_by_id
+            .get(&id_gd)
+            .and_then(|&idx| nu.idgd_catalog.get(idx))
+            .map(|entry| entry.translations.clone())
+            .unwrap_or_default();
+        Some(CardAbilityElementV2 { id_gd, text })
+    };
+    let mut main_out = Vec::new();
+    let mut echo_out = Vec::new();
+    for l in lines {
+        let ab = CardAbilityV2 {
+            kind: if l.is_echo {
+                CardAbilityKind::Echo
+            } else {
+                CardAbilityKind::Main
+            },
+            line: l.line,
+            trigger: element(l.trigger),
+            condition: element(l.condition),
+            output: element(l.output),
+        };
+        if l.is_echo {
+            echo_out.push(ab);
+        } else {
+            main_out.push(ab);
+        }
+    }
+    main_out.extend(echo_out);
+    main_out
 }
 
 pub fn subtype_names_from_index(index: &UniquesIndex) -> BTreeMap<String, BTreeMap<String, String>> {
@@ -1810,6 +1878,7 @@ mod tests {
                 status: FormatLoadStatus::Ready {
                     negated: false,
                     bitmap: allowed,
+                    nonunique_bitmap: RoaringBitmap::new(),
                 },
             },
         );
@@ -1848,6 +1917,7 @@ mod tests {
                 status: FormatLoadStatus::Ready {
                     negated: true,
                     bitmap: excluded,
+                    nonunique_bitmap: RoaringBitmap::new(),
                 },
             },
         );
@@ -1914,6 +1984,7 @@ mod tests {
                 status: FormatLoadStatus::Ready {
                     negated: false,
                     bitmap: allowed,
+                    nonunique_bitmap: RoaringBitmap::new(),
                 },
             },
         );

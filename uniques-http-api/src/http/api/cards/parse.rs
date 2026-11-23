@@ -751,9 +751,24 @@ pub(crate) fn parse_artists(params: &QueryMultiMap) -> Vec<String> {
 }
 
 pub(crate) fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters) -> ApiResult<()> {
+    validate_idgd_types_unified(state, None, filters)
+}
+
+pub(crate) fn validate_idgd_types_unified(
+    state: &UniquesIndex,
+    nonunique: Option<&crate::index::NonUniqueQueryIndex>,
+    filters: &AbilityFilters,
+) -> ApiResult<()> {
     let mut types: BTreeMap<u32, &str> = BTreeMap::new();
     for entry in &state.idgd_catalog().entries {
         types.insert(entry.id_gd, entry.element_type.as_str());
+    }
+    if let Some(nu) = nonunique {
+        for entry in &nu.idgd_catalog {
+            types
+                .entry(state.resolve_id_gd(entry.id_gd))
+                .or_insert(entry.element_type.as_str());
+        }
     }
 
     for slot in &filters.effects {
@@ -1222,6 +1237,7 @@ mod tests {
             FormatLoadStatus::Ready {
                 negated: false,
                 bitmap: RoaringBitmap::new(),
+                nonunique_bitmap: RoaringBitmap::new(),
             },
         );
         let mut params: QueryMultiMap = HashMap::new();

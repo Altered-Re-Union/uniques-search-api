@@ -235,7 +235,40 @@ impl NonUniqueCatalog {
     }
 }
 
-// --- Bitmaps: faction / rarity / product / serialized / stats ---
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NonUniqueAbilityLine {
+    pub is_echo: bool,
+    /// 1-based line number within `main` (`1..=N`) or `echo` (`1..=N`).
+    pub line: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u32>,
+}
+
+/// One positive `IdGd` fragment referenced by at least one non-unique print.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NonUniqueIdGdEntry {
+    pub id_gd: u32,
+    /// `"TRIGGER"`, `"CONDITION"`, or `"OUTPUT"`.
+    pub element_type: String,
+    pub translations: BTreeMap<String, String>,
+    pub is_main: bool,
+    pub is_echo: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub main_lines: Vec<u8>,
+    #[serde(default)]
+    pub has_ec: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NonUniqueIdGdCatalog {
+    pub entries: Vec<NonUniqueIdGdEntry>,
+}
+
+// --- Bitmaps: faction / rarity / product / serialized / stats / id_gd ---
 
 #[derive(Debug, Default)]
 pub struct NonUniqueIndexBuilder {
@@ -256,6 +289,9 @@ pub struct NonUniqueIndexBuilder {
     banned: RoaringBitmap,
     errated: RoaringBitmap,
     suspended: RoaringBitmap,
+    id_gd_whole: BTreeMap<u32, RoaringBitmap>,
+    id_gd_per_line: BTreeMap<(u32, String), RoaringBitmap>,
+    id_gd_meta: BTreeMap<u32, (bool, bool, BTreeSet<u8>, bool)>,
 }
 
 impl NonUniqueIndexBuilder {
@@ -352,6 +388,35 @@ impl NonUniqueIndexBuilder {
         if record.is_suspended {
             self.suspended.insert(print_index);
         }
+
+        for ability in &record.abilities {
+            let line_suffix = if ability.is_echo {
+                "ec".to_string()
+            } else {
+                format!("m{}", ability.line)
+            };
+            for id in [ability.trigger, ability.condition, ability.output]
+                .into_iter()
+                .flatten()
+            {
+                self.id_gd_whole
+                    .entry(id)
+                    .or_default()
+                    .insert(print_index);
+                self.id_gd_per_line
+                    .entry((id, line_suffix.clone()))
+                    .or_default()
+                    .insert(print_index);
+                let meta = self.id_gd_meta.entry(id).or_default();
+                if ability.is_echo {
+                    meta.1 = true;
+                    meta.3 = true;
+                } else {
+                    meta.0 = true;
+                    meta.2.insert(ability.line);
+                }
+            }
+        }
     }
 
     pub fn into_index(self) -> NonUniqueIndex {
@@ -373,6 +438,9 @@ impl NonUniqueIndexBuilder {
             banned: self.banned,
             errated: self.errated,
             suspended: self.suspended,
+            id_gd_whole: self.id_gd_whole,
+            id_gd_per_line: self.id_gd_per_line,
+            id_gd_meta: self.id_gd_meta,
         }
     }
 }
@@ -395,6 +463,9 @@ pub struct NonUniqueIndex {
     banned: RoaringBitmap,
     errated: RoaringBitmap,
     suspended: RoaringBitmap,
+    id_gd_whole: BTreeMap<u32, RoaringBitmap>,
+    id_gd_per_line: BTreeMap<(u32, String), RoaringBitmap>,
+    id_gd_meta: BTreeMap<u32, (bool, bool, BTreeSet<u8>, bool)>,
 }
 
 impl NonUniqueIndex {
@@ -461,7 +532,54 @@ impl NonUniqueIndex {
             }
         }
 
+        if !self.id_gd_whole.is_empty() {
+            let id_gd_dir = nonunique_root.join("id_gd");
+            fs::create_dir_all(&id_gd_dir)?;
+            for (id_gd, bitmap) in &self.id_gd_whole {
+                write_single_bitmap(&id_gd_dir.join(format!("{id_gd}.roar")), bitmap)?;
+            }
+            for ((id_gd, suffix), bitmap) in &self.id_gd_per_line {
+                write_single_bitmap(&id_gd_dir.join(format!("{id_gd}_{suffix}.roar")), bitmap)?;
+            }
+        }
+
         Ok(())
+    }
+
+    pub fn build_idgd_catalog(
+        &self,
+        fragments: &BTreeMap<i64, EffectFragmentTextRow>,
+    ) -> NonUniqueIdGdCatalog {
+        let mut entries = Vec::with_capacity(self.id_gd_meta.len());
+        for (&id_gd, (is_main, is_echo, main_lines, has_ec)) in &self.id_gd_meta {
+            let Some(frag) = fragments.get(&(id_gd as i64)) else {
+                continue;
+            };
+            let element_type = match frag.fragment_type.trim().to_ascii_uppercase().as_str() {
+                "TRIGGER" => "TRIGGER".to_string(),
+                "CONDITION" => "CONDITION".to_string(),
+                "OUTPUT" => "OUTPUT".to_string(),
+                other if !other.is_empty() => other.to_string(),
+                _ => "OUTPUT".to_string(),
+            };
+            let mut translations = BTreeMap::new();
+            for locale in LOCALES {
+                let text = fragment_text_for_locale(frag, locale);
+                if !text.is_empty() {
+                    translations.insert(locale.to_string(), text.to_string());
+                }
+            }
+            entries.push(NonUniqueIdGdEntry {
+                id_gd,
+                element_type,
+                translations,
+                is_main: *is_main,
+                is_echo: *is_echo,
+                main_lines: main_lines.iter().copied().collect(),
+                has_ec: *has_ec,
+            });
+        }
+        NonUniqueIdGdCatalog { entries }
     }
 }
 
@@ -651,11 +769,13 @@ struct PrintEffectFragmentRow {
     effect_id: Option<i64>,
 }
 
-/// Full text + keyword + slot row from shared `EffectFragments.csv`.
+/// Full text + type + keyword + slot row from shared `EffectFragments.csv`.
 #[derive(Debug, Deserialize)]
-struct EffectFragmentTextRow {
+pub struct EffectFragmentTextRow {
     #[serde(rename = "IdGd")]
     id_gd: i64,
+    #[serde(rename = "Type", default)]
+    fragment_type: String,
     #[serde(rename = "KeywordReference", default)]
     keyword_reference: String,
     #[serde(rename = "Slot", default)]
@@ -701,6 +821,8 @@ pub struct NonUniquePrintRecord {
     pub echo_effect: BTreeMap<String, String>,
     /// Locale -> space-joined combined text for full-text search.
     pub effect_text: BTreeMap<String, String>,
+    /// Structured positive-`idGd` ability lines (main + echo) for unified effect filtering & `CardV2.abilities`.
+    pub abilities: Vec<NonUniqueAbilityLine>,
 }
 
 /// Serializable per-print metadata stored at `nonunique/prints.json`, parallel to
@@ -746,6 +868,8 @@ pub struct NonUniquePrintMeta {
     pub main_effect: BTreeMap<String, String>,
     #[serde(default)]
     pub echo_effect: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub abilities: Vec<NonUniqueAbilityLine>,
 }
 
 impl From<&NonUniquePrintRecord> for NonUniquePrintMeta {
@@ -777,6 +901,7 @@ impl From<&NonUniquePrintRecord> for NonUniquePrintMeta {
             reserve: r.reserve,
             main_effect: r.main_effect.clone(),
             echo_effect: r.echo_effect.clone(),
+            abilities: r.abilities.clone(),
         }
     }
 }
@@ -975,6 +1100,7 @@ pub fn load_nonunique_prints(
                 main_effect: effects.main_effect,
                 echo_effect: effects.echo_effect,
                 effect_text: effects.combined_text,
+                abilities: effects.abilities,
                 set_name,
                 set_code,
                 set_reference: row.set_reference.clone(),
@@ -1024,6 +1150,7 @@ struct BuiltPrintEffects {
     echo_effect: BTreeMap<String, String>,
     combined_text: BTreeMap<String, String>,
     keywords: Vec<String>,
+    abilities: Vec<NonUniqueAbilityLine>,
 }
 
 fn fragment_text_for_locale<'a>(frag: &'a EffectFragmentTextRow, locale: &str) -> &'a str {
@@ -1036,6 +1163,10 @@ fn fragment_text_for_locale<'a>(frag: &'a EffectFragmentTextRow, locale: &str) -
     }
 }
 
+fn positive_id(id: Option<i64>) -> Option<u32> {
+    id.and_then(|v| (v > 0).then(|| u32::try_from(v).ok()).flatten())
+}
+
 fn build_print_effects(
     rows: &[PrintEffectFragmentRow],
     texts: &BTreeMap<i64, EffectFragmentTextRow>,
@@ -1045,6 +1176,9 @@ fn build_print_effects(
     let mut echo_lines: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut combined_parts: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut kw_set: BTreeSet<String> = BTreeSet::new();
+    let mut abilities: Vec<NonUniqueAbilityLine> = Vec::new();
+    let mut main_line_idx: u8 = 0;
+    let mut echo_line_idx: u8 = 0;
 
     for row in rows {
         let trigger_slot = row
@@ -1071,6 +1205,26 @@ fn build_print_effects(
             kw_set.insert("ECHO".to_string());
         }
 
+        let pos_t = positive_id(row.trigger_id);
+        let pos_c = positive_id(row.condition_id);
+        let pos_o = positive_id(row.effect_id);
+        if pos_t.is_some() || pos_c.is_some() || pos_o.is_some() {
+            let line = if is_echo {
+                echo_line_idx = echo_line_idx.saturating_add(1);
+                echo_line_idx
+            } else {
+                main_line_idx = main_line_idx.saturating_add(1);
+                main_line_idx
+            };
+            abilities.push(NonUniqueAbilityLine {
+                is_echo,
+                line,
+                trigger: pos_t,
+                condition: pos_c,
+                output: pos_o,
+            });
+        }
+
         for locale in LOCALES {
             let mut row_parts = Vec::new();
             for id in &ids {
@@ -1083,7 +1237,7 @@ fn build_print_effects(
                     }
                 }
                 let raw_t = fragment_text_for_locale(frag, locale);
-                if raw_t.is_empty() {
+                if raw_t.is_empty() || raw_t.trim() == "[]" {
                     continue;
                 }
                 if locale == "en_US" {
@@ -1118,6 +1272,7 @@ fn build_print_effects(
             .map(|(l, parts)| (l.to_string(), parts.join(" ")))
             .collect(),
         keywords: kw_set.into_iter().collect(),
+        abilities,
     }
 }
 
@@ -1215,7 +1370,24 @@ pub fn build_nonunique_index(
 
     catalog.save(&nonunique_out.join("catalog.json"))?;
     write_compact_records(&nonunique_out.join("cards.bin"), &compact_records)?;
-    index_builder.into_index().write_dir(&set_out)?;
+    let built_index = index_builder.into_index();
+    built_index.write_dir(&set_out)?;
+
+    let effect_fragments: BTreeMap<i64, EffectFragmentTextRow> =
+        read_all::<EffectFragmentTextRow>(&cardsdata_root.join("data").join("csv").join("EffectFragments.csv"))?
+            .into_iter()
+            .map(|r| (r.id_gd, r))
+            .collect();
+    let idgd_catalog = built_index.build_idgd_catalog(&effect_fragments);
+    if !idgd_catalog.entries.is_empty() {
+        let idgd_json = serde_json::to_string(&idgd_catalog)?;
+        fs::write(nonunique_out.join("idgd_catalog.json"), idgd_json).with_context(|| {
+            format!(
+                "write {}",
+                nonunique_out.join("idgd_catalog.json").display()
+            )
+        })?;
+    }
 
     let effect_text_json = serde_json::to_string(&effect_texts)?;
     fs::write(nonunique_out.join("effect_text.json"), effect_text_json)

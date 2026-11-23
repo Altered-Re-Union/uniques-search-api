@@ -32,16 +32,17 @@ pub(super) async fn reload_tick(
     })
     .await??;
 
-    let new_index = Arc::new(bundle.index);
-    let new_formats = rebuild_formats_for_index(
-        Arc::clone(&new_index),
-        formats_settings.as_ref().filter(|f| f.is_enabled()),
-    );
-
     let mut nonunique = bundle.nonunique;
     if let Some(ref mut nu) = nonunique {
         nu.bind_families(&bundle.families);
     }
+
+    let new_index = Arc::new(bundle.index);
+    let new_formats = rebuild_formats_for_index(
+        Arc::clone(&new_index),
+        nonunique.as_ref(),
+        formats_settings.as_ref().filter(|f| f.is_enabled()),
+    );
 
     let elapsed = started.elapsed();
 

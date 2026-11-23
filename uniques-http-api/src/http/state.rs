@@ -1,12 +1,31 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
+use axum::body::Bytes;
 use index_core::family_catalog::FamilyCatalogEntry;
 
 use crate::collections::CollectionStore;
 use crate::config::{CollectionsSettings, Settings};
 use crate::formats::FormatIndex;
+use crate::http::api::effects::{build_unified_effects_list, serialize_effects_list};
 use crate::index::{NonUniqueQueryIndex, UniquesIndex};
+
+pub(crate) fn compute_snapshot_effects_body(
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+) -> Arc<Bytes> {
+    let Some(nu) = nonunique.filter(|nu| !nu.idgd_catalog.is_empty()) else {
+        return Arc::clone(index.effects_body());
+    };
+    let list = build_unified_effects_list(index.idgd_catalog(), Some(&nu.idgd_catalog));
+    match serialize_effects_list(&list) {
+        Ok(bytes) => Arc::new(bytes),
+        Err(e) => {
+            eprintln!("failed to serialize unified effects list: {e:#}; falling back to uniques");
+            Arc::clone(index.effects_body())
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -25,6 +44,8 @@ pub struct QuerySnapshot {
     pub families: Arc<BTreeMap<i64, FamilyCatalogEntry>>,
     pub formats: Arc<FormatIndex>,
     pub collections: CollectionStore,
+    /// Pre-serialized unified `/api/v2/effects` JSON body (merging unique + non-unique catalogs).
+    pub effects_body: Arc<Bytes>,
 }
 
 /// Axum shared state; holds the loaded index, format filters, and collections.
@@ -48,12 +69,14 @@ impl AppState {
         index: UniquesIndex,
         collections_settings: &CollectionsSettings,
     ) -> Self {
+        let effects_body = Arc::clone(index.effects_body());
         Self::new(QuerySnapshot {
             index: Arc::new(index),
             nonunique: None,
             families: Arc::new(BTreeMap::new()),
             formats: Arc::new(FormatIndex::empty()),
             collections: CollectionStore::new(collections_settings),
+            effects_body,
         })
     }
 
@@ -140,12 +163,15 @@ impl AppState {
         let old_secs = current.index.manifest.built_at_secs;
         let new_secs = new_index.manifest.built_at_secs;
         if new_secs > old_secs {
+            let effects_body =
+                compute_snapshot_effects_body(new_index.as_ref(), nonunique.as_deref());
             self.commit(Arc::new(QuerySnapshot {
                 index: new_index,
                 nonunique,
                 families,
                 formats: new_formats,
                 collections: CollectionStore::new(collections_settings),
+                effects_body,
             }));
             Some((old_secs, new_secs))
         } else {
@@ -285,12 +311,15 @@ mod tests {
     }
 
     fn snapshot_with_index(built_at_secs: u64) -> QuerySnapshot {
+        let index = minimal_index(built_at_secs);
+        let effects_body = Arc::clone(index.effects_body());
         QuerySnapshot {
-            index: Arc::new(minimal_index(built_at_secs)),
+            index: Arc::new(index),
             nonunique: None,
             families: Arc::new(BTreeMap::new()),
             formats: Arc::new(FormatIndex::empty()),
             collections: CollectionStore::new(&test_collections_settings()),
+            effects_body,
         }
     }
 

@@ -13,7 +13,8 @@ use anyhow::Result;
 use index_core::artist_credits::{normalize_wanted_artists, ArtistCredits};
 use index_core::family_catalog::FamilyCatalogEntry;
 use index_core::nonunique::{
-    CompactNonUniqueFields, CompactNonUniqueView, NonUniqueCatalog, NonUniquePrintMeta,
+    CompactNonUniqueFields, CompactNonUniqueView, NonUniqueCatalog, NonUniqueIdGdCatalog,
+    NonUniqueIdGdEntry, NonUniquePrintMeta,
 };
 use roaring::RoaringBitmap;
 
@@ -36,6 +37,12 @@ pub struct NonUniqueCostRelationBitmaps {
     pub equal: RoaringBitmap,
     pub main_higher: RoaringBitmap,
     pub recall_higher: RoaringBitmap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NonUniqueEffectLine {
+    Main(u8),
+    Echo,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,6 +99,13 @@ pub struct NonUniqueQueryIndex {
     /// Printed artist credit -> searchable names, shared with the unique index (see
     /// `bind_artist_credits`).
     pub artist_credits: Arc<ArtistCredits>,
+    /// Positive `idGd` fragments referenced by non-unique prints (`nonunique/idgd_catalog.json`).
+    pub idgd_catalog: Vec<NonUniqueIdGdEntry>,
+    pub idgd_by_id: BTreeMap<u32, usize>,
+    pub id_gd_whole: BTreeMap<u32, RoaringBitmap>,
+    pub id_gd_per_line: BTreeMap<(u32, NonUniqueEffectLine), RoaringBitmap>,
+    /// Highest 1-based main effect line number seen across non-unique prints (at least 3).
+    pub max_main_lines: u8,
 }
 
 impl NonUniqueQueryIndex {
@@ -387,6 +401,49 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
     let sort_index =
         build_nonunique_sort_index(&catalog, &prints, &normalized_names, &empty_families);
 
+    let idgd_catalog_file: NonUniqueIdGdCatalog = if storage.has_file("nonunique/idgd_catalog.json") {
+        read_json(storage, "nonunique/idgd_catalog.json")?
+    } else {
+        NonUniqueIdGdCatalog::default()
+    };
+    let idgd_catalog = idgd_catalog_file.entries;
+    let mut idgd_by_id = BTreeMap::new();
+    let mut id_gd_whole = BTreeMap::new();
+    let mut id_gd_per_line = BTreeMap::new();
+    let mut max_main_lines: u8 = 3;
+
+    for (idx, entry) in idgd_catalog.iter().enumerate() {
+        idgd_by_id.insert(entry.id_gd, idx);
+        let whole_rel = format!("nonunique/id_gd/{}.roar", entry.id_gd);
+        if storage.has_file(&whole_rel) {
+            let bmp = read_roar(storage, &whole_rel)?;
+            if !bmp.is_empty() {
+                id_gd_whole.insert(entry.id_gd, bmp);
+            }
+        }
+        for &line in &entry.main_lines {
+            if line > max_main_lines {
+                max_main_lines = line;
+            }
+            let rel = format!("nonunique/id_gd/{}_m{line}.roar", entry.id_gd);
+            if storage.has_file(&rel) {
+                let bmp = read_roar(storage, &rel)?;
+                if !bmp.is_empty() {
+                    id_gd_per_line.insert((entry.id_gd, NonUniqueEffectLine::Main(line)), bmp);
+                }
+            }
+        }
+        if entry.has_ec {
+            let rel = format!("nonunique/id_gd/{}_ec.roar", entry.id_gd);
+            if storage.has_file(&rel) {
+                let bmp = read_roar(storage, &rel)?;
+                if !bmp.is_empty() {
+                    id_gd_per_line.insert((entry.id_gd, NonUniqueEffectLine::Echo), bmp);
+                }
+            }
+        }
+    }
+
     Ok(Some(NonUniqueQueryIndex {
         catalog,
         cards,
@@ -416,6 +473,11 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
         name_search_keys,
         sort_index,
         artist_credits: Default::default(),
+        idgd_catalog,
+        idgd_by_id,
+        id_gd_whole,
+        id_gd_per_line,
+        max_main_lines,
     }))
 }
 

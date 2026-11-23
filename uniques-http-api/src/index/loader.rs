@@ -35,7 +35,7 @@ pub mod storage;
 pub use archive::TarZstIndexStorage;
 pub use disk::DiskIndexStorage;
 pub use http::{load_app_state_from_http, load_index_from_http, HttpIndexClient};
-pub use nonunique::{load_nonunique_index, NonUniqueQueryIndex};
+pub use nonunique::{load_nonunique_index, NonUniqueEffectLine, NonUniqueQueryIndex};
 pub use object_store::{
     load_app_state_from_object_store, load_bundle_from_object_store, load_index_from_object_store,
     ObjectStoreIndexClient,
@@ -1080,15 +1080,20 @@ pub fn build_app_state(mut bundle: LoadedIndexBundle, settings: &Settings) -> Re
         nu.bind_families(&families);
     }
     let formats = match settings.formats.as_ref().filter(|f| f.is_enabled()) {
-        Some(formats_settings) => Arc::new(load_format_index(&index, formats_settings)),
+        Some(formats_settings) => {
+            Arc::new(load_format_index(&index, nonunique.as_ref(), formats_settings))
+        }
         None => Arc::new(FormatIndex::empty()),
     };
+    let effects_body =
+        crate::http::state::compute_snapshot_effects_body(&index, nonunique.as_ref());
     Ok(AppState::new(QuerySnapshot {
         index: Arc::new(index),
         families: Arc::new(families),
         nonunique: nonunique.map(Arc::new),
         formats,
         collections: CollectionStore::new(&settings.collections),
+        effects_body,
     }))
 }
 

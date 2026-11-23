@@ -29,8 +29,13 @@ pub async fn get_card_v2(
     if let Some(nu) = snapshot.nonunique.as_deref() {
         if let Some(print_index) = nu.resolve_reference(&reference) {
             let subtype_names = subtype_names_from_index(index);
-            if let Some(card) = nonunique_card_v2(nu, print_index, &snapshot.families, &subtype_names)
-            {
+            if let Some(card) = nonunique_card_v2(
+                nu,
+                print_index,
+                &snapshot.families,
+                &subtype_names,
+                snapshot.formats.as_ref(),
+            ) {
                 return Ok(Json(card));
             }
         }

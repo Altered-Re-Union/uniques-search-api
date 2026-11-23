@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
-use index_core::build_bitmap_from_ref_strs;
+use index_core::refs_bitmap::build_bitmaps_from_mixed_ref_strs;
 use roaring::RoaringBitmap;
 
-use crate::index::loader::{SetBitmaps, SET_CORE, SET_COREKS};
+use crate::index::loader::{NonUniqueQueryIndex, SetBitmaps, SET_CORE, SET_COREKS};
 use crate::index::UniquesIndex;
 
 use super::schema::{FormatDefinition, FormatMode, FormatsManifestEntry};
@@ -39,56 +39,75 @@ pub(crate) fn union_requested_sets(bitmaps: &SetBitmaps, sets: &[String]) -> Roa
     out
 }
 
-/// Build a format bitmap; returns `(negated, bitmap)`.
-pub fn build_format_bitmap(index: &UniquesIndex, def: &FormatDefinition) -> Result<(bool, RoaringBitmap)> {
+/// Build format bitmaps for both catalogs; returns `(negated, unique_bitmap, nonunique_bitmap)`.
+pub fn build_format_bitmap(
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+    def: &FormatDefinition,
+) -> Result<(bool, RoaringBitmap, RoaringBitmap)> {
+    let nu_catalog = nonunique.map(|nu| &nu.catalog);
     match def.mode().map_err(|e| anyhow!(e))? {
         FormatMode::Include => {
             let refs: Vec<&str> = def.included_refs.iter().map(String::as_str).collect();
-            let bitmap = build_bitmap_from_ref_strs(index.catalog(), &refs)?;
-            Ok((false, bitmap))
+            let (unique_bmp, nonunique_bmp) =
+                build_bitmaps_from_mixed_ref_strs(index.catalog(), nu_catalog, &refs)?;
+            Ok((false, unique_bmp, nonunique_bmp))
         }
         FormatMode::Exclude => {
-            let mut bitmap = RoaringBitmap::new();
+            let mut unique_bmp = RoaringBitmap::new();
+            let mut nonunique_bmp = RoaringBitmap::new();
             if !def.excluded_sets.is_empty() {
                 for code in &def.excluded_sets {
-                    if !index.set_bitmaps().by_set.contains_key(code) {
+                    let in_unique = index.set_bitmaps().by_set.contains_key(code);
+                    let in_nonunique = nonunique.is_some_and(|nu| nu.set.contains_key(code));
+                    if !in_unique && !in_nonunique {
                         return Err(anyhow!("unknown set code '{code}'"));
                     }
+                    if let Some(nu) = nonunique {
+                        if let Some(b) = nu.set.get(code) {
+                            nonunique_bmp |= b;
+                        }
+                    }
                 }
-                bitmap |= union_requested_sets(index.set_bitmaps(), &def.excluded_sets);
+                unique_bmp |= union_requested_sets(index.set_bitmaps(), &def.excluded_sets);
             }
             if !def.excluded_refs.is_empty() {
                 let refs: Vec<&str> = def.excluded_refs.iter().map(String::as_str).collect();
-                bitmap |= build_bitmap_from_ref_strs(index.catalog(), &refs)?;
+                let (u_refs, nu_refs) =
+                    build_bitmaps_from_mixed_ref_strs(index.catalog(), nu_catalog, &refs)?;
+                unique_bmp |= u_refs;
+                nonunique_bmp |= nu_refs;
             }
-            Ok((true, bitmap))
+            Ok((true, unique_bmp, nonunique_bmp))
         }
     }
 }
 
 pub fn load_single_format(
     index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
     entry: &FormatsManifestEntry,
     file_path: &std::path::Path,
-) -> Result<(bool, RoaringBitmap)> {
+) -> Result<(bool, RoaringBitmap, RoaringBitmap)> {
     let text = std::fs::read_to_string(file_path)
         .map_err(|e| anyhow!("read {}: {e}", file_path.display()))?;
-    load_single_format_from_text(index, entry, &text, &file_path.display().to_string())
+    load_single_format_from_text(index, nonunique, entry, &text, &file_path.display().to_string())
 }
 
 /// Same as [`load_single_format`], but for a format already fetched into memory
 /// (e.g. downloaded over HTTP). `label` is used in error messages in place of a file path.
 pub fn load_single_format_from_text(
     index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
     entry: &FormatsManifestEntry,
     text: &str,
     label: &str,
-) -> Result<(bool, RoaringBitmap)> {
+) -> Result<(bool, RoaringBitmap, RoaringBitmap)> {
     let def: FormatDefinition =
         serde_json::from_str(text).map_err(|e| anyhow!("parse {label}: {e}"))?;
     def.cross_check_manifest(entry).map_err(|e| anyhow!(e))?;
     def.mode().map_err(|e| anyhow!(e))?;
-    build_format_bitmap(index, &def)
+    build_format_bitmap(index, nonunique, &def)
 }
 
 #[cfg(test)]
@@ -225,10 +244,11 @@ mod tests {
             included_refs: vec!["ALT_CORE_B_AX_01_U_1".into()],
             ..Default::default()
         };
-        let (negated, bmp) = build_format_bitmap(&index, &def).unwrap();
+        let (negated, bmp, nu_bmp) = build_format_bitmap(&index, None, &def).unwrap();
         assert!(!negated);
         assert!(bmp.contains(0));
         assert_eq!(bmp.len(), 1);
+        assert!(nu_bmp.is_empty());
     }
 
     #[test]
@@ -240,8 +260,9 @@ mod tests {
             excluded_sets: vec![SET_CORE.into()],
             ..Default::default()
         };
-        let (negated, bmp) = build_format_bitmap(&index, &def).unwrap();
+        let (negated, bmp, nu_bmp) = build_format_bitmap(&index, None, &def).unwrap();
         assert!(negated);
         assert_eq!(bmp.len(), 5);
+        assert!(nu_bmp.is_empty());
     }
 }

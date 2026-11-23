@@ -4,6 +4,7 @@ use std::path::Path;
 use roaring::RoaringBitmap;
 
 use crate::config::FormatsSettings;
+use crate::index::loader::NonUniqueQueryIndex;
 use crate::index::UniquesIndex;
 
 use super::build::{load_single_format, load_single_format_from_text};
@@ -15,6 +16,7 @@ pub enum FormatLoadStatus {
     Ready {
         negated: bool,
         bitmap: RoaringBitmap,
+        nonunique_bitmap: RoaringBitmap,
     },
     Failed,
 }
@@ -44,17 +46,25 @@ impl FormatIndex {
 struct LoadedEntryResult {
     id: String,
     version: u64,
-    outcome: Result<(bool, RoaringBitmap), String>,
+    outcome: Result<(bool, RoaringBitmap, RoaringBitmap), String>,
 }
 
-pub fn load_format_index(index: &UniquesIndex, settings: &FormatsSettings) -> FormatIndex {
-    load_format_index_from_source(index, &FormatsSource::from_config(&settings.source))
+pub fn load_format_index(
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+    settings: &FormatsSettings,
+) -> FormatIndex {
+    load_format_index_from_source(index, nonunique, &FormatsSource::from_config(&settings.source))
 }
 
-fn load_format_index_from_source(index: &UniquesIndex, source: &FormatsSource) -> FormatIndex {
+fn load_format_index_from_source(
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+    source: &FormatsSource,
+) -> FormatIndex {
     match source {
-        FormatsSource::Disk(disk) => load_format_index_from_root(index, disk.root()),
-        FormatsSource::Http(http) => load_format_index_from_http(index, http),
+        FormatsSource::Disk(disk) => load_format_index_from_root(index, nonunique, disk.root()),
+        FormatsSource::Http(http) => load_format_index_from_http(index, nonunique, http),
     }
 }
 
@@ -75,7 +85,11 @@ fn read_manifest_entries_from_disk(root: &Path) -> Option<Vec<FormatsManifestEnt
     serde_json::from_str(&text).ok()
 }
 
-fn load_format_index_from_root(index: &UniquesIndex, root: &Path) -> FormatIndex {
+fn load_format_index_from_root(
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+    root: &Path,
+) -> FormatIndex {
     let manifest_path = root.join(MANIFEST_FILE);
     let entries: Vec<FormatsManifestEntry> = match std::fs::read_to_string(&manifest_path) {
         Ok(text) => match serde_json::from_str(&text) {
@@ -105,7 +119,7 @@ fn load_format_index_from_root(index: &UniquesIndex, root: &Path) -> FormatIndex
                 let root = root.to_path_buf();
                 s.spawn(move || {
                     let file_path = root.join(&entry.path);
-                    let outcome = load_single_format(index, &entry, &file_path)
+                    let outcome = load_single_format(index, nonunique, &entry, &file_path)
                         .map_err(|e| e.to_string());
                     LoadedEntryResult {
                         id: entry.id,
@@ -150,7 +164,11 @@ fn fetch_manifest(
     serde_json::from_str(&text).map_err(|e| format!("parse {url}: {e}"))
 }
 
-fn load_format_index_from_http(index: &UniquesIndex, http: &HttpFormatsSource) -> FormatIndex {
+fn load_format_index_from_http(
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+    http: &HttpFormatsSource,
+) -> FormatIndex {
     let client = match http_client() {
         Ok(client) => client,
         Err(e) => {
@@ -176,7 +194,7 @@ fn load_format_index_from_http(index: &UniquesIndex, http: &HttpFormatsSource) -
                 let url = http.file_url(&entry.path);
                 s.spawn(move || {
                     let outcome = fetch_text(&client, &url).and_then(|text| {
-                        load_single_format_from_text(index, &entry, &text, &url)
+                        load_single_format_from_text(index, nonunique, &entry, &text, &url)
                             .map_err(|e| e.to_string())
                     });
                     LoadedEntryResult {
@@ -218,12 +236,16 @@ fn merge_loaded_results(results: Vec<LoadedEntryResult>) -> FormatIndex {
         }
 
         match result.outcome {
-            Ok((negated, bitmap)) => {
+            Ok((negated, bitmap, nonunique_bitmap)) => {
                 by_id.insert(
                     result.id.clone(),
                     LoadedFormat {
                         id: result.id,
-                        status: FormatLoadStatus::Ready { negated, bitmap },
+                        status: FormatLoadStatus::Ready {
+                            negated,
+                            bitmap,
+                            nonunique_bitmap,
+                        },
                     },
                 );
             }
@@ -384,7 +406,7 @@ mod tests {
         .unwrap();
 
         let index = test_index();
-        let loaded = load_format_index(&index, &formats_settings(&dir));
+        let loaded = load_format_index(&index, None, &formats_settings(&dir));
         assert_eq!(loaded.by_id.len(), 2);
         assert!(matches!(
             loaded.get("std").unwrap().status,
@@ -411,7 +433,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_format_index(&test_index(), &formats_settings(&dir));
+        let loaded = load_format_index(&test_index(), None, &formats_settings(&dir));
         assert!(matches!(
             loaded.get("std").unwrap().status,
             FormatLoadStatus::Failed
@@ -433,7 +455,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_format_index(&test_index(), &formats_settings(&dir));
+        let loaded = load_format_index(&test_index(), None, &formats_settings(&dir));
         assert!(matches!(
             loaded.get("std").unwrap().status,
             FormatLoadStatus::Failed
@@ -463,7 +485,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_format_index(&test_index(), &formats_settings(&dir));
+        let loaded = load_format_index(&test_index(), None, &formats_settings(&dir));
         assert!(matches!(
             loaded.get("std").unwrap().status,
             FormatLoadStatus::Failed
@@ -476,7 +498,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("manifest.json"), "not json").unwrap();
 
-        let loaded = load_format_index(&test_index(), &formats_settings(&dir));
+        let loaded = load_format_index(&test_index(), None, &formats_settings(&dir));
         assert!(loaded.by_id.is_empty());
     }
 }

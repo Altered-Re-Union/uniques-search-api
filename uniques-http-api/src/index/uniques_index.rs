@@ -97,6 +97,42 @@ impl UniquesIndex {
         self.id_gd_aliases.resolve(id)
     }
 
+    /// Unique cards whose effect fragments match every term of `query` (case/accent/punctuation-
+    /// insensitive via [`crate::index::text_search::SearchQuery`]). Each term is resolved against
+    /// `idgd_catalog` entries and unioned across their whole-card bitmaps, then intersected across
+    /// all terms — sub-millisecond over millions of uniques.
+    pub fn bitmap_for_effect_text(&self, query: &str) -> RoaringBitmap {
+        let Some(parsed) = crate::index::text_search::SearchQuery::parse(query) else {
+            return self.present_cards.clone();
+        };
+        let mut acc: Option<RoaringBitmap> = None;
+        for term in parsed.terms() {
+            let mut term_bmp = RoaringBitmap::new();
+            for entry in &self.idgd_catalog.entries {
+                let matches_entry = entry.translations.values().any(|t| {
+                    let raw = t.text.trim();
+                    if raw.is_empty() || raw == "[]" {
+                        return false;
+                    }
+                    crate::index::text_search::search_key(raw).contains(term.as_str())
+                });
+                if matches_entry {
+                    if let Some(bmp) = self.id_gd_whole.get(&entry.id_gd) {
+                        term_bmp |= bmp;
+                    }
+                }
+            }
+            acc = Some(match acc {
+                Some(cur) => cur & term_bmp,
+                None => term_bmp,
+            });
+            if acc.as_ref().is_some_and(RoaringBitmap::is_empty) {
+                break;
+            }
+        }
+        acc.unwrap_or_default()
+    }
+
     pub fn stats_summary(&self) -> &StatsSummary {
         &self.stats_summary
     }
