@@ -216,7 +216,18 @@ The response is a JSON object with `iter` (match totals and paging), and `cards`
         es_ES: "...",
         it_IT: "..."
       },
-      collectorNumber: "BTG-011-U-161"
+      collectorNumber: "BTG-011-U-161",
+      abilities: [
+        {
+          kind: "main",
+          line: 1,
+          trigger: { idGd: 1, text: { en_US: "{R}", fr_FR: "{R}", ... } },
+          condition: { idGd: 191, text: { en_US: "If there's a card in your Landmarks:", ... } },
+          output: { idGd: 42, text: { en_US: "Target Character in play or in Reserve gains 2 boosts.", ... } }
+        },
+        { kind: "main", line: 2, trigger: { idGd: ..., text: { ... } }, condition: null, output: { ... } },
+        { kind: "echo", line: 1, trigger: { idGd: ..., text: { ... } }, condition: null, output: { ... } }
+      ]
     },
     {
       reference: "ALT_COREKS_B_BR_51_U_3467"
@@ -229,6 +240,30 @@ The response is a JSON object with `iter` (match totals and paging), and `cards`
 `collectorNumber` is omitted (not `null`) when the loaded index has no collector-number data for that
 family (older index, or a family from the non-JSON-crawl ingestion path — see
 `cli-indexer/plans/24-collector-number-ingestion.md`).
+
+### `abilities` (structured effect lines)
+
+Additive, optional `CardV2` field: the card's effect lines broken down into their idGd elements —
+the same ids as `GET /api/v2/effects` and the `effect[N][t|c|o]` / `support[t|c|o]` filters (duplicate
+idGd values collapsed at index build time are always reported as their canonical id).
+
+| Field       | Type                       | Description                                                                 |
+| ----------- | -------------------------- | --------------------------------------------------------------------------- |
+| `kind`      | `"main"` \| `"echo"`       | Main effect line or echo (support) line                                     |
+| `line`      | integer                    | 1-based line position within `kind` (main: M1..M3 slot of the index; echo: always `1`) |
+| `trigger`   | `{ idGd, text }` \| `null` | TRIGGER element, `null` when the line has none (e.g. static abilities)      |
+| `condition` | `{ idGd, text }` \| `null` | CONDITION element, `null` when the line has none                            |
+| `output`    | `{ idGd, text }` \| `null` | OUTPUT element, `null` when the line has none                               |
+
+`text` is a locale-keyed map (`en_US`, `fr_FR`, …) of that element's text, like `mainEffect`; locales
+with no text are left out, and it is `{}` if the id is missing from the loaded idGd catalog.
+Order: main lines (by `line`), then the echo line. Empty main slots are skipped, so `line` can have
+gaps (an M2-only card yields a single `line: 2` entry).
+
+Populated for **uniques** on every endpoint that returns full cards (`GET`/`POST /api/v2/cards`,
+`GET`/`POST /api/v2/search`, `GET /api/v2/card/{reference}`). The key is **omitted** when the card
+has no effect ids, and for **all non-unique prints**: the non-unique index only stores rendered
+effect texts, not per-line idGd elements.
 
 ## `POST /api/v2/cards`
 
@@ -424,7 +459,16 @@ GET /api/v2/card/ALT_COREKS_B_AX_05_U_161
   "faction": { "code": "AX", "name": "Axiom" },
   "mainEffect": { "en_US": "...", "fr_FR": "..." },
   "echoEffect": { "en_US": "...", "fr_FR": "..." },
-  "collectorNumber": "BTG-011-U-161"
+  "collectorNumber": "BTG-011-U-161",
+  "abilities": [
+    {
+      "kind": "main", "line": 1,
+      "trigger": { "idGd": 1, "text": { "en_US": "{R}", "fr_FR": "{R}" } },
+      "condition": { "idGd": 191, "text": { "en_US": "...", "fr_FR": "..." } },
+      "output": { "idGd": 42, "text": { "en_US": "...", "fr_FR": "..." } }
+    },
+    { "kind": "echo", "line": 1, "trigger": { "idGd": 7, "text": { ... } }, "condition": null, "output": { "idGd": 99, "text": { ... } } }
+  ]
 }
 ```
 
