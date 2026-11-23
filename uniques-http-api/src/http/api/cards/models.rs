@@ -109,6 +109,37 @@ pub struct CardV2 {
     pub legal_formats: Option<Vec<String>>,
     #[serde(rename = "debug_bga_trigram", skip_serializing_if = "Option::is_none")]
     pub debug_bga_trigram: Option<String>,
+    /// Structured effect lines (trigger / condition / output idGd elements), main lines first then
+    /// echo. Only known for uniques (from `cards.bin`); omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub abilities: Vec<CardAbilityV2>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CardAbilityKind {
+    Main,
+    Echo,
+}
+
+/// One effect line of a card: its trigger, condition and output elements (`null` when absent).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardAbilityV2 {
+    pub kind: CardAbilityKind,
+    /// 1-based line number within `kind` (main: M1..M3 position; echo: always 1).
+    pub line: u8,
+    pub trigger: Option<CardAbilityElementV2>,
+    pub condition: Option<CardAbilityElementV2>,
+    pub output: Option<CardAbilityElementV2>,
+}
+
+/// An idGd effect element (same id space as `/api/v2/effects` and `effect[N][t|c|o]` filters).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardAbilityElementV2 {
+    pub id_gd: u32,
+    pub text: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]

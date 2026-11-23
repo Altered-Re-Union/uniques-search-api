@@ -37,7 +37,13 @@ fn build_unified_test_server() -> (TempGuard, ServerState) {
 /// Same fixture, with `extra_alize_prints` (CSV rows, `\n`-terminated) appended to the ALIZE
 /// `NonUniquePrints.csv`.
 fn build_unified_test_server_with(extra_alize_prints: &str) -> (TempGuard, ServerState) {
-    build_unified_test_server_full(extra_alize_prints, ArtistCreditsSource::IndexFile)
+    build_unified_test_server_full(extra_alize_prints, ArtistCreditsSource::IndexFile, |_| {})
+}
+
+/// Like `build_unified_test_server`, but lets the caller patch the copied unique index dir before
+/// it is loaded.
+fn build_unified_test_server_patched(patch_index: impl FnOnce(&Path)) -> (TempGuard, ServerState) {
+    build_unified_test_server_full("", ArtistCreditsSource::IndexFile, patch_index)
 }
 
 /// Where the API gets the artist credit -> searchable names mapping from.
@@ -53,11 +59,13 @@ enum ArtistCreditsSource {
 fn build_unified_test_server_full(
     extra_alize_prints: &str,
     artist_credits: ArtistCreditsSource,
+    patch_index: impl FnOnce(&Path),
 ) -> (TempGuard, ServerState) {
     let root_dir = std::env::temp_dir().join(format!("unified_search_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root_dir).unwrap();
     let idx_dir = root_dir.join("unified_index");
     copy_dir_recursive(Path::new(FIXTURE_INDEX), &idx_dir);
+    patch_index(&idx_dir);
 
     let cardsdata = root_dir.join("cardsdata");
     let csv_root = cardsdata.join("data").join("csv");
@@ -560,7 +568,7 @@ async fn artist_refs(state: &ServerState, artists: &[&str]) -> Vec<String> {
 #[tokio::test]
 async fn artist_filter_matches_the_people_and_studios_of_a_credit() {
     let (_tmp, state) =
-        build_unified_test_server_full(ARTIST_ALIZE_PRINTS, ArtistCreditsSource::IndexFile);
+        build_unified_test_server_full(ARTIST_ALIZE_PRINTS, ArtistCreditsSource::IndexFile, |_| {});
 
     // A member never credited alone finds the team credits they are part of.
     assert_eq!(
@@ -629,7 +637,7 @@ async fn artist_filter_matches_the_people_and_studios_of_a_credit() {
 #[tokio::test]
 async fn card_json_keeps_the_printed_credit_and_lists_its_artists() {
     let (_tmp, state) =
-        build_unified_test_server_full(ARTIST_ALIZE_PRINTS, ArtistCreditsSource::IndexFile);
+        build_unified_test_server_full(ARTIST_ALIZE_PRINTS, ArtistCreditsSource::IndexFile, |_| {});
 
     let (_, card) = get_json(&state, "/api/v2/card/ALT_ALIZE_P_OR_48_C").await;
     assert_eq!(card["artist"], "Edward Chee - Seok Yeong");
@@ -656,7 +664,7 @@ async fn card_json_keeps_the_printed_credit_and_lists_its_artists() {
 #[tokio::test]
 async fn artists_endpoint_lists_people_and_studios_never_team_credits() {
     let (_tmp, state) =
-        build_unified_test_server_full(ARTIST_ALIZE_PRINTS, ArtistCreditsSource::IndexFile);
+        build_unified_test_server_full(ARTIST_ALIZE_PRINTS, ArtistCreditsSource::IndexFile, |_| {});
     let (status, res) = get_json(&state, "/api/v2/artists").await;
     assert_eq!(status, 200);
     assert_eq!(
@@ -677,7 +685,7 @@ async fn artists_endpoint_lists_people_and_studios_never_team_credits() {
 #[tokio::test]
 async fn without_a_mapping_each_printed_credit_is_its_own_artist() {
     let (_tmp, state) =
-        build_unified_test_server_full(ARTIST_ALIZE_PRINTS, ArtistCreditsSource::None);
+        build_unified_test_server_full(ARTIST_ALIZE_PRINTS, ArtistCreditsSource::None, |_| {});
 
     assert!(artist_refs(&state, &["Seok Yeong"]).await.is_empty());
     assert_eq!(
@@ -708,7 +716,7 @@ async fn without_a_mapping_each_printed_credit_is_its_own_artist() {
 #[tokio::test]
 async fn cardsdata_csv_dir_setting_builds_the_mapping_without_the_index_file() {
     let (_tmp, state) =
-        build_unified_test_server_full(ARTIST_ALIZE_PRINTS, ArtistCreditsSource::CsvSetting);
+        build_unified_test_server_full(ARTIST_ALIZE_PRINTS, ArtistCreditsSource::CsvSetting, |_| {});
 
     assert_eq!(
         artist_refs(&state, &["Seok Yeong"]).await,
@@ -718,4 +726,68 @@ async fn cardsdata_csv_dir_setting_builds_the_mapping_without_the_index_file() {
     let artists = res["artists"].as_array().unwrap();
     assert!(artists.contains(&serde_json::json!("Stephen Yeoh")));
     assert!(!artists.contains(&serde_json::json!("Edward Chee - Seok Yeong")));
+}
+
+/// Write `[T, C, O]` idGd slots into the single unique's 32-byte `cards.bin` record
+/// (`group` 0..=2 = main M1..M3, 3 = echo). Slot u16 LE at byte `6 + (group * 3 + k) * 2`.
+fn set_effect_group(idx_dir: &Path, group: usize, tco: [u16; 3]) {
+    let path = idx_dir.join("cards.bin");
+    let mut bytes = fs::read(&path).unwrap();
+    for (k, id) in tco.into_iter().enumerate() {
+        let off = 6 + (group * 3 + k) * 2;
+        bytes[off..off + 2].copy_from_slice(&id.to_le_bytes());
+    }
+    fs::write(&path, bytes).unwrap();
+}
+
+#[tokio::test]
+async fn unique_cards_expose_abilities_nonuniques_do_not() {
+    // minimal_index idgd catalog: 1 = TRIGGER "{R}", 2 = CONDITION, 3 = OUTPUT "[AFTER_YOU]."
+    let (_tmp, state) = build_unified_test_server_patched(|dir| {
+        set_effect_group(dir, 0, [1, 2, 3]);
+        set_effect_group(dir, 3, [0, 0, 3]);
+    });
+
+    let expected = serde_json::json!([
+        {
+            "kind": "main",
+            "line": 1,
+            "trigger": { "idGd": 1, "text": { "en_US": "{R}" } },
+            "condition": { "idGd": 2, "text": { "en_US": "If you control two or more Plants:" } },
+            "output": { "idGd": 3, "text": { "en_US": "[AFTER_YOU]." } }
+        },
+        {
+            "kind": "echo",
+            "line": 1,
+            "trigger": null,
+            "condition": null,
+            "output": { "idGd": 3, "text": { "en_US": "[AFTER_YOU]." } }
+        }
+    ]);
+
+    let (status, uniq) = get_json(&state, "/api/v2/card/ALT_TEST_B_AX_04_U_1").await;
+    assert_eq!(status, 200);
+    assert_eq!(uniq["abilities"], expected);
+
+    let (status, res) = get_json(&state, "/api/v2/search?rarity[]=UNIQUE").await;
+    assert_eq!(status, 200);
+    assert_eq!(res["cards"][0]["reference"], "ALT_TEST_B_AX_04_U_1");
+    assert_eq!(res["cards"][0]["abilities"], expected);
+
+    // Non-unique prints carry no per-line idGd data in the index: no `abilities` key at all.
+    let (status, hero) = get_json(&state, "/api/v2/card/ALT_CORE_B_AX_02_C").await;
+    assert_eq!(status, 200);
+    assert!(hero.get("abilities").is_none());
+    let (_, commons) = get_json(&state, "/api/v2/search?rarity[]=COMMON").await;
+    for card in commons["cards"].as_array().unwrap() {
+        assert!(card.get("abilities").is_none());
+    }
+}
+
+#[tokio::test]
+async fn unique_without_effect_ids_has_no_abilities_key() {
+    let (_tmp, state) = build_unified_test_server();
+    let (status, uniq) = get_json(&state, "/api/v2/card/ALT_TEST_B_AX_04_U_1").await;
+    assert_eq!(status, 200);
+    assert!(uniq.get("abilities").is_none());
 }

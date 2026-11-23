@@ -14,7 +14,7 @@ use crate::index::UniquesIndex;
 
 use super::error::{QueryError, QueryResult};
 use crate::http::api::cards::models::{
-    CardFaction, CardRarityV2, CardSetV2, CardSubTypeV2, CardTypeV2, CardV2, CardsRequest,
+    CardAbilityElementV2, CardAbilityKind, CardAbilityV2, CardFaction, CardRarityV2, CardSetV2, CardSubTypeV2, CardTypeV2, CardV2, CardsRequest,
     CardsSort, CompareOp, CostPredicate, CostRelation, EffectCombineMode, FamilyMatchV2, SortDir,
     SortField,
 };
@@ -498,6 +498,7 @@ pub(crate) fn card_v2_from_index(
         reserve: None,
         legal_formats: None,
         debug_bga_trigram: debug_bga_trigram.then(|| build_debug_bga_trigram(&view)),
+        abilities: build_abilities(state, idgd_by_id, &view),
     })
 }
 
@@ -655,6 +656,7 @@ pub fn nonunique_card_v2(
             reserve: meta.reserve,
             legal_formats: None,
             debug_bga_trigram: None,
+            abilities: Vec::new(),
         })
     } else {
         // Fallback when legacy index lacks `prints.json`.
@@ -730,6 +732,7 @@ pub fn nonunique_card_v2(
             reserve: None,
             legal_formats: None,
             debug_bga_trigram: None,
+            abilities: Vec::new(),
         })
     }
 }
@@ -1250,6 +1253,53 @@ fn pick_translation(map: &BTreeMap<String, index_core::card::LocaleText>, locale
         return t.text.clone();
     }
     map.values().next().map(|t| t.text.clone()).unwrap_or_default()
+}
+
+/// Structured abilities of a unique: one entry per non-empty `[T, C, O]` group of the compact
+/// record (main M1..M3, then echo). Slots are positional (see `compact::set_group_from_effect`),
+/// so the element kind comes from the slot, not from a catalog lookup. Ids are resolved through
+/// the alias map so they match `/api/v2/effects` and the `effect[N][t|c|o]` filters.
+fn build_abilities(
+    state: &UniquesIndex,
+    idgd_by_id: &BTreeMap<u32, &IdGdCatalogEntry>,
+    view: &index_core::compact::CompactCardView<'_>,
+) -> Vec<CardAbilityV2> {
+    let element = |id: u16| -> Option<CardAbilityElementV2> {
+        if id == 0 {
+            return None;
+        }
+        let id_gd = state.resolve_id_gd(id as u32);
+        let text = idgd_by_id
+            .get(&id_gd)
+            .map(|entry| {
+                entry
+                    .translations
+                    .iter()
+                    .filter(|(_, t)| !t.text.is_empty())
+                    .map(|(locale, t)| (locale.clone(), t.text.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(CardAbilityElementV2 { id_gd, text })
+    };
+    let ability = |kind: CardAbilityKind, line: u8, [t, c, o]: [u16; 3]| -> Option<CardAbilityV2> {
+        if t == 0 && c == 0 && o == 0 {
+            return None;
+        }
+        Some(CardAbilityV2 {
+            kind,
+            line,
+            trigger: element(t),
+            condition: element(c),
+            output: element(o),
+        })
+    };
+
+    let mut out: Vec<CardAbilityV2> = (0..3u8)
+        .filter_map(|g| ability(CardAbilityKind::Main, g + 1, view.main_effect_group(g as usize)))
+        .collect();
+    out.extend(ability(CardAbilityKind::Echo, 1, view.echo_effect()));
+    out
 }
 
 #[cfg(test)]
@@ -2237,5 +2287,89 @@ mod tests {
         assert!(req.q.is_none());
         let bmp = build_bitmap(state.index().as_ref(), state.formats().as_ref(), &state.snapshot().collections, &req).unwrap();
         assert_eq!(bmp.len(), state.index().manifest().total_bit_span as u64);
+    }
+
+    fn idgd_text_entry(id_gd: u32, element_type: &str, texts: &[(&str, &str)]) -> IdGdCatalogEntry {
+        IdGdCatalogEntry {
+            id_gd,
+            card_count: 1,
+            bitmap_bytes: 0,
+            bitmap_file: format!("{id_gd}.roar"),
+            element_type: element_type.to_string(),
+            translations: texts
+                .iter()
+                .map(|(locale, text)| {
+                    (
+                        locale.to_string(),
+                        index_core::card::LocaleText {
+                            locale: locale.to_string(),
+                            text: text.to_string(),
+                        },
+                    )
+                })
+                .collect(),
+            m1: None,
+            m2: None,
+            m3: None,
+            ec: None,
+            is_main: true,
+            is_echo: false,
+            duplicated_id_gd: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn abilities_serialized_per_line_with_tco_elements() {
+        let state = test_state();
+        let index = state.index();
+        // Fixture card 5: main M1 = [24 T, 191 C, 90 O], echo = [24 T, -, 42 O].
+        let t24 = idgd_text_entry(24, "TRIGGER", &[("en_US", "{J}"), ("fr_FR", "{J}")]);
+        let c191 = idgd_text_entry(191, "CONDITION", &[("en_US", "If you have a Plant:"), ("fr_FR", "")]);
+        let o90 = idgd_text_entry(90, "OUTPUT", &[("en_US", "Draw a card.")]);
+        let mut idgd_by_id: BTreeMap<u32, &IdGdCatalogEntry> =
+            index.idgd_catalog().entries.iter().map(|e| (e.id_gd, e)).collect();
+        idgd_by_id.insert(24, &t24);
+        idgd_by_id.insert(191, &c191);
+        idgd_by_id.insert(90, &o90);
+
+        let card = card_v2_from_index(index.as_ref(), 5, &idgd_by_id, false).unwrap();
+        let json = serde_json::to_value(&card).unwrap();
+        assert_eq!(
+            json["abilities"],
+            serde_json::json!([
+                {
+                    "kind": "main",
+                    "line": 1,
+                    "trigger": { "idGd": 24, "text": { "en_US": "{J}", "fr_FR": "{J}" } },
+                    "condition": { "idGd": 191, "text": { "en_US": "If you have a Plant:" } },
+                    "output": { "idGd": 90, "text": { "en_US": "Draw a card." } }
+                },
+                {
+                    "kind": "echo",
+                    "line": 1,
+                    "trigger": { "idGd": 24, "text": { "en_US": "{J}", "fr_FR": "{J}" } },
+                    "condition": null,
+                    "output": { "idGd": 42, "text": {} }
+                }
+            ])
+        );
+        // The pre-existing text fields are untouched.
+        assert_eq!(
+            json["mainEffect"]["en_US"],
+            "{J} If you have a Plant: Draw a card."
+        );
+    }
+
+    #[test]
+    fn abilities_absent_when_card_has_no_effect_ids() {
+        let state = test_state();
+        let index = state.index();
+        let idgd_by_id: BTreeMap<u32, &IdGdCatalogEntry> =
+            index.idgd_catalog().entries.iter().map(|e| (e.id_gd, e)).collect();
+        // Fixture card 7 has an all-zero compact record.
+        let card = card_v2_from_index(index.as_ref(), 7, &idgd_by_id, false).unwrap();
+        assert!(card.abilities.is_empty());
+        let json = serde_json::to_value(&card).unwrap();
+        assert!(json.get("abilities").is_none());
     }
 }
