@@ -57,6 +57,9 @@ pub struct UniquesIndex {
     /// inside family spans.
     pub present_cards: RoaringBitmap,
     pub effects_body: Arc<Bytes>,
+    /// Precomputed `(id_gd, normalized search keys)` across all locales (including localized
+    /// keyword expansions when `keywords.json` is bound), used by `bitmap_for_effect_text`.
+    pub effect_text_search_keys: Vec<(u32, Vec<String>)>,
     /// Printed artist credit -> searchable names (`artist[]`, `/api/v2/artists`). Empty (each
     /// credit is its own name) until bound by `bind_artist_credits` at load time.
     pub artist_credits: Arc<ArtistCredits>,
@@ -97,10 +100,25 @@ impl UniquesIndex {
         self.id_gd_aliases.resolve(id)
     }
 
+    pub fn equivalent_id_gds(&self, id: u32) -> Vec<u32> {
+        self.id_gd_aliases.equivalent_ids(id)
+    }
+
+    /// Rebuild `effect_text_search_keys` with localized keyword display expansions (e.g.
+    /// `[RESUPPLY]` -> `Ravitaillez`, `[ANCHORED]` -> `Ancré`) so `effectText` and `q` match
+    /// unique cards in every locale consistently with non-unique prints.
+    pub fn bind_effect_text_keywords(
+        &mut self,
+        keywords_i18n: &BTreeMap<String, BTreeMap<String, String>>,
+    ) {
+        self.effect_text_search_keys =
+            build_effect_text_search_keys(&self.idgd_catalog, Some(keywords_i18n));
+    }
+
     /// Unique cards whose effect fragments match every term of `query` (case/accent/punctuation-
     /// insensitive via [`crate::index::text_search::SearchQuery`]). Each term is resolved against
-    /// `idgd_catalog` entries and unioned across their whole-card bitmaps, then intersected across
-    /// all terms — sub-millisecond over millions of uniques.
+    /// precomputed `effect_text_search_keys` and unioned across whole-card bitmaps, then
+    /// intersected across all terms — sub-millisecond over millions of uniques.
     pub fn bitmap_for_effect_text(&self, query: &str) -> RoaringBitmap {
         let Some(parsed) = crate::index::text_search::SearchQuery::parse(query) else {
             return self.present_cards.clone();
@@ -108,16 +126,9 @@ impl UniquesIndex {
         let mut acc: Option<RoaringBitmap> = None;
         for term in parsed.terms() {
             let mut term_bmp = RoaringBitmap::new();
-            for entry in &self.idgd_catalog.entries {
-                let matches_entry = entry.translations.values().any(|t| {
-                    let raw = t.text.trim();
-                    if raw.is_empty() || raw == "[]" {
-                        return false;
-                    }
-                    crate::index::text_search::search_key(raw).contains(term.as_str())
-                });
-                if matches_entry {
-                    if let Some(bmp) = self.id_gd_whole.get(&entry.id_gd) {
+            for (id_gd, keys) in &self.effect_text_search_keys {
+                if keys.iter().any(|k| k.contains(term.as_str())) {
+                    if let Some(bmp) = self.id_gd_whole.get(id_gd) {
                         term_bmp |= bmp;
                     }
                 }
@@ -347,4 +358,56 @@ impl Drop for UniquesIndex {
             self.index_dir.display(),
         );
     }
+}
+
+/// Precompute normalized effect-text search keys per `id_gd` across all locales, including
+/// localized keyword expansions when `keywords_i18n` (`nonunique/keywords.json`) is available.
+pub(crate) fn build_effect_text_search_keys(
+    catalog: &IdGdCatalog,
+    keywords_i18n: Option<&BTreeMap<String, BTreeMap<String, String>>>,
+) -> Vec<(u32, Vec<String>)> {
+    let mut out = Vec::with_capacity(catalog.entries.len());
+    for entry in &catalog.entries {
+        let mut keys = Vec::new();
+        for (locale, t) in &entry.translations {
+            let raw = t.text.trim();
+            if raw.is_empty() || raw == "[]" {
+                continue;
+            }
+            let raw_key = crate::index::text_search::search_key(raw);
+            if !raw_key.is_empty() && !keys.contains(&raw_key) {
+                keys.push(raw_key);
+            }
+            if let Some(kw_map) = keywords_i18n {
+                let expanded = index_core::nonunique::expand_keyword_tokens(raw, locale, kw_map);
+                let exp_key = crate::index::text_search::search_key(&expanded);
+                if !exp_key.is_empty() && !keys.contains(&exp_key) {
+                    keys.push(exp_key);
+                }
+                // Also index all localized display strings for any [KEYWORD] token in `raw` so
+                // searches in FR/ES/DE/IT match even if a catalog entry only carries en_US.
+                let mut rest = raw;
+                while let Some(open) = rest.find('[') {
+                    let after = &rest[open + 1..];
+                    let Some(close) = after.find(']') else {
+                        break;
+                    };
+                    let token = &after[..close];
+                    if let Some(by_loc) = kw_map.get(token) {
+                        for disp in by_loc.values() {
+                            let kw_key = crate::index::text_search::search_key(disp);
+                            if !kw_key.is_empty() && !keys.contains(&kw_key) {
+                                keys.push(kw_key);
+                            }
+                        }
+                    }
+                    rest = &after[close + 1..];
+                }
+            }
+        }
+        if !keys.is_empty() {
+            out.push((entry.id_gd, keys));
+        }
+    }
+    out
 }

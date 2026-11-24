@@ -40,6 +40,19 @@ impl IdGdAliasMap {
         self.alias_to_canonical.get(&id).copied().unwrap_or(id)
     }
 
+    /// Return `[canonical, ...aliases]` for `id`, covering both canonical and collapsed alias IDs
+    /// so cross-index lookups (e.g. non-unique bitmaps indexed by pre-collapse `idGd`) never miss.
+    pub fn equivalent_ids(&self, id: u32) -> Vec<u32> {
+        let canonical = self.resolve(id);
+        let mut out = vec![canonical];
+        for (&alias, &canon) in &self.alias_to_canonical {
+            if canon == canonical && alias != canonical {
+                out.push(alias);
+            }
+        }
+        out
+    }
+
     pub fn resolve_ids(&self, ids: &[u32]) -> Vec<u32> {
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {

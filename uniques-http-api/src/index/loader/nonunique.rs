@@ -106,6 +106,8 @@ pub struct NonUniqueQueryIndex {
     pub id_gd_per_line: BTreeMap<(u32, NonUniqueEffectLine), RoaringBitmap>,
     /// Highest 1-based main effect line number seen across non-unique prints (at least 3).
     pub max_main_lines: u8,
+    /// Localized keyword display texts (`nonunique/keywords.json`: `keyword_ref -> locale -> text`).
+    pub keywords_i18n: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl NonUniqueQueryIndex {
@@ -444,6 +446,13 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
         }
     }
 
+    let keywords_i18n: BTreeMap<String, BTreeMap<String, String>> =
+        if storage.has_file("nonunique/keywords.json") {
+            read_json(storage, "nonunique/keywords.json")?
+        } else {
+            BTreeMap::new()
+        };
+
     Ok(Some(NonUniqueQueryIndex {
         catalog,
         cards,
@@ -478,6 +487,7 @@ pub fn load_nonunique_index(storage: &impl IndexStorage) -> Result<Option<NonUni
         id_gd_whole,
         id_gd_per_line,
         max_main_lines,
+        keywords_i18n,
     }))
 }
 

@@ -820,6 +820,10 @@ async fn unified_effects_endpoint_filters_and_formats_work_across_both_branches(
     for entry in cat_json["entries"].as_array_mut().unwrap() {
         entry["bitmap_bytes"] = serde_json::json!(b0_bytes.len());
         let id = entry["id_gd"].as_u64().unwrap();
+        if id == 3 {
+            // Simulate a collapsed duplicate idGd (alias 95 -> canonical 3) referenced by a non-unique!
+            entry["duplicated_id_gd"] = serde_json::json!([95]);
+        }
         entry["m1"] = serde_json::json!({
             "card_count": 1,
             "bitmap_bytes": b0_bytes.len(),
@@ -867,6 +871,7 @@ ALIZE,Trial by Frost,L'Epreuve du Givre,,,\n",
 1,Trigger,,MAIN_EFFECT,{R},{R},,,\n\
 2,Condition,,,If you control two or more Plants:,Si vous controlez deux Plantes:,,,\n\
 3,Output,AFTER_YOU,,[AFTER_YOU].,[AFTER_YOU].,,,\n\
+95,Output,AFTER_YOU,,[AFTER_YOU].,[AFTER_YOU].,,,\n\
 192,Trigger,,ECHO_EFFECT,{D} :,{D} :,,,\n\
 1001,Output,,,Draw two cards.,Piochez deux cartes.,,,\n",
     )
@@ -879,10 +884,11 @@ ALIZE,Trial by Frost,L'Epreuve du Givre,,,\n",
 1,ALT_CORE_B_AX_02_C,101,CORE,AX,C,B,0,7,BTG-002-C,3,3,2,2,2,,,0,0,0\n",
     )
     .unwrap();
+    // Reference collapsed alias 95 (instead of canonical 3) to verify alias expansion on non-uniques!
     fs::write(
         core_dir.join("PrintEffectFragments.csv"),
         "PrintId,DisplayIndex,TriggerId,ConditionId,EffectId\n\
-1,0,1,2,3\n",
+1,0,1,2,95\n",
     )
     .unwrap();
     fs::write(
@@ -986,16 +992,22 @@ ALIZE,Trial by Frost,L'Epreuve du Givre,,,\n",
     assert_eq!(status, 200);
     assert_eq!(filt["idGds"], serde_json::json!([1001]));
 
-    // 5. effectText and q match UNIQUE cards via their effect text as well as non-uniques!
+    // 5. effectText and q match UNIQUE cards via their effect text AND localized keyword expansion!
     let (status, res) = get_json(&state, "/api/v2/search?effectText=plants").await;
     assert_eq!(status, 200);
     assert_eq!(res["iter"]["total"], 2);
+    let (status, res) = get_json(&state, "/api/v2/search?effectText=apres%20vous").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        res["iter"]["total"], 2,
+        "French keyword display 'Après Vous' must match both unique and non-unique cards"
+    );
     let (status, res) = get_json(&state, "/api/v2/search?q=plants&rarity[]=UNIQUE").await;
     assert_eq!(status, 200);
     assert_eq!(res["iter"]["total"], 1);
     assert_eq!(res["cards"][0]["reference"], "ALT_TEST_B_AX_04_U_1");
 
-    // 6. format= applies to BOTH uniques and non-uniques, and populates legalFormats on non-uniques!
+    // 6. format= applies to BOTH uniques and non-uniques, and populates legalFormats & canonical abilities!
     let (status, res) = get_json(&state, "/api/v2/search?format=mixed_inc").await;
     assert_eq!(status, 200);
     assert_eq!(res["iter"]["total"], 2);
@@ -1009,6 +1021,10 @@ ALIZE,Trial by Frost,L'Epreuve du Givre,,,\n",
     let (status, card) = get_json(&state, "/api/v2/card/ALT_CORE_B_AX_02_C").await;
     assert_eq!(status, 200);
     assert_eq!(card["legalFormats"], serde_json::json!(["mixed_inc"]));
+    assert_eq!(
+        card["abilities"][0]["output"]["idGd"], 3,
+        "non-unique ability referencing collapsed alias 95 must expose canonical idGd 3"
+    );
     let (status, card_alize) = get_json(&state, "/api/v2/card/ALT_ALIZE_B_YZ_11_C").await;
     assert_eq!(status, 200);
     assert_eq!(card_alize["legalFormats"], serde_json::json!(["no_core"]));

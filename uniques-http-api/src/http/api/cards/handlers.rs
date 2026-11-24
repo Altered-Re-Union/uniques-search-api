@@ -35,6 +35,7 @@ pub async fn get_card_v2(
                 &snapshot.families,
                 &subtype_names,
                 snapshot.formats.as_ref(),
+                index.id_gd_aliases(),
             ) {
                 return Ok(Json(card));
             }

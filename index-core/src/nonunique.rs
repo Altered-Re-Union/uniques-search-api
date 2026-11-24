@@ -532,8 +532,11 @@ impl NonUniqueIndex {
             }
         }
 
+        let id_gd_dir = nonunique_root.join("id_gd");
+        if id_gd_dir.exists() {
+            fs::remove_dir_all(&id_gd_dir)?;
+        }
         if !self.id_gd_whole.is_empty() {
-            let id_gd_dir = nonunique_root.join("id_gd");
             fs::create_dir_all(&id_gd_dir)?;
             for (id_gd, bitmap) in &self.id_gd_whole {
                 write_single_bitmap(&id_gd_dir.join(format!("{id_gd}.roar")), bitmap)?;
@@ -1299,6 +1302,83 @@ fn load_card_types_localized(
     Ok(out)
 }
 
+/// Load `Keywords.csv` into `keyword_ref -> locale -> display_text` (excluding empty displays such
+/// as `BB`) for persisting `nonunique/keywords.json` and localized effect-text search expansion.
+pub fn load_keywords_localized(
+    csv_root: &Path,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+    let rows = read_optional_all::<KeywordCsvRow>(&csv_root.join("Keywords.csv"))?;
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let mut names = BTreeMap::new();
+        for (locale, val) in [
+            ("en_US", &row.display_web_en_us),
+            ("fr_FR", &row.display_web_fr_fr),
+            ("es_ES", &row.display_web_es_es),
+            ("de_DE", &row.display_web_de_de),
+            ("it_IT", &row.display_web_it_it),
+        ] {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                names.insert(locale.to_string(), trimmed.to_string());
+            }
+        }
+        if !names.is_empty() {
+            out.insert(row.reference, names);
+        }
+    }
+    Ok(out)
+}
+
+/// Replace `[KEYWORD]` / `$[KEYWORD]` markers in `text` with their localized display text from
+/// `keywords` (falling back to `en_US` or keeping the raw token if unknown).
+pub fn expand_keyword_tokens(
+    text: &str,
+    locale: &str,
+    keywords: &BTreeMap<String, BTreeMap<String, String>>,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let prefix = &rest[..open];
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(']') else {
+            out.push_str(rest);
+            return out;
+        };
+        let key = &after[..close];
+        if !key.is_empty()
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
+            let clean_prefix = prefix.strip_suffix('$').unwrap_or(prefix);
+            out.push_str(clean_prefix);
+            if let Some(by_loc) = keywords.get(key) {
+                if let Some(disp) = by_loc.get(locale).or_else(|| by_loc.get("en_US")) {
+                    out.push_str(disp);
+                } else {
+                    out.push('[');
+                    out.push_str(key);
+                    out.push(']');
+                }
+            } else if key != "BB" {
+                out.push('[');
+                out.push_str(key);
+                out.push(']');
+            }
+        } else {
+            out.push_str(prefix);
+            out.push('[');
+            out.push_str(key);
+            out.push(']');
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 // --- Build orchestration ---
 
 #[derive(Debug, serde::Serialize)]
@@ -1401,6 +1481,13 @@ pub fn build_nonunique_index(
     let card_types_json = serde_json::to_string(&card_types_map)?;
     fs::write(nonunique_out.join("card_types.json"), card_types_json)
         .with_context(|| format!("write {}", nonunique_out.join("card_types.json").display()))?;
+
+    let keywords_map = load_keywords_localized(&cardsdata_root.join("data").join("csv"))?;
+    if !keywords_map.is_empty() {
+        let keywords_json = serde_json::to_string(&keywords_map)?;
+        fs::write(nonunique_out.join("keywords.json"), keywords_json)
+            .with_context(|| format!("write {}", nonunique_out.join("keywords.json").display()))?;
+    }
 
     let built_at_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

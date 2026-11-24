@@ -880,6 +880,8 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
     );
 
     let id_gd_aliases = IdGdAliasMap::from_catalog(&idgd_catalog);
+    let effect_text_search_keys =
+        crate::index::uniques_index::build_effect_text_search_keys(&idgd_catalog, None);
 
     let effects_list = build_effects_list(&idgd_catalog);
     let effects_body = Arc::new(serialize_effects_list(&effects_list)?);
@@ -920,6 +922,7 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
         collector_number_lookup_index,
         present_cards,
         effects_body,
+        effect_text_search_keys,
         artist_credits: Default::default(),
     })
 }
@@ -1071,13 +1074,16 @@ pub fn load_app_state(settings: &Settings) -> Result<AppState> {
 pub fn build_app_state(mut bundle: LoadedIndexBundle, settings: &Settings) -> Result<AppState> {
     bundle.bind_artist_credits(&settings.artists)?;
     let LoadedIndexBundle {
-        index,
+        mut index,
         mut nonunique,
         families,
         ..
     } = bundle;
     if let Some(ref mut nu) = nonunique {
         nu.bind_families(&families);
+        if !nu.keywords_i18n.is_empty() {
+            index.bind_effect_text_keywords(&nu.keywords_i18n);
+        }
     }
     let formats = match settings.formats.as_ref().filter(|f| f.is_enabled()) {
         Some(formats_settings) => {

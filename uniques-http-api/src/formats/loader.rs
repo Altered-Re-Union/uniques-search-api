@@ -335,6 +335,7 @@ mod tests {
                 entries: vec![],
             },
             id_gd_aliases: IdGdAliasMap::default(),
+            effect_text_search_keys: Vec::new(),
             stats_summary: StatsSummary {
                 version: 1,
                 set: "TEST".to_string(),

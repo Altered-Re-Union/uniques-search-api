@@ -359,6 +359,7 @@ fn respond_search(server: &ServerState, params: &QueryMultiMap) -> ApiResult<Jso
                         &snapshot.families,
                         &subtype_names,
                         snapshot.formats.as_ref(),
+                        snapshot.index.id_gd_aliases(),
                     ) {
                         cards.push(SearchCard::NonUnique { card });
                     }
@@ -1796,12 +1797,8 @@ pub(crate) fn nonunique_union_on_line(
 ) -> RoaringBitmap {
     let mut out = RoaringBitmap::new();
     for &id in ids {
-        let resolved = unique.resolve_id_gd(id);
-        if let Some(bmp) = nu.id_gd_per_line.get(&(resolved, line)) {
-            out |= bmp;
-        }
-        if resolved != id {
-            if let Some(bmp) = nu.id_gd_per_line.get(&(id, line)) {
+        for eq_id in unique.equivalent_id_gds(id) {
+            if let Some(bmp) = nu.id_gd_per_line.get(&(eq_id, line)) {
                 out |= bmp;
             }
         }

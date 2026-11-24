@@ -607,6 +607,7 @@ pub fn nonunique_card_v2(
     families: &BTreeMap<i64, FamilyCatalogEntry>,
     subtype_names: &BTreeMap<String, BTreeMap<String, String>>,
     formats: &FormatIndex,
+    aliases: &index_core::idgd_collapse::IdGdAliasMap,
 ) -> Option<CardV2> {
     let reference = nu.reference_for(print_index)?.to_string();
     let legal_formats = nonunique_legal_formats(print_index, formats);
@@ -650,7 +651,7 @@ pub fn nonunique_card_v2(
                 }),
             })
             .collect();
-        let abilities = build_nonunique_abilities(nu, &meta.abilities);
+        let abilities = build_nonunique_abilities(nu, &meta.abilities, aliases);
 
         Some(CardV2 {
             reference,
@@ -770,12 +771,15 @@ pub fn nonunique_card_v2(
 fn build_nonunique_abilities(
     nu: &NonUniqueQueryIndex,
     lines: &[index_core::nonunique::NonUniqueAbilityLine],
+    aliases: &index_core::idgd_collapse::IdGdAliasMap,
 ) -> Vec<CardAbilityV2> {
     let element = |id: Option<u32>| -> Option<CardAbilityElementV2> {
-        let id_gd = id?;
+        let raw_id = id?;
+        let id_gd = aliases.resolve(raw_id);
         let text = nu
             .idgd_by_id
-            .get(&id_gd)
+            .get(&raw_id)
+            .or_else(|| nu.idgd_by_id.get(&id_gd))
             .and_then(|&idx| nu.idgd_catalog.get(idx))
             .map(|entry| entry.translations.clone())
             .unwrap_or_default();
