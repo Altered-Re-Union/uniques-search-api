@@ -567,7 +567,12 @@ impl NonUniqueIndex {
             };
             let mut translations = BTreeMap::new();
             for locale in LOCALES {
-                let text = fragment_text_for_locale(frag, locale);
+                let raw = fragment_text_for_locale(frag, locale);
+                let text = if id_gd >= 1000 && element_type == "OUTPUT" {
+                    strip_trailing_reminder(raw)
+                } else {
+                    raw
+                };
                 if !text.is_empty() {
                     translations.insert(locale.to_string(), text.to_string());
                 }
@@ -1170,6 +1175,82 @@ fn positive_id(id: Option<i64>) -> Option<u32> {
     id.and_then(|v| (v > 0).then(|| u32::try_from(v).ok()).flatten())
 }
 
+/// Returns true when the entire text is a standalone parenthetical rules reminder (e.g.
+/// `"(If I leave the Expedition zone, remove me from the game.)"`). Such lines remain in a card's
+/// printed `mainEffect` text but are not indexed as filterable abilities in `/api/v2/effects`.
+pub fn is_pure_reminder_text(text: &str) -> bool {
+    let t = text.trim();
+    let t = t.strip_suffix('.').unwrap_or(t).trim_end();
+    if !(t.starts_with('(') && t.ends_with(')')) || t.len() < 3 {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    for (idx, ch) in t.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return idx + ch.len_utf8() == t.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Strip a trailing standalone rules-reminder sentence `(...)` from an output label for
+/// `/api/v2/effects`, while keeping integrated qualifiers like `(as an exhausted Mana Orb).` or
+/// `({T}).` intact and never emptying a string.
+pub fn strip_trailing_reminder(text: &str) -> &str {
+    let mut current = text.trim();
+    loop {
+        let trimmed = current.strip_suffix('.').unwrap_or(current).trim_end();
+        if !trimmed.ends_with(')') {
+            break;
+        }
+        // Find matching '(' for the final ')'.
+        let mut depth: i32 = 0;
+        let mut open_idx = None;
+        for (idx, ch) in trimmed.char_indices().rev() {
+            match ch {
+                ')' => depth += 1,
+                '(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(open) = open_idx else {
+            break;
+        };
+        let before = trimmed[..open].trim_end();
+        if before.is_empty() {
+            break;
+        }
+        let inside = trimmed[open + 1..trimmed.len() - 1].trim();
+        let preceded_by_sentence_end = before.ends_with('.') || before.ends_with('!') || before.ends_with('?');
+        let inside_ends_sentence = inside.ends_with('.')
+            || inside.ends_with('!')
+            || inside.ends_with('?')
+            || inside.ends_with(".\"")
+            || inside.ends_with(".»")
+            || inside.ends_with(". »")
+            || inside.ends_with(".”");
+        if preceded_by_sentence_end || inside_ends_sentence {
+            current = before;
+        } else {
+            break;
+        }
+    }
+    current
+}
+
 fn build_print_effects(
     rows: &[PrintEffectFragmentRow],
     texts: &BTreeMap<i64, EffectFragmentTextRow>,
@@ -1211,7 +1292,13 @@ fn build_print_effects(
         let pos_t = positive_id(row.trigger_id);
         let pos_c = positive_id(row.condition_id);
         let pos_o = positive_id(row.effect_id);
-        if pos_t.is_some() || pos_c.is_some() || pos_o.is_some() {
+        let is_pure_reminder = matches!(pos_t, None | Some(23))
+            && matches!(pos_c, None | Some(191))
+            && row
+                .effect_id
+                .and_then(|id| texts.get(&id))
+                .is_some_and(|f| is_pure_reminder_text(&f.text_en_us));
+        if !is_pure_reminder && (pos_t.is_some() || pos_c.is_some() || pos_o.is_some()) {
             let line = if is_echo {
                 echo_line_idx = echo_line_idx.saturating_add(1);
                 echo_line_idx
@@ -1654,6 +1741,44 @@ mod tests {
         assert_eq!(
             card_types.get("HERO").and_then(|m| m.get("fr_FR")).map(String::as_str),
             Some("Heros")
+        );
+    }
+
+    #[test]
+    fn pure_and_trailing_reminder_helpers_distinguish_reminders_from_qualifiers() {
+        assert!(is_pure_reminder_text(
+            "(If I leave the Expedition zone, remove me from the game.)"
+        ));
+        assert!(is_pure_reminder_text(
+            "(An Anchored Character doesn't go to Reserve during Rest and loses Anchored.)"
+        ));
+        assert!(!is_pure_reminder_text(
+            "Target Character gains [ANCHORED]. (During Rest, it doesn't go to Reserve.)"
+        ));
+        assert!(!is_pure_reminder_text("Draw a card."));
+
+        assert_eq!(
+            strip_trailing_reminder(
+                "Target Character loses [FLEETING]. (Discard me from Reserve to do this.)"
+            ),
+            "Target Character loses [FLEETING]."
+        );
+        assert_eq!(
+            strip_trailing_reminder(
+                "Target Character gains [ANCHORED]. (At Rest, it doesn't go to Reserve)."
+            ),
+            "Target Character gains [ANCHORED]."
+        );
+        // Integrated qualifiers (period after closing paren, no sentence inside) stay intact.
+        assert_eq!(
+            strip_trailing_reminder(
+                "Put target Permanent in its owner's Mana zone (as an exhausted Mana Orb)."
+            ),
+            "Put target Permanent in its owner's Mana zone (as an exhausted Mana Orb)."
+        );
+        assert_eq!(
+            strip_trailing_reminder("Send target Character to Reserve, then exhaust it ({T})."),
+            "Send target Character to Reserve, then exhaust it ({T})."
         );
     }
 }

@@ -18,12 +18,27 @@ use crate::index::loader::NonUniqueEffectLine;
 use super::filtered::{other_two_buckets, parse_editing, union_on_line, MAIN_LINES, SUPPORT_LINES};
 use super::models::{EffectsFilteredResponse, Region};
 
-pub async fn get_effects_v2(State(server): State<ServerState>) -> Response {
+pub async fn get_effects_v2(
+    State(server): State<ServerState>,
+    RawQuery(query): RawQuery,
+) -> Response {
     let snapshot = server.app.snapshot();
+    let unique_only = query.as_deref().is_some_and(|q| {
+        q.split('&').any(|pair| {
+            let mut kv = pair.splitn(2, '=');
+            kv.next() == Some("kind")
+                && kv.next().is_some_and(|v| v.eq_ignore_ascii_case("unique"))
+        })
+    });
+    let body = if unique_only {
+        snapshot.index.effects_body().as_ref().clone()
+    } else {
+        snapshot.effects_body.as_ref().clone()
+    };
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        snapshot.effects_body.as_ref().clone(),
+        body,
     )
         .into_response()
 }

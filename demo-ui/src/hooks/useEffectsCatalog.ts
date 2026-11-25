@@ -26,7 +26,7 @@ export function useEffectsCatalog(): EffectsCatalogState {
 
     async function load() {
       const base = getApiBaseUrl();
-      const url = `${base}/api/v2/effects`;
+      const url = `${base}/api/v2/effects?kind=unique`;
 
       try {
         const res = await fetch(url, { signal: controller.signal });
