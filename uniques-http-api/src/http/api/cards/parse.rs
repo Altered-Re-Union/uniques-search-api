@@ -5,7 +5,7 @@ use url::form_urlencoded;
 use index_core::faction_index::Faction;
 
 use crate::collections::CollectionStore;
-use crate::formats::{FormatIndex, FormatLoadStatus};
+use crate::formats::{FormatIndex, FormatResolveError};
 use crate::http::api::error::{bad_request, collection_not_loaded, internal_server_error, ApiResult};
 use crate::collections::validate_collection_id;
 use crate::index::UniquesIndex;
@@ -96,19 +96,11 @@ pub(crate) fn resolve_format_filter(
     let Some(id) = format_id else {
         return Ok(None);
     };
-
-    if !formats_enabled {
-        return Err(bad_request(format!("unknown format '{id}'")));
-    }
-
-    let Some(loaded) = format_index.get(&id) else {
-        return Err(bad_request(format!("unknown format '{id}'")));
-    };
-
-    match &loaded.status {
-        FormatLoadStatus::Ready { .. } => Ok(Some(id)),
-        FormatLoadStatus::Failed => Err(internal_server_error("format failed to load")),
-    }
+    format_index.validate(&id, formats_enabled).map_err(|e| match e {
+        FormatResolveError::Unknown(u) => bad_request(format!("unknown format '{u}'")),
+        FormatResolveError::Failed => internal_server_error("format failed to load"),
+    })?;
+    Ok(Some(id))
 }
 
 pub(crate) fn parse_request(
@@ -751,25 +743,12 @@ pub(crate) fn parse_artists(params: &QueryMultiMap) -> Vec<String> {
 }
 
 pub(crate) fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters) -> ApiResult<()> {
-    validate_idgd_types_unified(state, None, filters)
-}
-
-pub(crate) fn validate_idgd_types_unified(
-    state: &UniquesIndex,
-    nonunique: Option<&crate::index::NonUniqueQueryIndex>,
-    filters: &AbilityFilters,
-) -> ApiResult<()> {
-    let mut types: BTreeMap<u32, &str> = BTreeMap::new();
-    for entry in &state.idgd_catalog().entries {
-        types.insert(entry.id_gd, entry.element_type.as_str());
-    }
-    if let Some(nu) = nonunique {
-        for entry in &nu.idgd_catalog {
-            types
-                .entry(state.resolve_id_gd(entry.id_gd))
-                .or_insert(entry.element_type.as_str());
-        }
-    }
+    let types: BTreeMap<u32, &str> = state
+        .idgd_catalog()
+        .entries
+        .iter()
+        .map(|entry| (entry.id_gd, entry.element_type.as_str()))
+        .collect();
 
     for slot in &filters.effects {
         for (key_suffix, selector, ids) in [

@@ -911,15 +911,22 @@ ALIZE,Trial by Frost,L'Epreuve du Givre,,,\n",
     )
     .unwrap();
 
-    // Formats directory with an exclude format banning CORE + an include format listing one unique + one non-unique.
+    // Formats directory with an exclude format banning CORE, a mixed include format, and a
+    // unique-only include format (like Frontier) that restricts Uniques without hiding non-Uniques.
     let formats_dir = root_dir.join("formats");
     fs::create_dir_all(&formats_dir).unwrap();
     fs::write(
         formats_dir.join("manifest.json"),
         r#"[
+  {"id":"frontier_only","path":"frontier_only.json","version":1},
   {"id":"mixed_inc","path":"mixed_inc.json","version":1},
   {"id":"no_core","path":"no_core.json","version":1}
 ]"#,
+    )
+    .unwrap();
+    fs::write(
+        formats_dir.join("frontier_only.json"),
+        r#"{"id":"frontier_only","version":1,"included_refs":["ALT_TEST_B_AX_04_U_1"]}"#,
     )
     .unwrap();
     fs::write(
@@ -967,6 +974,22 @@ ALIZE,Trial by Frost,L'Epreuve du Givre,,,\n",
         .collect();
     assert!(trigger_ids.contains(&1) && trigger_ids.contains(&192));
     assert!(output_ids.contains(&3) && output_ids.contains(&1001));
+    // Output 1001 & trigger 192 only appear on SPELL non-uniques -> spellOnly: true;
+    // Output 3 & trigger 1 appear on Characters/Uniques -> spellOnly omitted/false.
+    let out_1001 = eff_list["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["idGd"] == 1001)
+        .unwrap();
+    let out_3 = eff_list["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["idGd"] == 3)
+        .unwrap();
+    assert_eq!(out_1001["spellOnly"], true);
+    assert!(out_3.get("spellOnly").is_none());
 
     // 2. Structured effect[0][t]=1&effect[0][o]=3 matches BOTH the unique AND the non-unique card!
     let (status, res) = get_json(&state, "/api/v2/search?effect[0][t]=1&effect[0][o]=3").await;
@@ -1007,7 +1030,17 @@ ALIZE,Trial by Frost,L'Epreuve du Givre,,,\n",
     assert_eq!(res["iter"]["total"], 1);
     assert_eq!(res["cards"][0]["reference"], "ALT_TEST_B_AX_04_U_1");
 
-    // 6. format= applies to BOTH uniques and non-uniques, and populates legalFormats & canonical abilities!
+    // 6. format= applies to BOTH uniques and non-uniques, except unique-only Include formats
+    // (like Frontier) which restrict Uniques while keeping non-Uniques available normally!
+    let (status, res) = get_json(&state, "/api/v2/search?format=frontier_only").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        res["iter"]["total"], 3,
+        "unique-only include format (frontier) must keep non-unique cards available normally"
+    );
+    let (status, res) = get_json(&state, "/api/v2/search?format=frontier_only&rarity[]=COMMON").await;
+    assert_eq!(status, 200);
+    assert_eq!(res["iter"]["total"], 2);
     let (status, res) = get_json(&state, "/api/v2/search?format=mixed_inc").await;
     assert_eq!(status, 200);
     assert_eq!(res["iter"]["total"], 2);
@@ -1020,14 +1053,14 @@ ALIZE,Trial by Frost,L'Epreuve du Givre,,,\n",
     assert_eq!(res["cards"][0]["reference"], "ALT_ALIZE_B_YZ_11_C");
     let (status, card) = get_json(&state, "/api/v2/card/ALT_CORE_B_AX_02_C").await;
     assert_eq!(status, 200);
-    assert_eq!(card["legalFormats"], serde_json::json!(["mixed_inc"]));
+    assert_eq!(card["legalFormats"], serde_json::json!(["frontier_only", "mixed_inc"]));
     assert_eq!(
         card["abilities"][0]["output"]["idGd"], 3,
         "non-unique ability referencing collapsed alias 95 must expose canonical idGd 3"
     );
     let (status, card_alize) = get_json(&state, "/api/v2/card/ALT_ALIZE_B_YZ_11_C").await;
     assert_eq!(status, 200);
-    assert_eq!(card_alize["legalFormats"], serde_json::json!(["no_core"]));
+    assert_eq!(card_alize["legalFormats"], serde_json::json!(["frontier_only", "no_core"]));
 }
 
 #[tokio::test]

@@ -17,9 +17,7 @@ use roaring::RoaringBitmap;
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::collections::CollectionStore;
 use crate::config::{ArtistsSettings, Settings};
-use crate::formats::{load_format_index, FormatIndex};
 use crate::http::api::effects::{build_effects_list, serialize_effects_list};
 use crate::http::state::{AppState, QuerySnapshot};
 use crate::index::text_search::{search_key, SearchQuery};
@@ -99,6 +97,37 @@ pub struct SetBitmaps {
     pub by_set: BTreeMap<String, RoaringBitmap>,
     /// `CORE | COREKS` when both sets exist in `by_set`; built once at load.
     pub core_and_coreks: Option<RoaringBitmap>,
+}
+
+impl SetBitmaps {
+    pub fn union_requested(&self, sets: &[String]) -> RoaringBitmap {
+        let has_core = sets.iter().any(|s| s == SET_CORE);
+        let has_coreks = sets.iter().any(|s| s == SET_COREKS);
+        let use_combined = has_core && has_coreks;
+
+        let mut out = RoaringBitmap::new();
+        if use_combined {
+            if let Some(combined) = &self.core_and_coreks {
+                out = combined.clone();
+            } else {
+                if let Some(b) = self.by_set.get(SET_CORE) {
+                    out |= b.clone();
+                }
+                if let Some(b) = self.by_set.get(SET_COREKS) {
+                    out |= b.clone();
+                }
+            }
+        }
+        for code in sets {
+            if use_combined && (code == SET_CORE || code == SET_COREKS) {
+                continue;
+            }
+            if let Some(b) = self.by_set.get(code) {
+                out |= b.clone();
+            }
+        }
+        out
+    }
 }
 
 pub fn build_set_bitmaps(catalog: &Catalog) -> SetBitmaps {
@@ -895,6 +924,12 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
 
     eprintln!("index load complete");
 
+    let keyword_bitmaps = crate::index::uniques_index::build_unique_keyword_bitmaps(
+        &idgd_catalog,
+        &id_gd_whole,
+        &id_gd_per_line,
+    );
+
     Ok(UniquesIndex {
         index_dir,
         catalog,
@@ -923,6 +958,7 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
         present_cards,
         effects_body,
         effect_text_search_keys,
+        keyword_bitmaps,
         artist_credits: Default::default(),
     })
 }
@@ -1071,36 +1107,14 @@ pub fn load_app_state(settings: &Settings) -> Result<AppState> {
     build_app_state(bundle, settings)
 }
 
-pub fn build_app_state(mut bundle: LoadedIndexBundle, settings: &Settings) -> Result<AppState> {
-    bundle.bind_artist_credits(&settings.artists)?;
-    let LoadedIndexBundle {
-        mut index,
-        mut nonunique,
-        families,
-        ..
-    } = bundle;
-    if let Some(ref mut nu) = nonunique {
-        nu.bind_families(&families);
-        if !nu.keywords_i18n.is_empty() {
-            index.bind_effect_text_keywords(&nu.keywords_i18n);
-        }
-    }
-    let formats = match settings.formats.as_ref().filter(|f| f.is_enabled()) {
-        Some(formats_settings) => {
-            Arc::new(load_format_index(&index, nonunique.as_ref(), formats_settings))
-        }
-        None => Arc::new(FormatIndex::empty()),
-    };
-    let effects_body =
-        crate::http::state::compute_snapshot_effects_body(&index, nonunique.as_ref());
-    Ok(AppState::new(QuerySnapshot {
-        index: Arc::new(index),
-        families: Arc::new(families),
-        nonunique: nonunique.map(Arc::new),
-        formats,
-        collections: CollectionStore::new(&settings.collections),
-        effects_body,
-    }))
+pub fn build_app_state(bundle: LoadedIndexBundle, settings: &Settings) -> Result<AppState> {
+    let snapshot = QuerySnapshot::assemble(
+        bundle,
+        Some(&settings.artists),
+        settings.formats.as_ref(),
+        &settings.collections,
+    )?;
+    Ok(AppState::new(snapshot))
 }
 
 /// Load index only (empty format catalog) for tests.

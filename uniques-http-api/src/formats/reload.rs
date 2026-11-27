@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::config::{FormatsSettings, Settings};
 use crate::formats::loader::{load_format_index, read_manifest_versions, FormatIndex};
 use crate::formats::source::FormatsSource;
-use crate::http::state::{AppState, QuerySnapshot};
+use crate::http::state::AppState;
 use tokio::time::MissedTickBehavior;
 
 pub fn spawn_formats_hot_reload(
@@ -49,21 +49,17 @@ async fn formats_reload_tick(state: &Arc<AppState>, settings: &Settings) -> anyh
     let nonunique = current.nonunique.clone();
     let state = Arc::clone(state);
 
+    let expected_built_at_secs = current.index.manifest.built_at_secs;
     let new_formats = tokio::task::spawn_blocking(move || {
         load_format_index(index.as_ref(), nonunique.as_deref(), &settings)
     })
     .await?;
 
-    let snapshot = QuerySnapshot {
-        index: Arc::clone(&current.index),
-        nonunique: current.nonunique.clone(),
-        families: current.families.clone(),
-        formats: Arc::new(new_formats),
-        collections: current.collections.clone(),
-        effects_body: Arc::clone(&current.effects_body),
-    };
-    state.commit(Arc::new(snapshot));
-    eprintln!("formats hot-reloaded");
+    if state.swap_formats_if_same_index(expected_built_at_secs, Arc::new(new_formats)) {
+        eprintln!("formats hot-reloaded");
+    } else {
+        eprintln!("formats hot-reload skipped: index reloaded concurrently");
+    }
     Ok(())
 }
 

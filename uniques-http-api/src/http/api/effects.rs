@@ -2,12 +2,14 @@ mod filtered;
 mod handlers;
 mod list;
 mod models;
+mod unified;
 
 use axum::{routing::get, Router};
 
 use crate::http::ServerState;
 
 pub use list::{build_effects_list, build_unified_effects_list, serialize_effects_list};
+pub use unified::UnifiedEffectIndex;
 
 pub fn router() -> Router<ServerState> {
     Router::new()

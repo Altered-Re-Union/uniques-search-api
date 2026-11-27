@@ -1,21 +1,14 @@
-use std::collections::BTreeSet;
-
 use axum::extract::{RawQuery, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use index_core::bitmap::EffectLine;
-
 use crate::http::api::cards::parse::parse_query_multimap;
 use crate::http::api::error::{bad_request, ApiResult};
-use crate::http::api::search::{
-    nonunique_union_on_line, parse_request as parse_search_request, search_bitmaps,
-};
+use crate::http::api::search::{parse_request as parse_search_request, search_bitmaps};
 use crate::http::ServerState;
-use crate::index::loader::NonUniqueEffectLine;
 
-use super::filtered::{other_two_buckets, parse_editing, union_on_line, MAIN_LINES, SUPPORT_LINES};
+use super::filtered::{other_two_buckets, parse_editing};
 use super::models::{EffectsFilteredResponse, Region};
 
 pub async fn get_effects_v2(
@@ -33,7 +26,7 @@ pub async fn get_effects_v2(
     let body = if unique_only {
         snapshot.index.effects_body().as_ref().clone()
     } else {
-        snapshot.effects_body.as_ref().clone()
+        snapshot.effects.effects_body().as_ref().clone()
     };
     (
         StatusCode::OK,
@@ -49,9 +42,6 @@ pub async fn get_effects_filtered(
 ) -> ApiResult<Json<EffectsFilteredResponse>> {
     let params = parse_query_multimap(query.as_deref())?;
     let snapshot = server.app.snapshot();
-    let index = snapshot.index.as_ref();
-    let nonunique = snapshot.nonunique.as_deref();
-    let formats = snapshot.formats.as_ref();
     let formats_enabled = server
         .settings
         .formats
@@ -73,15 +63,7 @@ pub async fn get_effects_filtered(
 
     let (part, region) = parse_editing(editing)?;
 
-    let collections = &snapshot.collections;
-    let req = parse_search_request(
-        &params,
-        index,
-        nonunique,
-        formats,
-        formats_enabled,
-        collections,
-    )?;
+    let req = parse_search_request(&params, &snapshot, formats_enabled)?;
 
     // Co-constraints = the edited group's other two boxes (the edited part is ignored).
     let (co1, co2) = match region {
@@ -104,99 +86,18 @@ pub async fn get_effects_filtered(
     }
     let (unique_base, nonunique_base) = search_bitmaps(&snapshot, &base_req)?;
 
-    let element_type = part.element_type();
-    let mut reachable: BTreeSet<u32> = BTreeSet::new();
-
-    // --- Unique branch ---
-    if !unique_base.is_empty() {
-        let lines: &[EffectLine] = match region {
-            Region::Main(_) => &MAIN_LINES,
-            Region::Support => &SUPPORT_LINES,
-        };
-        let mut partials = Vec::new();
-        for &line in lines {
-            let mut pl = unique_base.clone();
-            if !co1.is_empty() {
-                pl &= union_on_line(index, line, &co1);
-                if pl.is_empty() {
-                    continue;
-                }
-            }
-            if !co2.is_empty() {
-                pl &= union_on_line(index, line, &co2);
-                if pl.is_empty() {
-                    continue;
-                }
-            }
-            partials.push((line, pl));
-        }
-        if !partials.is_empty() {
-            for entry in &index.idgd_catalog().entries {
-                if entry.element_type != element_type {
-                    continue;
-                }
-                let id = entry.id_gd;
-                for (line, pl) in &partials {
-                    if let Some(bm) = index.id_gd_per_line().get(&(id, *line)) {
-                        if !pl.is_disjoint(bm) {
-                            reachable.insert(id);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // --- Non-unique branch ---
-    if let (Some(nu), false) = (nonunique, nonunique_base.is_empty()) {
-        let nu_lines: Vec<NonUniqueEffectLine> = match region {
-            Region::Main(_) => (1..=nu.max_main_lines)
-                .map(NonUniqueEffectLine::Main)
-                .collect(),
-            Region::Support => vec![NonUniqueEffectLine::Echo],
-        };
-        let mut partials = Vec::new();
-        for line in nu_lines {
-            let mut pl = nonunique_base.clone();
-            if !co1.is_empty() {
-                pl &= nonunique_union_on_line(nu, index, line, &co1);
-                if pl.is_empty() {
-                    continue;
-                }
-            }
-            if !co2.is_empty() {
-                pl &= nonunique_union_on_line(nu, index, line, &co2);
-                if pl.is_empty() {
-                    continue;
-                }
-            }
-            partials.push((line, pl));
-        }
-        if !partials.is_empty() {
-            for entry in &nu.idgd_catalog {
-                if entry.element_type != element_type {
-                    continue;
-                }
-                let raw_id = entry.id_gd;
-                let canon_id = index.resolve_id_gd(raw_id);
-                if reachable.contains(&canon_id) {
-                    continue;
-                }
-                for (line, pl) in &partials {
-                    if let Some(bm) = nu.id_gd_per_line.get(&(raw_id, *line)) {
-                        if !pl.is_disjoint(bm) {
-                            reachable.insert(canon_id);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let id_gds = snapshot.effects.reachable_id_gds(
+        snapshot.index.as_ref(),
+        &unique_base,
+        &nonunique_base,
+        part,
+        region,
+        &co1,
+        &co2,
+    );
 
     Ok(Json(EffectsFilteredResponse {
         editing: editing.to_string(),
-        id_gds: reachable.into_iter().collect(),
+        id_gds,
     }))
 }

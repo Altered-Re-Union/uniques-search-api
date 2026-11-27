@@ -8,8 +8,8 @@ use index_core::idgd_catalog::IdGdCatalogEntry;
 use index_core::stat_index::StatField;
 
 use crate::collections::CollectionStore;
-use crate::formats::{FormatIndex, FormatLoadStatus};
-use crate::index::loader::{FamilySpanRange, NonUniqueQueryIndex, SetBitmaps, SET_CORE, SET_COREKS};
+use crate::formats::FormatIndex;
+use crate::index::loader::{FamilySpanRange, NonUniqueQueryIndex};
 use crate::index::UniquesIndex;
 
 use super::error::{QueryError, QueryResult};
@@ -18,38 +18,6 @@ use crate::http::api::cards::models::{
     CardsSort, CompareOp, CostPredicate, CostRelation, EffectCombineMode, FamilyMatchV2, SortDir,
     SortField,
 };
-
-fn union_requested_sets(bitmaps: &SetBitmaps, sets: &[String]) -> RoaringBitmap {
-    let has_core = sets.iter().any(|s| s == SET_CORE);
-    let has_coreks = sets.iter().any(|s| s == SET_COREKS);
-    let use_combined = has_core && has_coreks;
-
-    let mut out = RoaringBitmap::new();
-
-    if use_combined {
-        if let Some(combined) = &bitmaps.core_and_coreks {
-            out = combined.clone();
-        } else {
-            if let Some(b) = bitmaps.by_set.get(SET_CORE) {
-                out |= b.clone();
-            }
-            if let Some(b) = bitmaps.by_set.get(SET_COREKS) {
-                out |= b.clone();
-            }
-        }
-    }
-
-    for code in sets {
-        if use_combined && (code == SET_CORE || code == SET_COREKS) {
-            continue;
-        }
-        if let Some(b) = bitmaps.by_set.get(code) {
-            out |= b.clone();
-        }
-    }
-
-    out
-}
 
 pub(crate) fn build_bitmap(
     state: &UniquesIndex,
@@ -102,7 +70,7 @@ pub(crate) fn build_bitmap(
     }
 
     if !req.sets.is_empty() {
-        groups.push(union_requested_sets(state.set_bitmaps(), &req.sets));
+        groups.push(state.set_bitmaps().union_requested(&req.sets));
     }
 
     if !req.refs.is_empty() {
@@ -197,25 +165,6 @@ pub(crate) fn build_bitmap(
         groups.push(unified_search_bitmap(state, q));
     }
 
-    let mut format_exclude: Option<RoaringBitmap> = None;
-    if let Some(id) = &req.format {
-        if let Some(loaded) = format_index.get(id) {
-            match &loaded.status {
-                FormatLoadStatus::Ready {
-                    negated: true,
-                    bitmap,
-                    ..
-                } => format_exclude = Some(bitmap.clone()),
-                FormatLoadStatus::Ready {
-                    negated: false,
-                    bitmap,
-                    ..
-                } => groups.push(bitmap.clone()),
-                FormatLoadStatus::Failed => {}
-            }
-        }
-    }
-
     if let Some(id) = &req.collection {
         if let Some(bitmaps) = collections.get(id) {
             groups.push(bitmaps.unique.clone());
@@ -234,8 +183,8 @@ pub(crate) fn build_bitmap(
     if let Some(exclude) = no_effect_exclude {
         out -= exclude;
     }
-    if let Some(exclude) = format_exclude {
-        out -= exclude;
+    if let Some(id) = &req.format {
+        format_index.apply_to_unique(id, &mut out);
     }
     Ok(out)
 }
@@ -531,43 +480,11 @@ pub fn rarity_v2_from_code(code: &str) -> CardRarityV2 {
 }
 
 pub fn unique_legal_formats(card_index: u32, formats: &FormatIndex) -> Option<Vec<String>> {
-    if formats.by_id.is_empty() {
-        return None;
-    }
-    let mut out = Vec::new();
-    for (id, loaded) in &formats.by_id {
-        if let FormatLoadStatus::Ready {
-            negated, bitmap, ..
-        } = &loaded.status
-        {
-            let matches = bitmap.contains(card_index);
-            if (*negated && !matches) || (!*negated && matches) {
-                out.push(id.clone());
-            }
-        }
-    }
-    Some(out)
+    formats.unique_legal_formats(card_index)
 }
 
 pub fn nonunique_legal_formats(print_index: u32, formats: &FormatIndex) -> Option<Vec<String>> {
-    if formats.by_id.is_empty() {
-        return None;
-    }
-    let mut out = Vec::new();
-    for (id, loaded) in &formats.by_id {
-        if let FormatLoadStatus::Ready {
-            negated,
-            nonunique_bitmap,
-            ..
-        } = &loaded.status
-        {
-            let matches = nonunique_bitmap.contains(print_index);
-            if (*negated && !matches) || (!*negated && matches) {
-                out.push(id.clone());
-            }
-        }
-    }
-    Some(out)
+    formats.nonunique_legal_formats(print_index)
 }
 
 /// Populate unified-search metadata (`rarity`, `cardType`, `isBanned`, `isErrated`, `isSuspended`,

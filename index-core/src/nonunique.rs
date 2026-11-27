@@ -27,33 +27,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const VALUE_BUCKETS: usize = 16;
 const LOCALES: [&str; 5] = ["en_US", "fr_FR", "es_ES", "de_DE", "it_IT"];
 
-/// Canonicalize `EffectFragments.KeywordReference` variants (`FLEETING_CHAR` -> `FLEETING`,
-/// `RESUPPLIES` / `RESUPPLY_INF` / `EXHAUSTED_RESUPPLY` -> `RESUPPLY`, etc.) so keyword filtering
-/// matches what users pick in the UI filter panel.
-pub fn canonical_keyword(raw: &str) -> Option<String> {
-    let k = raw.trim().to_ascii_uppercase();
-    if k.is_empty() || k == "BB" {
-        return None;
-    }
-    let mapped = match k.as_str() {
-        s if s.starts_with("ANCHORED") => "ANCHORED",
-        s if s.starts_with("ASLEEP") => "ASLEEP",
-        s if s.starts_with("ASCEND") || s == "DUE_TO_ASCENSION" => "ASCEND",
-        s if s.starts_with("BOOSTED") => "BOOSTED",
-        s if s.starts_with("COOLDOWN") => "COOLDOWN",
-        s if s.starts_with("DEFENDER") => "DEFENDER",
-        s if s.starts_with("ETERNAL") => "ETERNAL",
-        s if s.starts_with("FLEETING") => "FLEETING",
-        s if s.starts_with("GIGANTIC") => "GIGANTIC",
-        s if s.starts_with("RESUPPL") || s.starts_with("EXHAUSTED_RESUPPL") => "RESUPPLY",
-        s if s.starts_with("SABOTAGE") => "SABOTAGE",
-        s if s.starts_with("SCOUT") => "SCOUT",
-        s if s.starts_with("SEASONED") => "SEASONED",
-        s if s.starts_with("TOUGH") => "TOUGH",
-        other => other,
-    };
-    Some(mapped.to_string())
-}
+pub use crate::effect_text::{
+    canonical_keyword, expand_keyword_tokens, is_pure_reminder_text, strip_trailing_reminder,
+};
 
 /// Map `RarityReference` to an on-disk code (`0` = unknown/unmapped). `U` (Unique) isn't expected
 /// on a non-unique row but isn't rejected here either — see `load_nonunique_prints`.
@@ -261,6 +237,18 @@ pub struct NonUniqueIdGdEntry {
     pub main_lines: Vec<u8>,
     #[serde(default)]
     pub has_ec: bool,
+    /// True when every non-unique print referencing this fragment is a `SPELL`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spell_only: bool,
+}
+
+#[derive(Debug, Default)]
+struct IdGdMeta {
+    is_main: bool,
+    is_echo: bool,
+    main_lines: BTreeSet<u8>,
+    has_ec: bool,
+    has_non_spell: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -291,7 +279,7 @@ pub struct NonUniqueIndexBuilder {
     suspended: RoaringBitmap,
     id_gd_whole: BTreeMap<u32, RoaringBitmap>,
     id_gd_per_line: BTreeMap<(u32, String), RoaringBitmap>,
-    id_gd_meta: BTreeMap<u32, (bool, bool, BTreeSet<u8>, bool)>,
+    id_gd_meta: BTreeMap<u32, IdGdMeta>,
 }
 
 impl NonUniqueIndexBuilder {
@@ -409,11 +397,14 @@ impl NonUniqueIndexBuilder {
                     .insert(print_index);
                 let meta = self.id_gd_meta.entry(id).or_default();
                 if ability.is_echo {
-                    meta.1 = true;
-                    meta.3 = true;
+                    meta.is_echo = true;
+                    meta.has_ec = true;
                 } else {
-                    meta.0 = true;
-                    meta.2.insert(ability.line);
+                    meta.is_main = true;
+                    meta.main_lines.insert(ability.line);
+                }
+                if record.card_type.as_deref() != Some("SPELL") {
+                    meta.has_non_spell = true;
                 }
             }
         }
@@ -465,7 +456,7 @@ pub struct NonUniqueIndex {
     suspended: RoaringBitmap,
     id_gd_whole: BTreeMap<u32, RoaringBitmap>,
     id_gd_per_line: BTreeMap<(u32, String), RoaringBitmap>,
-    id_gd_meta: BTreeMap<u32, (bool, bool, BTreeSet<u8>, bool)>,
+    id_gd_meta: BTreeMap<u32, IdGdMeta>,
 }
 
 impl NonUniqueIndex {
@@ -554,7 +545,7 @@ impl NonUniqueIndex {
         fragments: &BTreeMap<i64, EffectFragmentTextRow>,
     ) -> NonUniqueIdGdCatalog {
         let mut entries = Vec::with_capacity(self.id_gd_meta.len());
-        for (&id_gd, (is_main, is_echo, main_lines, has_ec)) in &self.id_gd_meta {
+        for (&id_gd, meta) in &self.id_gd_meta {
             let Some(frag) = fragments.get(&(id_gd as i64)) else {
                 continue;
             };
@@ -581,10 +572,11 @@ impl NonUniqueIndex {
                 id_gd,
                 element_type,
                 translations,
-                is_main: *is_main,
-                is_echo: *is_echo,
-                main_lines: main_lines.iter().copied().collect(),
-                has_ec: *has_ec,
+                is_main: meta.is_main,
+                is_echo: meta.is_echo,
+                main_lines: meta.main_lines.iter().copied().collect(),
+                has_ec: meta.has_ec,
+                spell_only: !meta.has_non_spell,
             });
         }
         NonUniqueIdGdCatalog { entries }
@@ -933,71 +925,13 @@ fn parse_optional_u8(raw: &str) -> Option<u8> {
 fn substitute_keywords(
     raw: &str,
     locale: &str,
-    keywords: &BTreeMap<String, KeywordCsvRow>,
+    keywords: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> String {
-    if !raw.contains('[') {
-        return raw.to_string();
-    }
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(open) = rest.find('[') {
-        out.push_str(&rest[..open]);
-        let after_open = &rest[open + 1..];
-        if let Some(close) = after_open.find(']') {
-            let token = &after_open[..close];
-            if let Some(kw) = keywords.get(token) {
-                let localized = match locale {
-                    "fr_FR" => &kw.display_web_fr_fr,
-                    "es_ES" => &kw.display_web_es_es,
-                    "de_DE" => &kw.display_web_de_de,
-                    "it_IT" => &kw.display_web_it_it,
-                    _ => &kw.display_web_en_us,
-                };
-                let replacement = if !localized.is_empty() {
-                    localized.as_str()
-                } else if !kw.display_web_en_us.is_empty() {
-                    kw.display_web_en_us.as_str()
-                } else {
-                    token
-                };
-                out.push_str(replacement);
-            } else {
-                out.push('[');
-                out.push_str(token);
-                out.push(']');
-            }
-            rest = &after_open[close + 1..];
-        } else {
-            out.push('[');
-            out.push_str(after_open);
-            rest = "";
-            break;
-        }
-    }
-    out.push_str(rest);
-    out
+    expand_keyword_tokens(raw, locale, keywords)
 }
 
 fn extract_bracket_keywords(raw: &str, out: &mut BTreeSet<String>) {
-    let mut rest = raw;
-    while let Some(open) = rest.find('[') {
-        let after = &rest[open + 1..];
-        if let Some(close) = after.find(']') {
-            let token = &after[..close];
-            if !token.is_empty()
-                && token
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-            {
-                if let Some(canon) = canonical_keyword(token) {
-                    out.insert(canon);
-                }
-            }
-            rest = &after[close + 1..];
-        } else {
-            break;
-        }
-    }
+    crate::effect_text::extract_canonical_keywords(raw, out);
 }
 
 /// Reads `<cardsdata_root>/data/csv/NonUnique/<set>/NonUniquePrints.csv` plus shared referentials.
@@ -1038,11 +972,7 @@ pub fn load_nonunique_prints(
             .map(|r| (r.reference, r.name_en_us))
             .collect();
 
-    let keywords_map: BTreeMap<String, KeywordCsvRow> =
-        read_optional_all::<KeywordCsvRow>(&csv_root.join("Keywords.csv"))?
-            .into_iter()
-            .map(|r| (r.reference.clone(), r))
-            .collect();
+    let keywords_map = load_keywords_localized(&csv_root)?;
 
     let effect_texts: BTreeMap<i64, EffectFragmentTextRow> =
         read_all::<EffectFragmentTextRow>(&csv_root.join("EffectFragments.csv"))?
@@ -1175,86 +1105,10 @@ fn positive_id(id: Option<i64>) -> Option<u32> {
     id.and_then(|v| (v > 0).then(|| u32::try_from(v).ok()).flatten())
 }
 
-/// Returns true when the entire text is a standalone parenthetical rules reminder (e.g.
-/// `"(If I leave the Expedition zone, remove me from the game.)"`). Such lines remain in a card's
-/// printed `mainEffect` text but are not indexed as filterable abilities in `/api/v2/effects`.
-pub fn is_pure_reminder_text(text: &str) -> bool {
-    let t = text.trim();
-    let t = t.strip_suffix('.').unwrap_or(t).trim_end();
-    if !(t.starts_with('(') && t.ends_with(')')) || t.len() < 3 {
-        return false;
-    }
-    let mut depth: i32 = 0;
-    for (idx, ch) in t.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return idx + ch.len_utf8() == t.len();
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Strip a trailing standalone rules-reminder sentence `(...)` from an output label for
-/// `/api/v2/effects`, while keeping integrated qualifiers like `(as an exhausted Mana Orb).` or
-/// `({T}).` intact and never emptying a string.
-pub fn strip_trailing_reminder(text: &str) -> &str {
-    let mut current = text.trim();
-    loop {
-        let trimmed = current.strip_suffix('.').unwrap_or(current).trim_end();
-        if !trimmed.ends_with(')') {
-            break;
-        }
-        // Find matching '(' for the final ')'.
-        let mut depth: i32 = 0;
-        let mut open_idx = None;
-        for (idx, ch) in trimmed.char_indices().rev() {
-            match ch {
-                ')' => depth += 1,
-                '(' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        open_idx = Some(idx);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(open) = open_idx else {
-            break;
-        };
-        let before = trimmed[..open].trim_end();
-        if before.is_empty() {
-            break;
-        }
-        let inside = trimmed[open + 1..trimmed.len() - 1].trim();
-        let preceded_by_sentence_end = before.ends_with('.') || before.ends_with('!') || before.ends_with('?');
-        let inside_ends_sentence = inside.ends_with('.')
-            || inside.ends_with('!')
-            || inside.ends_with('?')
-            || inside.ends_with(".\"")
-            || inside.ends_with(".»")
-            || inside.ends_with(". »")
-            || inside.ends_with(".”");
-        if preceded_by_sentence_end || inside_ends_sentence {
-            current = before;
-        } else {
-            break;
-        }
-    }
-    current
-}
-
 fn build_print_effects(
     rows: &[PrintEffectFragmentRow],
     texts: &BTreeMap<i64, EffectFragmentTextRow>,
-    keywords_map: &BTreeMap<String, KeywordCsvRow>,
+    keywords_map: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> BuiltPrintEffects {
     let mut main_lines: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut echo_lines: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
@@ -1415,55 +1269,6 @@ pub fn load_keywords_localized(
         }
     }
     Ok(out)
-}
-
-/// Replace `[KEYWORD]` / `$[KEYWORD]` markers in `text` with their localized display text from
-/// `keywords` (falling back to `en_US` or keeping the raw token if unknown).
-pub fn expand_keyword_tokens(
-    text: &str,
-    locale: &str,
-    keywords: &BTreeMap<String, BTreeMap<String, String>>,
-) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(open) = rest.find('[') {
-        let prefix = &rest[..open];
-        let after = &rest[open + 1..];
-        let Some(close) = after.find(']') else {
-            out.push_str(rest);
-            return out;
-        };
-        let key = &after[..close];
-        if !key.is_empty()
-            && key
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-        {
-            let clean_prefix = prefix.strip_suffix('$').unwrap_or(prefix);
-            out.push_str(clean_prefix);
-            if let Some(by_loc) = keywords.get(key) {
-                if let Some(disp) = by_loc.get(locale).or_else(|| by_loc.get("en_US")) {
-                    out.push_str(disp);
-                } else {
-                    out.push('[');
-                    out.push_str(key);
-                    out.push(']');
-                }
-            } else if key != "BB" {
-                out.push('[');
-                out.push_str(key);
-                out.push(']');
-            }
-        } else {
-            out.push_str(prefix);
-            out.push('[');
-            out.push_str(key);
-            out.push(']');
-        }
-        rest = &after[close + 1..];
-    }
-    out.push_str(rest);
-    out
 }
 
 // --- Build orchestration ---

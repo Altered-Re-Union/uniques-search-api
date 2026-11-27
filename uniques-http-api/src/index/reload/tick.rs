@@ -1,8 +1,5 @@
-use std::sync::Arc;
-
 use crate::config::Settings;
-use crate::formats::rebuild_formats_for_index;
-use crate::http::state::AppState;
+use crate::http::state::{AppState, QuerySnapshot};
 
 use super::source::IndexSource;
 
@@ -25,38 +22,21 @@ pub(super) async fn reload_tick(
     let source = source.clone();
     let formats_settings = settings.formats.clone();
     let artists_settings = settings.artists.clone();
-    let bundle = tokio::task::spawn_blocking(move || {
-        let mut bundle = source.load_bundle()?;
-        bundle.bind_artist_credits(&artists_settings)?;
-        anyhow::Ok(bundle)
+    let collections_settings = settings.collections.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let bundle = source.load_bundle()?;
+        QuerySnapshot::assemble(
+            bundle,
+            Some(&artists_settings),
+            formats_settings.as_ref(),
+            &collections_settings,
+        )
     })
     .await??;
 
-    let mut index = bundle.index;
-    let mut nonunique = bundle.nonunique;
-    if let Some(ref mut nu) = nonunique {
-        nu.bind_families(&bundle.families);
-        if !nu.keywords_i18n.is_empty() {
-            index.bind_effect_text_keywords(&nu.keywords_i18n);
-        }
-    }
-
-    let new_index = Arc::new(index);
-    let new_formats = rebuild_formats_for_index(
-        Arc::clone(&new_index),
-        nonunique.as_ref(),
-        formats_settings.as_ref().filter(|f| f.is_enabled()),
-    );
-
     let elapsed = started.elapsed();
 
-    match state.commit_snapshot_if_newer(
-        new_index,
-        nonunique.map(Arc::new),
-        Arc::new(bundle.families),
-        new_formats,
-        &settings.collections,
-    ) {
+    match state.commit_assembled_if_newer(snapshot) {
         Some((old_secs, new_secs)) => {
             eprintln!(
                 "index hot-reloaded: version {old_secs} -> {new_secs} (loaded in {:.2}s)",

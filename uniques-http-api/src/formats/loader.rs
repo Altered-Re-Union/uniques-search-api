@@ -21,6 +21,21 @@ pub enum FormatLoadStatus {
     Failed,
 }
 
+impl FormatLoadStatus {
+    /// True when an Include format (`negated == false`) lists only Uniques (e.g. `frontier`),
+    /// meaning it restricts Uniques while non-Unique cards remain available normally.
+    pub fn is_unique_only_include(&self) -> bool {
+        matches!(
+            self,
+            FormatLoadStatus::Ready {
+                negated: false,
+                bitmap,
+                nonunique_bitmap,
+            } if nonunique_bitmap.is_empty() && !bitmap.is_empty()
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedFormat {
     pub id: String,
@@ -33,6 +48,12 @@ pub struct FormatIndex {
     pub manifest_versions: BTreeMap<String, u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatResolveError {
+    Unknown(String),
+    Failed,
+}
+
 impl FormatIndex {
     pub fn empty() -> Self {
         Self::default()
@@ -40,6 +61,110 @@ impl FormatIndex {
 
     pub fn get(&self, id: &str) -> Option<&LoadedFormat> {
         self.by_id.get(id)
+    }
+
+    /// Validate that `id` is a loaded, ready format when formats are enabled.
+    pub fn validate(&self, id: &str, enabled: bool) -> Result<(), FormatResolveError> {
+        if !enabled {
+            return Err(FormatResolveError::Unknown(id.to_string()));
+        }
+        let Some(loaded) = self.by_id.get(id) else {
+            return Err(FormatResolveError::Unknown(id.to_string()));
+        };
+        match &loaded.status {
+            FormatLoadStatus::Ready { .. } => Ok(()),
+            FormatLoadStatus::Failed => Err(FormatResolveError::Failed),
+        }
+    }
+
+    /// Apply format `id` in-place to a unique-branch result bitmap.
+    pub fn apply_to_unique(&self, id: &str, bitmap: &mut RoaringBitmap) {
+        let Some(loaded) = self.by_id.get(id) else {
+            return;
+        };
+        match &loaded.status {
+            FormatLoadStatus::Ready {
+                negated: true,
+                bitmap: excluded,
+                ..
+            } => *bitmap -= excluded,
+            FormatLoadStatus::Ready {
+                negated: false,
+                bitmap: allowed,
+                ..
+            } => *bitmap &= allowed,
+            FormatLoadStatus::Failed => {}
+        }
+    }
+
+    /// Apply format `id` in-place to a non-unique-branch result bitmap. Unique-only Include
+    /// formats (e.g. `frontier`) leave non-unique prints unfiltered.
+    pub fn apply_to_nonunique(&self, id: &str, bitmap: &mut RoaringBitmap) {
+        let Some(loaded) = self.by_id.get(id) else {
+            return;
+        };
+        if loaded.status.is_unique_only_include() {
+            return;
+        }
+        match &loaded.status {
+            FormatLoadStatus::Ready {
+                negated: true,
+                nonunique_bitmap,
+                ..
+            } => *bitmap -= nonunique_bitmap,
+            FormatLoadStatus::Ready {
+                negated: false,
+                nonunique_bitmap,
+                ..
+            } => *bitmap &= nonunique_bitmap,
+            FormatLoadStatus::Failed => {}
+        }
+    }
+
+    /// Legal format IDs for a unique card index, or `None` when no formats are configured.
+    pub fn unique_legal_formats(&self, card_index: u32) -> Option<Vec<String>> {
+        if self.by_id.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (id, loaded) in &self.by_id {
+            if let FormatLoadStatus::Ready {
+                negated, bitmap, ..
+            } = &loaded.status
+            {
+                let matches = bitmap.contains(card_index);
+                if (*negated && !matches) || (!*negated && matches) {
+                    out.push(id.clone());
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Legal format IDs for a non-unique print index, or `None` when no formats are configured.
+    pub fn nonunique_legal_formats(&self, print_index: u32) -> Option<Vec<String>> {
+        if self.by_id.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (id, loaded) in &self.by_id {
+            if loaded.status.is_unique_only_include() {
+                out.push(id.clone());
+                continue;
+            }
+            if let FormatLoadStatus::Ready {
+                negated,
+                nonunique_bitmap,
+                ..
+            } = &loaded.status
+            {
+                let matches = nonunique_bitmap.contains(print_index);
+                if (*negated && !matches) || (!*negated && matches) {
+                    out.push(id.clone());
+                }
+            }
+        }
+        Some(out)
     }
 }
 
@@ -316,62 +441,9 @@ mod tests {
             }],
             total_bit_span: 2,
         };
-        let set_bitmaps = build_set_bitmaps(&catalog);
-        UniquesIndex {
-            index_dir: PathBuf::from("/test"),
-            catalog: catalog.clone(),
-            manifest: IndexManifest {
-                version: 1,
-                set: "TEST".to_string(),
-                kind: None,
-                built_at_secs: 0,
-                card_count: 2,
-                id_gd_count: 0,
-                total_bit_span: 2,
-                family_count: 1,
-            },
-            idgd_catalog: IdGdCatalog {
-                set: "TEST".to_string(),
-                entries: vec![],
-            },
-            id_gd_aliases: IdGdAliasMap::default(),
-            effect_text_search_keys: Vec::new(),
-            stats_summary: StatsSummary {
-                version: 1,
-                set: "TEST".to_string(),
-                total_cards_indexed: 2,
-                fields: vec![],
-            },
-            factions_summary: FactionsSummary {
-                version: 1,
-                set: "TEST".to_string(),
-                total_cards_indexed: 2,
-                source: String::new(),
-                factions: vec![],
-                unknown_count: 0,
-                bitmap_dir: String::new(),
-            },
-            cards: vec![],
-            id_gd_whole: BTreeMap::new(),
-            id_gd_per_line: BTreeMap::new(),
-            stats: BTreeMap::new(),
-            factions: BTreeMap::new(),
-            set_bitmaps,
-            cost_relations: Default::default(),
-            subtype_bitmaps: BTreeMap::new(),
-            no_effect_bitmap: Default::default(),
-            banned: RoaringBitmap::new(),
-            errated: RoaringBitmap::new(),
-            suspended: RoaringBitmap::new(),
-            name_search_index: build_name_search_index(&catalog),
-            family_lookup_index: build_family_lookup_index(&catalog),
-            family_span_groups: build_family_span_groups(&catalog),
-            family_sort_index: Default::default(),
-            collector_number_lookup_index: build_collector_number_lookup_index(&catalog),
-            present_cards: RoaringBitmap::from_iter(0..catalog.total_bit_span),
-            effects_body: Arc::new(Bytes::from_static(b"[]")),
-            artist_credits: Default::default(),
-        }
+        let mut idx = UniquesIndex::minimal_for_test(catalog, 0);
+        idx.present_cards = RoaringBitmap::from_iter(0..idx.catalog.total_bit_span);
+        idx
     }
 
     fn formats_settings(root: &std::path::Path) -> FormatsSettings {

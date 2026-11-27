@@ -2,42 +2,10 @@ use anyhow::{anyhow, Result};
 use index_core::refs_bitmap::build_bitmaps_from_mixed_ref_strs;
 use roaring::RoaringBitmap;
 
-use crate::index::loader::{NonUniqueQueryIndex, SetBitmaps, SET_CORE, SET_COREKS};
+use crate::index::loader::NonUniqueQueryIndex;
 use crate::index::UniquesIndex;
 
 use super::schema::{FormatDefinition, FormatMode, FormatsManifestEntry};
-
-pub(crate) fn union_requested_sets(bitmaps: &SetBitmaps, sets: &[String]) -> RoaringBitmap {
-    let has_core = sets.iter().any(|s| s == SET_CORE);
-    let has_coreks = sets.iter().any(|s| s == SET_COREKS);
-    let use_combined = has_core && has_coreks;
-
-    let mut out = RoaringBitmap::new();
-
-    if use_combined {
-        if let Some(combined) = &bitmaps.core_and_coreks {
-            out = combined.clone();
-        } else {
-            if let Some(b) = bitmaps.by_set.get(SET_CORE) {
-                out |= b.clone();
-            }
-            if let Some(b) = bitmaps.by_set.get(SET_COREKS) {
-                out |= b.clone();
-            }
-        }
-    }
-
-    for code in sets {
-        if use_combined && (code == SET_CORE || code == SET_COREKS) {
-            continue;
-        }
-        if let Some(b) = bitmaps.by_set.get(code) {
-            out |= b.clone();
-        }
-    }
-
-    out
-}
 
 /// Build format bitmaps for both catalogs; returns `(negated, unique_bitmap, nonunique_bitmap)`.
 pub fn build_format_bitmap(
@@ -69,7 +37,7 @@ pub fn build_format_bitmap(
                         }
                     }
                 }
-                unique_bmp |= union_requested_sets(index.set_bitmaps(), &def.excluded_sets);
+                unique_bmp |= index.set_bitmaps().union_requested(&def.excluded_sets);
             }
             if !def.excluded_refs.is_empty() {
                 let refs: Vec<&str> = def.excluded_refs.iter().map(String::as_str).collect();
@@ -178,62 +146,9 @@ mod tests {
             ],
             total_bit_span: 8,
         };
-        let set_bitmaps = build_set_bitmaps(&catalog);
-        UniquesIndex {
-            index_dir: PathBuf::from("/test"),
-            catalog: catalog.clone(),
-            manifest: IndexManifest {
-                version: 1,
-                set: "TEST".to_string(),
-                kind: None,
-                built_at_secs: 0,
-                card_count: 8,
-                id_gd_count: 0,
-                total_bit_span: 8,
-                family_count: 2,
-            },
-            idgd_catalog: IdGdCatalog {
-                set: "TEST".to_string(),
-                entries: vec![],
-            },
-            id_gd_aliases: IdGdAliasMap::default(),
-            effect_text_search_keys: Vec::new(),
-            stats_summary: StatsSummary {
-                version: 1,
-                set: "TEST".to_string(),
-                total_cards_indexed: 8,
-                fields: vec![],
-            },
-            factions_summary: FactionsSummary {
-                version: 1,
-                set: "TEST".to_string(),
-                total_cards_indexed: 8,
-                source: String::new(),
-                factions: vec![],
-                unknown_count: 0,
-                bitmap_dir: String::new(),
-            },
-            cards: vec![],
-            id_gd_whole: BTreeMap::new(),
-            id_gd_per_line: BTreeMap::new(),
-            stats: BTreeMap::new(),
-            factions: BTreeMap::new(),
-            set_bitmaps,
-            cost_relations: Default::default(),
-            subtype_bitmaps: BTreeMap::new(),
-            no_effect_bitmap: Default::default(),
-            banned: RoaringBitmap::new(),
-            errated: RoaringBitmap::new(),
-            suspended: RoaringBitmap::new(),
-            name_search_index: build_name_search_index(&catalog),
-            family_lookup_index: build_family_lookup_index(&catalog),
-            family_span_groups: build_family_span_groups(&catalog),
-            family_sort_index: Default::default(),
-            collector_number_lookup_index: build_collector_number_lookup_index(&catalog),
-            present_cards: RoaringBitmap::from_iter(0..catalog.total_bit_span),
-            effects_body: Arc::new(Bytes::from_static(b"[]")),
-            artist_credits: Default::default(),
-        }
+        let mut idx = UniquesIndex::minimal_for_test(catalog, 0);
+        idx.present_cards = RoaringBitmap::from_iter(0..idx.catalog.total_bit_span);
+        idx
     }
 
     #[test]

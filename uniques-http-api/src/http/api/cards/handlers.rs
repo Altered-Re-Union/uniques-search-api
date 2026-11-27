@@ -10,8 +10,7 @@ use crate::http::api::error::{bad_request, map_query_error, not_found, ApiResult
 use crate::http::ServerState;
 use crate::index::{
     build_bitmap, card_v2_from_index, cards_from_indices, enrich_unique_card_v2,
-    families_from_bitmap, nonunique_card_v2, page_cards_v2_sorted, subtype_names_from_index,
-    CardResolveError,
+    families_from_bitmap, nonunique_card_v2, page_cards_v2_sorted, CardResolveError,
 };
 use super::{CardV2, CardsIter, CardsResponse};
 
@@ -28,12 +27,11 @@ pub async fn get_card_v2(
 
     if let Some(nu) = snapshot.nonunique.as_deref() {
         if let Some(print_index) = nu.resolve_reference(&reference) {
-            let subtype_names = subtype_names_from_index(index);
             if let Some(card) = nonunique_card_v2(
                 nu,
                 print_index,
                 &snapshot.families,
-                &subtype_names,
+                &snapshot.subtype_names,
                 snapshot.formats.as_ref(),
                 index.id_gd_aliases(),
             ) {

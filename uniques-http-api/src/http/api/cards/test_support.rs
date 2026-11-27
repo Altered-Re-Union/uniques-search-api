@@ -253,6 +253,7 @@ pub(crate) fn test_state() -> AppState {
         id_gd_aliases,
         effects_body,
         effect_text_search_keys: Vec::new(),
+        keyword_bitmaps: BTreeMap::new(),
         artist_credits: Default::default(),
         stats_summary,
         factions_summary,
@@ -360,6 +361,7 @@ pub(crate) fn test_state_with_sets() -> AppState {
         id_gd_aliases: IdGdAliasMap::default(),
         effects_body: Arc::new(Bytes::from_static(b"{}")),
         effect_text_search_keys: Vec::new(),
+        keyword_bitmaps: BTreeMap::new(),
         artist_credits: Default::default(),
         stats_summary: StatsSummary {
             version: 1,

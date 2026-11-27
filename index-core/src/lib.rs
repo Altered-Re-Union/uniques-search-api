@@ -10,6 +10,7 @@ pub mod compact;
 pub mod crawl;
 pub mod csv_util;
 pub mod decode;
+pub mod effect_text;
 pub mod extra_catalog;
 pub mod faction_display;
 pub mod faction_index;

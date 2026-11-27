@@ -47,6 +47,7 @@ pub fn build_unified_effects_list(
             if let Some(existing) = target.get_mut(&canon_id) {
                 existing.is_main |= entry.is_main;
                 existing.is_echo |= entry.is_echo;
+                existing.spell_only &= entry.spell_only;
             } else {
                 target.insert(
                     canon_id,
@@ -56,6 +57,7 @@ pub fn build_unified_effects_list(
                         is_echo: entry.is_echo,
                         is_main: entry.is_main,
                         duplicated_id_gd: Vec::new(),
+                        spell_only: entry.spell_only,
                     },
                 );
             }
@@ -82,6 +84,7 @@ fn effect_part_with_region(entry: &IdGdCatalogEntry) -> EffectPartWithRegion {
         is_echo: entry.is_echo,
         is_main: entry.is_main,
         duplicated_id_gd: entry.duplicated_id_gd.clone(),
+        spell_only: false,
     }
 }
 
