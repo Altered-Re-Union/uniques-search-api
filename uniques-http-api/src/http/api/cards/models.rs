@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use roaring::RoaringBitmap;
 use serde::Serialize;
 
 use index_core::faction_index::Faction;
@@ -241,6 +242,47 @@ pub(crate) enum CostPredicate {
     Exact(u8),
     AnyOf(Vec<u8>),
     RangeBounds(Vec<(CompareOp, u8)>),
+}
+
+impl CostPredicate {
+    /// Evaluate this predicate against any 0..=15 bucket provider, shared by unique and non-unique
+    /// query paths.
+    pub(crate) fn evaluate(
+        &self,
+        mut get_bucket: impl FnMut(u8) -> Option<RoaringBitmap>,
+    ) -> RoaringBitmap {
+        let mut out = RoaringBitmap::new();
+        match self {
+            CostPredicate::Exact(v) => {
+                if let Some(bmp) = get_bucket(*v) {
+                    out |= bmp;
+                }
+            }
+            CostPredicate::AnyOf(values) => {
+                for &v in values {
+                    if let Some(bmp) = get_bucket(v) {
+                        out |= bmp;
+                    }
+                }
+            }
+            CostPredicate::RangeBounds(bounds) => {
+                for candidate in 0u8..=15u8 {
+                    let keep = bounds.iter().all(|(op, value)| match op {
+                        CompareOp::Gt => candidate > *value,
+                        CompareOp::Gte => candidate >= *value,
+                        CompareOp::Lt => candidate < *value,
+                        CompareOp::Lte => candidate <= *value,
+                    });
+                    if keep {
+                        if let Some(bmp) = get_bucket(candidate) {
+                            out |= bmp;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

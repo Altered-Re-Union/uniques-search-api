@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{FormatsSettings, Settings};
-use crate::formats::loader::{load_format_index, read_manifest_versions, FormatIndex};
+use crate::config::Settings;
+use crate::formats::loader::{load_format_index, read_manifest_versions};
 use crate::formats::source::FormatsSource;
-use crate::http::state::{AppState, QuerySnapshot};
+use crate::http::state::AppState;
 use tokio::time::MissedTickBehavior;
 
 pub fn spawn_formats_hot_reload(
@@ -46,31 +46,19 @@ async fn formats_reload_tick(state: &Arc<AppState>, settings: &Settings) -> anyh
     eprintln!("formats hot-reload starting: manifest version snapshot changed");
     let settings = formats_settings.clone();
     let index = Arc::clone(&current.index);
+    let nonunique = current.nonunique.clone();
     let state = Arc::clone(state);
 
+    let expected_built_at_secs = current.index.manifest.built_at_secs;
     let new_formats = tokio::task::spawn_blocking(move || {
-        load_format_index(index.as_ref(), &settings)
+        load_format_index(index.as_ref(), nonunique.as_deref(), &settings)
     })
     .await?;
 
-    let snapshot = QuerySnapshot {
-        index: Arc::clone(&current.index),
-        nonunique: current.nonunique.clone(),
-        families: current.families.clone(),
-        formats: Arc::new(new_formats),
-        collections: current.collections.clone(),
-    };
-    state.commit(Arc::new(snapshot));
-    eprintln!("formats hot-reloaded");
-    Ok(())
-}
-
-pub fn rebuild_formats_for_index(
-    index: Arc<crate::index::UniquesIndex>,
-    formats_settings: Option<&FormatsSettings>,
-) -> Arc<FormatIndex> {
-    match formats_settings.filter(|f| f.is_enabled()) {
-        Some(settings) => Arc::new(load_format_index(index.as_ref(), settings)),
-        None => Arc::new(FormatIndex::empty()),
+    if state.swap_formats_if_same_index(expected_built_at_secs, Arc::new(new_formats)) {
+        eprintln!("formats hot-reloaded");
+    } else {
+        eprintln!("formats hot-reload skipped: index reloaded concurrently");
     }
+    Ok(())
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,7 +8,7 @@ use index_core::bitmap::EffectLine;
 use index_core::catalog::Catalog;
 use index_core::compact::{CompactCardView, RECORD_SIZE};
 use index_core::faction_index::Faction;
-use index_core::idgd_catalog::IdGdCatalog;
+use index_core::idgd_catalog::{IdGdCatalog, IdGdCatalogEntry};
 use index_core::idgd_collapse::IdGdAliasMap;
 use index_core::path::parse_card_reference;
 use index_core::stat_index::StatField;
@@ -25,6 +25,8 @@ pub struct UniquesIndex {
     pub catalog: Catalog,
     pub manifest: IndexManifest,
     pub idgd_catalog: IdGdCatalog,
+    /// O(1) lookup from `id_gd` to entry index in `idgd_catalog.entries` (built once at load).
+    pub idgd_by_id: HashMap<u32, usize>,
     pub id_gd_aliases: IdGdAliasMap,
     pub stats_summary: StatsSummary,
     pub factions_summary: FactionsSummary,
@@ -57,6 +59,12 @@ pub struct UniquesIndex {
     /// inside family spans.
     pub present_cards: RoaringBitmap,
     pub effects_body: Arc<Bytes>,
+    /// Precomputed `(id_gd, normalized search keys)` across all locales (including localized
+    /// keyword expansions when `keywords.json` is bound), used by `bitmap_for_effect_text`.
+    pub effect_text_search_keys: Vec<(u32, Vec<String>)>,
+    /// Precomputed canonical keyword bitmaps (including `"ECHO"` from `EffectLine::Ec`), derived
+    /// once at load time via `index_core::effect_text`.
+    pub keyword_bitmaps: BTreeMap<String, RoaringBitmap>,
     /// Printed artist credit -> searchable names (`artist[]`, `/api/v2/artists`). Empty (each
     /// credit is its own name) until bound by `bind_artist_credits` at load time.
     pub artist_credits: Arc<ArtistCredits>,
@@ -89,12 +97,62 @@ impl UniquesIndex {
         &self.idgd_catalog
     }
 
+    pub fn idgd_entry(&self, id_gd: u32) -> Option<&IdGdCatalogEntry> {
+        self.idgd_by_id
+            .get(&id_gd)
+            .and_then(|&idx| self.idgd_catalog.entries.get(idx))
+    }
+
     pub fn id_gd_aliases(&self) -> &IdGdAliasMap {
         &self.id_gd_aliases
     }
 
     pub fn resolve_id_gd(&self, id: u32) -> u32 {
         self.id_gd_aliases.resolve(id)
+    }
+
+    pub fn equivalent_id_gds(&self, id: u32) -> Vec<u32> {
+        self.id_gd_aliases.equivalent_ids(id)
+    }
+
+    /// Rebuild `effect_text_search_keys` with localized keyword display expansions (e.g.
+    /// `[RESUPPLY]` -> `Ravitaillez`, `[ANCHORED]` -> `Ancré`) so `effectText` and `q` match
+    /// unique cards in every locale consistently with non-unique prints.
+    pub fn bind_effect_text_keywords(
+        &mut self,
+        keywords_i18n: &BTreeMap<String, BTreeMap<String, String>>,
+    ) {
+        self.effect_text_search_keys =
+            build_effect_text_search_keys(&self.idgd_catalog, Some(keywords_i18n));
+    }
+
+    /// Unique cards whose effect fragments match every term of `query` (case/accent/punctuation-
+    /// insensitive via [`crate::index::text_search::SearchQuery`]). Each term is resolved against
+    /// precomputed `effect_text_search_keys` and unioned across whole-card bitmaps, then
+    /// intersected across all terms — sub-millisecond over millions of uniques.
+    pub fn bitmap_for_effect_text(&self, query: &str) -> RoaringBitmap {
+        let Some(parsed) = crate::index::text_search::SearchQuery::parse(query) else {
+            return self.present_cards.clone();
+        };
+        let mut acc: Option<RoaringBitmap> = None;
+        for term in parsed.terms() {
+            let mut term_bmp = RoaringBitmap::new();
+            for (id_gd, keys) in &self.effect_text_search_keys {
+                if keys.iter().any(|k| k.contains(term.as_str())) {
+                    if let Some(bmp) = self.id_gd_whole.get(id_gd) {
+                        term_bmp |= bmp;
+                    }
+                }
+            }
+            acc = Some(match acc {
+                Some(cur) => cur & term_bmp,
+                None => term_bmp,
+            });
+            if acc.as_ref().is_some_and(RoaringBitmap::is_empty) {
+                break;
+            }
+        }
+        acc.unwrap_or_default()
     }
 
     pub fn stats_summary(&self) -> &StatsSummary {
@@ -179,6 +237,84 @@ impl UniquesIndex {
 
     pub fn effects_body(&self) -> &Arc<Bytes> {
         &self.effects_body
+    }
+
+    pub fn keyword_bitmaps(&self) -> &BTreeMap<String, RoaringBitmap> {
+        &self.keyword_bitmaps
+    }
+
+    #[cfg(test)]
+    pub(crate) fn minimal_for_test(catalog: Catalog, built_at_secs: u64) -> Self {
+        use crate::index::loader::{
+            build_collector_number_lookup_index, build_family_lookup_index, build_family_sort_index,
+            build_family_span_groups, build_name_search_index, build_set_bitmaps,
+            CostRelationBitmaps, FactionsSummary, IndexManifest, StatsSummary,
+        };
+        let set_bitmaps = build_set_bitmaps(&catalog);
+        let family_lookup_index = build_family_lookup_index(&catalog);
+        let name_search_index = build_name_search_index(&catalog);
+        let family_span_groups = build_family_span_groups(&catalog);
+        let family_sort_index = build_family_sort_index(&catalog);
+        let collector_number_lookup_index = build_collector_number_lookup_index(&catalog);
+        let total_bit_span = catalog.total_bit_span;
+        let family_count = catalog.families.len() as u64;
+        Self {
+            index_dir: PathBuf::from("/test"),
+            manifest: IndexManifest {
+                version: 1,
+                set: catalog.set.clone(),
+                kind: None,
+                built_at_secs,
+                card_count: total_bit_span,
+                id_gd_count: 0,
+                total_bit_span,
+                family_count,
+            },
+            stats_summary: StatsSummary {
+                version: 1,
+                set: catalog.set.clone(),
+                total_cards_indexed: total_bit_span,
+                fields: vec![],
+            },
+            factions_summary: FactionsSummary {
+                version: 1,
+                set: catalog.set.clone(),
+                total_cards_indexed: total_bit_span,
+                source: String::new(),
+                factions: vec![],
+                unknown_count: 0,
+                bitmap_dir: String::new(),
+            },
+            idgd_catalog: IdGdCatalog {
+                set: catalog.set.clone(),
+                entries: vec![],
+            },
+            idgd_by_id: HashMap::new(),
+            id_gd_aliases: IdGdAliasMap::default(),
+            catalog,
+            cards: vec![],
+            id_gd_whole: BTreeMap::new(),
+            id_gd_per_line: BTreeMap::new(),
+            stats: BTreeMap::new(),
+            factions: BTreeMap::new(),
+            set_bitmaps,
+            cost_relations: CostRelationBitmaps::default(),
+            subtype_bitmaps: BTreeMap::new(),
+            no_effect_bitmap: RoaringBitmap::new(),
+            banned: RoaringBitmap::new(),
+            errated: RoaringBitmap::new(),
+            suspended: RoaringBitmap::new(),
+            name_search_index,
+            family_lookup_index,
+            family_span_groups,
+            family_sort_index,
+            collector_number_lookup_index,
+            present_cards: RoaringBitmap::new(),
+            effects_body: Arc::new(Bytes::from_static(b"[]")),
+            effect_text_search_keys: Vec::new(),
+            keyword_bitmaps: BTreeMap::new(),
+            artist_credits: Default::default(),
+        }
     }
 
     pub fn card_view(&self, card_index: u32) -> Option<CompactCardView<'_>> {
@@ -311,4 +447,84 @@ impl Drop for UniquesIndex {
             self.index_dir.display(),
         );
     }
+}
+
+/// Derive per-canonical-keyword bitmaps for the unique catalog once at load time (including
+/// `"ECHO"` from `EffectLine::Ec`), using the shared `index_core::effect_text` parser so unique
+/// and non-unique keyword filtering never drift.
+pub(crate) fn build_unique_keyword_bitmaps(
+    catalog: &IdGdCatalog,
+    id_gd_whole: &BTreeMap<u32, RoaringBitmap>,
+    id_gd_per_line: &BTreeMap<(u32, EffectLine), RoaringBitmap>,
+) -> BTreeMap<String, RoaringBitmap> {
+    let mut out: BTreeMap<String, RoaringBitmap> = BTreeMap::new();
+    let mut echo = RoaringBitmap::new();
+    for entry in &catalog.entries {
+        if entry.ec.is_some() {
+            if let Some(b) = id_gd_per_line.get(&(entry.id_gd, EffectLine::Ec)) {
+                echo |= b;
+            }
+        }
+        let Some(en) = entry.translations.get("en_US").map(|t| t.text.as_str()) else {
+            continue;
+        };
+        let Some(whole) = id_gd_whole.get(&entry.id_gd) else {
+            continue;
+        };
+        let mut kws = std::collections::BTreeSet::new();
+        index_core::effect_text::extract_canonical_keywords(en, &mut kws);
+        for kw in kws {
+            out.entry(kw)
+                .and_modify(|bmp| *bmp |= whole)
+                .or_insert_with(|| whole.clone());
+        }
+    }
+    if !echo.is_empty() {
+        out.insert("ECHO".to_string(), echo);
+    }
+    out
+}
+
+/// Precompute normalized effect-text search keys per `id_gd` across all locales, including
+/// localized keyword expansions when `keywords_i18n` (`nonunique/keywords.json`) is available.
+pub(crate) fn build_effect_text_search_keys(
+    catalog: &IdGdCatalog,
+    keywords_i18n: Option<&BTreeMap<String, BTreeMap<String, String>>>,
+) -> Vec<(u32, Vec<String>)> {
+    let mut out = Vec::with_capacity(catalog.entries.len());
+    for entry in &catalog.entries {
+        let mut keys = Vec::new();
+        for (locale, t) in &entry.translations {
+            let raw = t.text.trim();
+            if raw.is_empty() || raw == "[]" {
+                continue;
+            }
+            let raw_key = crate::index::text_search::search_key(raw);
+            if !raw_key.is_empty() && !keys.contains(&raw_key) {
+                keys.push(raw_key);
+            }
+            if let Some(kw_map) = keywords_i18n {
+                let expanded = index_core::effect_text::expand_keyword_tokens(raw, locale, kw_map);
+                let exp_key = crate::index::text_search::search_key(&expanded);
+                if !exp_key.is_empty() && !keys.contains(&exp_key) {
+                    keys.push(exp_key);
+                }
+                for token in index_core::effect_text::extract_bracket_tokens(raw) {
+                    let norm = token.trim().replace(' ', "_");
+                    if let Some(by_loc) = kw_map.get(token).or_else(|| kw_map.get(norm.as_str())) {
+                        for disp in by_loc.values() {
+                            let kw_key = crate::index::text_search::search_key(disp);
+                            if !kw_key.is_empty() && !keys.contains(&kw_key) {
+                                keys.push(kw_key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !keys.is_empty() {
+            out.push((entry.id_gd, keys));
+        }
+    }
+    out
 }

@@ -72,10 +72,13 @@ pub fn build_family_catalog(cardsdata_root: &Path) -> Result<FamilyCatalog> {
 
     let mut subtypes_by_family: BTreeMap<i64, Vec<String>> = BTreeMap::new();
     for row in read_all::<CardFamilySubTypeRow>(&csv_root.join("CardFamilySubTypes.csv"))? {
-        subtypes_by_family
-            .entry(row.card_family_id)
-            .or_default()
-            .push(row.card_sub_type_reference);
+        let norm = row.card_sub_type_reference.trim().to_ascii_uppercase();
+        if !norm.is_empty() {
+            let list = subtypes_by_family.entry(row.card_family_id).or_default();
+            if !list.contains(&norm) {
+                list.push(norm);
+            }
+        }
     }
 
     let mut families = Vec::new();

@@ -40,6 +40,19 @@ impl IdGdAliasMap {
         self.alias_to_canonical.get(&id).copied().unwrap_or(id)
     }
 
+    /// Return `[canonical, ...aliases]` for `id`, covering both canonical and collapsed alias IDs
+    /// so cross-index lookups (e.g. non-unique bitmaps indexed by pre-collapse `idGd`) never miss.
+    pub fn equivalent_ids(&self, id: u32) -> Vec<u32> {
+        let canonical = self.resolve(id);
+        let mut out = vec![canonical];
+        for (&alias, &canon) in &self.alias_to_canonical {
+            if canon == canonical && alias != canonical {
+                out.push(alias);
+            }
+        }
+        out
+    }
+
     pub fn resolve_ids(&self, ids: &[u32]) -> Vec<u32> {
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
@@ -190,36 +203,48 @@ pub fn remap_cards_bin_file(path: &Path, remap: &BTreeMap<u32, u32>) -> Result<(
         ));
     }
 
-    let record_count = (len / RECORD_SIZE as u64) as usize;
-    let mut buf = [0u8; RECORD_SIZE];
+    const CHUNK_RECORDS: usize = (1024 * 1024) / RECORD_SIZE; // ~1 MiB aligned to RECORD_SIZE
+    let mut chunk = vec![0u8; CHUNK_RECORDS * RECORD_SIZE];
+    let mut offset: u64 = 0;
 
-    for idx in 0..record_count {
-        let offset = (idx as u64) * RECORD_SIZE as u64;
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut buf)?;
-
-        let mut fields = crate::compact::decode_record(&buf);
-        remap_id_gd_fields(&mut fields, remap);
-        buf = crate::compact::encode_record(&fields);
+    while offset < len {
+        let remaining = (len - offset) as usize;
+        let to_read = remaining.min(chunk.len());
+        let slice = &mut chunk[..to_read];
 
         file.seek(SeekFrom::Start(offset))?;
-        file.write_all(&buf)?;
+        file.read_exact(slice)?;
+
+        let mut modified = false;
+        for rec in slice.chunks_exact_mut(RECORD_SIZE) {
+            let mut arr = [0u8; RECORD_SIZE];
+            arr.copy_from_slice(rec);
+            let mut fields = crate::compact::decode_record(&arr);
+            let before = fields;
+            remap_id_gd_fields(&mut fields, remap);
+            if fields != before {
+                rec.copy_from_slice(&crate::compact::encode_record(&fields));
+                modified = true;
+            }
+        }
+
+        if modified {
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(slice)?;
+        }
+
+        offset += to_read as u64;
     }
 
     Ok(())
 }
 
 fn load_bitmap(path: &Path) -> Result<RoaringBitmap> {
-    let bytes = fs::read(path)?;
-    Ok(RoaringBitmap::deserialize_from(&bytes[..])?)
+    crate::roar_io::read_roar(path)
 }
 
 fn write_bitmap(path: &Path, bitmap: &RoaringBitmap) -> Result<u64> {
-    let mut bytes = Vec::new();
-    bitmap.serialize_into(&mut bytes)?;
-    let len = bytes.len() as u64;
-    fs::write(path, bytes)?;
-    Ok(len)
+    crate::roar_io::write_roar(path, bitmap)
 }
 
 /// Collapse duplicate-text idGd bitmaps on disk after merge; returns merge-time remap.

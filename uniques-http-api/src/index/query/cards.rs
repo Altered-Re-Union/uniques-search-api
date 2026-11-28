@@ -3,53 +3,21 @@ use std::collections::BTreeMap;
 use roaring::RoaringBitmap;
 
 use index_core::bitmap::EffectLine;
+use index_core::faction_index::Faction;
 use index_core::family_catalog::FamilyCatalogEntry;
-use index_core::idgd_catalog::IdGdCatalogEntry;
 use index_core::stat_index::StatField;
 
 use crate::collections::CollectionStore;
-use crate::formats::{FormatIndex, FormatLoadStatus};
-use crate::index::loader::{FamilySpanRange, NonUniqueQueryIndex, SetBitmaps, SET_CORE, SET_COREKS};
+use crate::formats::FormatIndex;
+use crate::index::loader::{FamilySpanRange, NonUniqueQueryIndex};
 use crate::index::UniquesIndex;
 
 use super::error::{QueryError, QueryResult};
 use crate::http::api::cards::models::{
     CardAbilityElementV2, CardAbilityKind, CardAbilityV2, CardFaction, CardRarityV2, CardSetV2, CardSubTypeV2, CardTypeV2, CardV2, CardsRequest,
-    CardsSort, CompareOp, CostPredicate, CostRelation, EffectCombineMode, FamilyMatchV2, SortDir,
+    CardsSort, CostPredicate, CostRelation, EffectCombineMode, FamilyMatchV2, SortDir,
     SortField,
 };
-
-fn union_requested_sets(bitmaps: &SetBitmaps, sets: &[String]) -> RoaringBitmap {
-    let has_core = sets.iter().any(|s| s == SET_CORE);
-    let has_coreks = sets.iter().any(|s| s == SET_COREKS);
-    let use_combined = has_core && has_coreks;
-
-    let mut out = RoaringBitmap::new();
-
-    if use_combined {
-        if let Some(combined) = &bitmaps.core_and_coreks {
-            out = combined.clone();
-        } else {
-            if let Some(b) = bitmaps.by_set.get(SET_CORE) {
-                out |= b.clone();
-            }
-            if let Some(b) = bitmaps.by_set.get(SET_COREKS) {
-                out |= b.clone();
-            }
-        }
-    }
-
-    for code in sets {
-        if use_combined && (code == SET_CORE || code == SET_COREKS) {
-            continue;
-        }
-        if let Some(b) = bitmaps.by_set.get(code) {
-            out |= b.clone();
-        }
-    }
-
-    out
-}
 
 pub(crate) fn build_bitmap(
     state: &UniquesIndex,
@@ -102,7 +70,7 @@ pub(crate) fn build_bitmap(
     }
 
     if !req.sets.is_empty() {
-        groups.push(union_requested_sets(state.set_bitmaps(), &req.sets));
+        groups.push(state.set_bitmaps().union_requested(&req.sets));
     }
 
     if !req.refs.is_empty() {
@@ -197,23 +165,6 @@ pub(crate) fn build_bitmap(
         groups.push(unified_search_bitmap(state, q));
     }
 
-    let mut format_exclude: Option<RoaringBitmap> = None;
-    if let Some(id) = &req.format {
-        if let Some(loaded) = format_index.get(id) {
-            match &loaded.status {
-                FormatLoadStatus::Ready {
-                    negated: true,
-                    bitmap,
-                } => format_exclude = Some(bitmap.clone()),
-                FormatLoadStatus::Ready {
-                    negated: false,
-                    bitmap,
-                } => groups.push(bitmap.clone()),
-                FormatLoadStatus::Failed => {}
-            }
-        }
-    }
-
     if let Some(id) = &req.collection {
         if let Some(bitmaps) = collections.get(id) {
             groups.push(bitmaps.unique.clone());
@@ -232,8 +183,8 @@ pub(crate) fn build_bitmap(
     if let Some(exclude) = no_effect_exclude {
         out -= exclude;
     }
-    if let Some(exclude) = format_exclude {
-        out -= exclude;
+    if let Some(id) = &req.format {
+        format_index.apply_to_unique(id, &mut out);
     }
     Ok(out)
 }
@@ -276,9 +227,10 @@ fn collector_number_bitmap(state: &UniquesIndex, collector_numbers: &[String]) -
     out
 }
 
-/// `q`'s single OR'd group: name substring, exact reference, exact collector number.
+/// `q`'s single OR'd group: name substring, effect text match, exact reference, exact collector number.
 fn unified_search_bitmap(state: &UniquesIndex, q: &str) -> RoaringBitmap {
     let mut out = state.name_search_index().bitmap_for_contains(state.catalog(), q);
+    out |= state.bitmap_for_effect_text(q);
     out |= index_core::build_bitmap_from_ref_strs_lenient(state.catalog(), &[q]);
     for card_index in state.resolve_card_indices_by_collector_number(q) {
         out.insert(card_index);
@@ -299,32 +251,7 @@ fn bitmap_for_cost_predicate(
     let Some(buckets) = state.stats().get(&field) else {
         return Err(QueryError::invalid(format!("missing stats index for {label}")));
     };
-
-    let mut out = RoaringBitmap::new();
-    match pred {
-        CostPredicate::Exact(v) => {
-            out |= buckets[*v as usize].clone();
-        }
-        CostPredicate::AnyOf(values) => {
-            for &v in values {
-                out |= buckets[v as usize].clone();
-            }
-        }
-        CostPredicate::RangeBounds(bounds) => {
-            for v in 0u8..=15u8 {
-                let keep = bounds.iter().all(|(op, value)| match op {
-                    CompareOp::Gt => v > *value,
-                    CompareOp::Gte => v >= *value,
-                    CompareOp::Lt => v < *value,
-                    CompareOp::Lte => v <= *value,
-                });
-                if keep {
-                    out |= buckets[v as usize].clone();
-                }
-            }
-        }
-    }
-    Ok(out)
+    Ok(pred.evaluate(|v| buckets.get(v as usize).cloned()))
 }
 
 pub(crate) fn combine_effect_bitmaps(
@@ -440,7 +367,6 @@ fn bitmap_line(state: &UniquesIndex, line: EffectLine, id_gd: u32) -> RoaringBit
 pub(crate) fn card_v2_from_index(
     state: &UniquesIndex,
     card_index: u32,
-    idgd_by_id: &BTreeMap<u32, &IdGdCatalogEntry>,
     debug_bga_trigram: bool,
 ) -> QueryResult<CardV2> {
     let reference = state
@@ -456,7 +382,10 @@ pub(crate) fn card_v2_from_index(
         .family_for_bit(card_index)
         .map_err(|e| QueryError::invalid(format!("family lookup for card_index {card_index}: {e}")))?;
 
-    let faction_code = faction_from_code(view.faction_code());
+    let faction_code = Faction::from_faction_code(view.faction_code())
+        .map(Faction::reference)
+        .unwrap_or("UN")
+        .to_string();
     let faction_name = index_core::faction_display_name(&faction_code)
         .unwrap_or("")
         .to_string();
@@ -484,8 +413,8 @@ pub(crate) fn card_v2_from_index(
             code: faction_code,
             name: faction_name,
         },
-        main_effect: build_main_effect_localized(idgd_by_id, &view),
-        echo_effect: build_echo_effect_localized(idgd_by_id, &view),
+        main_effect: build_main_effect_localized(state, &view),
+        echo_effect: build_echo_effect_localized(state, &view),
         collector_number: build_collector_number(family, card_index),
         card_type: None,
         rarity: None,
@@ -498,7 +427,7 @@ pub(crate) fn card_v2_from_index(
         reserve: None,
         legal_formats: None,
         debug_bga_trigram: debug_bga_trigram.then(|| build_debug_bga_trigram(&view)),
-        abilities: build_abilities(state, idgd_by_id, &view),
+        abilities: build_abilities(state, &view),
     })
 }
 
@@ -528,19 +457,11 @@ pub fn rarity_v2_from_code(code: &str) -> CardRarityV2 {
 }
 
 pub fn unique_legal_formats(card_index: u32, formats: &FormatIndex) -> Option<Vec<String>> {
-    if formats.by_id.is_empty() {
-        return None;
-    }
-    let mut out = Vec::new();
-    for (id, loaded) in &formats.by_id {
-        if let FormatLoadStatus::Ready { negated, bitmap } = &loaded.status {
-            let matches = bitmap.contains(card_index);
-            if (*negated && !matches) || (!*negated && matches) {
-                out.push(id.clone());
-            }
-        }
-    }
-    Some(out)
+    formats.unique_legal_formats(card_index)
+}
+
+pub fn nonunique_legal_formats(print_index: u32, formats: &FormatIndex) -> Option<Vec<String>> {
+    formats.nonunique_legal_formats(print_index)
 }
 
 /// Populate unified-search metadata (`rarity`, `cardType`, `isBanned`, `isErrated`, `isSuspended`,
@@ -579,8 +500,11 @@ pub fn nonunique_card_v2(
     print_index: u32,
     families: &BTreeMap<i64, FamilyCatalogEntry>,
     subtype_names: &BTreeMap<String, BTreeMap<String, String>>,
+    formats: &FormatIndex,
+    aliases: &index_core::idgd_collapse::IdGdAliasMap,
 ) -> Option<CardV2> {
     let reference = nu.reference_for(print_index)?.to_string();
+    let legal_formats = nonunique_legal_formats(print_index, formats);
     if let Some(meta) = nu.print_for(print_index) {
         let fam = families.get(&meta.card_family_id);
         let name = fam.map(|f| f.name.clone()).unwrap_or_default();
@@ -621,6 +545,7 @@ pub fn nonunique_card_v2(
                 }),
             })
             .collect();
+        let abilities = build_nonunique_abilities(nu, &meta.abilities, aliases);
 
         Some(CardV2 {
             reference,
@@ -654,9 +579,9 @@ pub fn nonunique_card_v2(
             is_suspended: Some(meta.is_suspended),
             permanent: meta.permanent,
             reserve: meta.reserve,
-            legal_formats: None,
+            legal_formats,
             debug_bga_trigram: None,
-            abilities: Vec::new(),
+            abilities,
         })
     } else {
         // Fallback when legacy index lacks `prints.json`.
@@ -730,11 +655,52 @@ pub fn nonunique_card_v2(
             is_suspended: Some(nu.suspended.contains(print_index)),
             permanent: None,
             reserve: None,
-            legal_formats: None,
+            legal_formats,
             debug_bga_trigram: None,
             abilities: Vec::new(),
         })
     }
+}
+
+fn build_nonunique_abilities(
+    nu: &NonUniqueQueryIndex,
+    lines: &[index_core::nonunique::NonUniqueAbilityLine],
+    aliases: &index_core::idgd_collapse::IdGdAliasMap,
+) -> Vec<CardAbilityV2> {
+    let element = |id: Option<u32>| -> Option<CardAbilityElementV2> {
+        let raw_id = id?;
+        let id_gd = aliases.resolve(raw_id);
+        let text = nu
+            .idgd_by_id
+            .get(&raw_id)
+            .or_else(|| nu.idgd_by_id.get(&id_gd))
+            .and_then(|&idx| nu.idgd_catalog.get(idx))
+            .map(|entry| entry.translations.clone())
+            .unwrap_or_default();
+        Some(CardAbilityElementV2 { id_gd, text })
+    };
+    let mut main_out = Vec::new();
+    let mut echo_out = Vec::new();
+    for l in lines {
+        let ab = CardAbilityV2 {
+            kind: if l.is_echo {
+                CardAbilityKind::Echo
+            } else {
+                CardAbilityKind::Main
+            },
+            line: l.line,
+            trigger: element(l.trigger),
+            condition: element(l.condition),
+            output: element(l.output),
+        };
+        if l.is_echo {
+            echo_out.push(ab);
+        } else {
+            main_out.push(ab);
+        }
+    }
+    main_out.extend(echo_out);
+    main_out
 }
 
 pub fn subtype_names_from_index(index: &UniquesIndex) -> BTreeMap<String, BTreeMap<String, String>> {
@@ -833,18 +799,9 @@ pub(crate) fn cards_from_indices(
     indices: &[u32],
     debug_bga_trigram: bool,
 ) -> QueryResult<Vec<CardV2>> {
-    let idgd_by_id: BTreeMap<u32, &IdGdCatalogEntry> = state
-        .idgd_catalog()
-        .entries
-        .iter()
-        .map(|e| (e.id_gd, e))
-        .collect();
-
     indices
         .iter()
-        .map(|&card_index| {
-            card_v2_from_index(state, card_index, &idgd_by_id, debug_bga_trigram)
-        })
+        .map(|&card_index| card_v2_from_index(state, card_index, debug_bga_trigram))
         .collect()
 }
 
@@ -883,24 +840,8 @@ pub(crate) fn page_cards_v2_sorted(
         return Ok((cards, next_cursor));
     }
 
-    let idgd_by_id: BTreeMap<u32, &IdGdCatalogEntry> = state
-        .idgd_catalog()
-        .entries
-        .iter()
-        .map(|e| (e.id_gd, e))
-        .collect();
-
     let indices = window_indices(bitmap, cursor, page, limit);
-
-    let mut out = Vec::with_capacity(indices.len());
-    for card_index in &indices {
-        out.push(card_v2_from_index(
-            state,
-            *card_index,
-            &idgd_by_id,
-            debug_bga_trigram,
-        )?);
-    }
+    let out = cards_from_indices(state, &indices, debug_bga_trigram)?;
 
     // The "there's more, here's where to resume" cursor only makes sense for the legacy scheme —
     // page-based pagination doesn't need it, the client just requests `page + 1` directly.
@@ -1116,19 +1057,6 @@ fn window_indices(
     it.take(limit).collect()
 }
 
-fn faction_from_code(code: u8) -> String {
-    match code {
-        1 => "AX",
-        2 => "BR",
-        3 => "LY",
-        4 => "MU",
-        5 => "OR",
-        6 => "YZ",
-        _ => "UN",
-    }
-    .to_string()
-}
-
 fn build_debug_bga_trigram(view: &index_core::compact::CompactCardView<'_>) -> String {
     let mut triplets: Vec<String> = Vec::new();
     for g in 0..3 {
@@ -1150,7 +1078,7 @@ fn format_tco_triplet([t, c, o]: [u16; 3]) -> Option<String> {
 }
 
 fn build_main_effect_localized(
-    idgd_by_id: &BTreeMap<u32, &IdGdCatalogEntry>,
+    state: &UniquesIndex,
     view: &index_core::compact::CompactCardView<'_>,
 ) -> BTreeMap<String, String> {
     let groups: [[u16; 3]; 3] = [
@@ -1166,7 +1094,7 @@ fn build_main_effect_localized(
             if id == 0 {
                 continue;
             }
-            if let Some(entry) = idgd_by_id.get(&(id as u32)) {
+            if let Some(entry) = state.idgd_entry(id as u32) {
                 for k in entry.translations.keys() {
                     locales.insert(k.clone(), ());
                 }
@@ -1178,7 +1106,7 @@ fn build_main_effect_localized(
     for locale in locales.keys() {
         let mut lines: Vec<String> = Vec::new();
         for [t, c, o] in groups {
-            if let Some(line) = build_effect_line_localized(idgd_by_id, [t, c, o], locale) {
+            if let Some(line) = build_effect_line_localized(state, [t, c, o], locale) {
                 lines.push(line);
             }
         }
@@ -1190,7 +1118,7 @@ fn build_main_effect_localized(
 }
 
 fn build_echo_effect_localized(
-    idgd_by_id: &BTreeMap<u32, &IdGdCatalogEntry>,
+    state: &UniquesIndex,
     view: &index_core::compact::CompactCardView<'_>,
 ) -> BTreeMap<String, String> {
     let [t, c, o] = view.echo_effect();
@@ -1201,7 +1129,7 @@ fn build_echo_effect_localized(
         if id == 0 {
             continue;
         }
-        if let Some(entry) = idgd_by_id.get(&(id as u32)) {
+        if let Some(entry) = state.idgd_entry(id as u32) {
             for k in entry.translations.keys() {
                 locales.insert(k.clone(), ());
             }
@@ -1210,7 +1138,7 @@ fn build_echo_effect_localized(
 
     let mut out = BTreeMap::new();
     for locale in locales.keys() {
-        if let Some(line) = build_effect_line_localized(idgd_by_id, [t, c, o], locale) {
+        if let Some(line) = build_effect_line_localized(state, [t, c, o], locale) {
             out.insert(locale.clone(), line);
         }
     }
@@ -1218,7 +1146,7 @@ fn build_echo_effect_localized(
 }
 
 fn build_effect_line_localized(
-    idgd_by_id: &BTreeMap<u32, &IdGdCatalogEntry>,
+    state: &UniquesIndex,
     [t, c, o]: [u16; 3],
     locale: &str,
 ) -> Option<String> {
@@ -1230,8 +1158,8 @@ fn build_effect_line_localized(
         if id == 0 {
             continue;
         }
-        let text = idgd_by_id
-            .get(&(id as u32))
+        let text = state
+            .idgd_entry(id as u32)
             .map(|entry| pick_translation(&entry.translations, locale))
             .unwrap_or_default();
         if !text.is_empty() {
@@ -1261,7 +1189,6 @@ fn pick_translation(map: &BTreeMap<String, index_core::card::LocaleText>, locale
 /// the alias map so they match `/api/v2/effects` and the `effect[N][t|c|o]` filters.
 fn build_abilities(
     state: &UniquesIndex,
-    idgd_by_id: &BTreeMap<u32, &IdGdCatalogEntry>,
     view: &index_core::compact::CompactCardView<'_>,
 ) -> Vec<CardAbilityV2> {
     let element = |id: u16| -> Option<CardAbilityElementV2> {
@@ -1269,8 +1196,8 @@ fn build_abilities(
             return None;
         }
         let id_gd = state.resolve_id_gd(id as u32);
-        let text = idgd_by_id
-            .get(&id_gd)
+        let text = state
+            .idgd_entry(id_gd)
             .map(|entry| {
                 entry
                     .translations
@@ -1810,6 +1737,7 @@ mod tests {
                 status: FormatLoadStatus::Ready {
                     negated: false,
                     bitmap: allowed,
+                    nonunique_bitmap: RoaringBitmap::new(),
                 },
             },
         );
@@ -1848,6 +1776,7 @@ mod tests {
                 status: FormatLoadStatus::Ready {
                     negated: true,
                     bitmap: excluded,
+                    nonunique_bitmap: RoaringBitmap::new(),
                 },
             },
         );
@@ -1914,6 +1843,7 @@ mod tests {
                 status: FormatLoadStatus::Ready {
                     negated: false,
                     bitmap: allowed,
+                    nonunique_bitmap: RoaringBitmap::new(),
                 },
             },
         );
@@ -2289,8 +2219,12 @@ mod tests {
         assert_eq!(bmp.len(), state.index().manifest().total_bit_span as u64);
     }
 
-    fn idgd_text_entry(id_gd: u32, element_type: &str, texts: &[(&str, &str)]) -> IdGdCatalogEntry {
-        IdGdCatalogEntry {
+    fn idgd_text_entry(
+        id_gd: u32,
+        element_type: &str,
+        texts: &[(&str, &str)],
+    ) -> index_core::idgd_catalog::IdGdCatalogEntry {
+        index_core::idgd_catalog::IdGdCatalogEntry {
             id_gd,
             card_count: 1,
             bitmap_bytes: 0,
@@ -2322,17 +2256,27 @@ mod tests {
     fn abilities_serialized_per_line_with_tco_elements() {
         let state = test_state();
         let index = state.index();
+        drop(state);
+        let mut index = std::sync::Arc::try_unwrap(index)
+            .ok()
+            .expect("fresh test index");
         // Fixture card 5: main M1 = [24 T, 191 C, 90 O], echo = [24 T, -, 42 O].
-        let t24 = idgd_text_entry(24, "TRIGGER", &[("en_US", "{J}"), ("fr_FR", "{J}")]);
-        let c191 = idgd_text_entry(191, "CONDITION", &[("en_US", "If you have a Plant:"), ("fr_FR", "")]);
-        let o90 = idgd_text_entry(90, "OUTPUT", &[("en_US", "Draw a card.")]);
-        let mut idgd_by_id: BTreeMap<u32, &IdGdCatalogEntry> =
-            index.idgd_catalog().entries.iter().map(|e| (e.id_gd, e)).collect();
-        idgd_by_id.insert(24, &t24);
-        idgd_by_id.insert(191, &c191);
-        idgd_by_id.insert(90, &o90);
+        for entry in [
+            idgd_text_entry(24, "TRIGGER", &[("en_US", "{J}"), ("fr_FR", "{J}")]),
+            idgd_text_entry(191, "CONDITION", &[("en_US", "If you have a Plant:"), ("fr_FR", "")]),
+            idgd_text_entry(90, "OUTPUT", &[("en_US", "Draw a card.")]),
+        ] {
+            let id_gd = entry.id_gd;
+            if let Some(&pos) = index.idgd_by_id.get(&id_gd) {
+                index.idgd_catalog.entries[pos] = entry;
+            } else {
+                let pos = index.idgd_catalog.entries.len();
+                index.idgd_catalog.entries.push(entry);
+                index.idgd_by_id.insert(id_gd, pos);
+            }
+        }
 
-        let card = card_v2_from_index(index.as_ref(), 5, &idgd_by_id, false).unwrap();
+        let card = card_v2_from_index(&index, 5, false).unwrap();
         let json = serde_json::to_value(&card).unwrap();
         assert_eq!(
             json["abilities"],
@@ -2364,10 +2308,8 @@ mod tests {
     fn abilities_absent_when_card_has_no_effect_ids() {
         let state = test_state();
         let index = state.index();
-        let idgd_by_id: BTreeMap<u32, &IdGdCatalogEntry> =
-            index.idgd_catalog().entries.iter().map(|e| (e.id_gd, e)).collect();
         // Fixture card 7 has an all-zero compact record.
-        let card = card_v2_from_index(index.as_ref(), 7, &idgd_by_id, false).unwrap();
+        let card = card_v2_from_index(index.as_ref(), 7, false).unwrap();
         assert!(card.abilities.is_empty());
         let json = serde_json::to_value(&card).unwrap();
         assert!(json.get("abilities").is_none());

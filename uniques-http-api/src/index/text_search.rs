@@ -67,7 +67,6 @@ impl SearchQuery {
         (!terms.is_empty()).then_some(Self { terms })
     }
 
-    #[cfg(test)]
     pub fn terms(&self) -> &[String] {
         &self.terms
     }

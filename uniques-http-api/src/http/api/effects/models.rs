@@ -21,6 +21,10 @@ pub struct EffectPartWithRegion {
     pub is_main: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub duplicated_id_gd: Vec<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spell_only: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub card_types: Vec<String>,
 }
 
 /// `GET /api/v2/effects/filtered` response body.

@@ -1,17 +1,11 @@
-use std::collections::BTreeMap;
-
 use axum::extract::{Path, RawQuery, State};
 use axum::Json;
 
-use index_core::idgd_catalog::IdGdCatalogEntry;
-
 use crate::http::api::cards::parse::{parse_query_multimap, parse_request, QueryMultiMap};
-use crate::http::api::error::{bad_request, map_query_error, not_found, ApiResult};
+use crate::http::api::error::{map_query_error, ApiResult};
 use crate::http::ServerState;
 use crate::index::{
-    build_bitmap, card_v2_from_index, cards_from_indices, enrich_unique_card_v2,
-    families_from_bitmap, nonunique_card_v2, page_cards_v2_sorted, subtype_names_from_index,
-    CardResolveError,
+    build_bitmap, cards_from_indices, families_from_bitmap, page_cards_v2_sorted,
 };
 use super::{CardV2, CardsIter, CardsResponse};
 
@@ -24,48 +18,7 @@ pub async fn get_card_v2(
     let debug_bga_trigram = params.contains_key("debug_bga_trigram");
 
     let snapshot = server.app.snapshot();
-    let index = snapshot.index.as_ref();
-
-    if let Some(nu) = snapshot.nonunique.as_deref() {
-        if let Some(print_index) = nu.resolve_reference(&reference) {
-            let subtype_names = subtype_names_from_index(index);
-            if let Some(card) = nonunique_card_v2(nu, print_index, &snapshot.families, &subtype_names)
-            {
-                return Ok(Json(card));
-            }
-        }
-    }
-
-    let card_index = index.resolve_card_index(&reference).map_err(|e| match e {
-        CardResolveError::BadRequest { message } => bad_request(message),
-        CardResolveError::NotFound { message } => not_found(message),
-    })?;
-
-    let view = index.card_view(card_index).ok_or_else(|| {
-        not_found(format!("missing compact record for card_index {card_index}"))
-    })?;
-
-    if view.faction_code() == 0 {
-        return Err(not_found(format!("card not indexed at {reference}")));
-    }
-
-    let idgd_by_id: BTreeMap<u32, &IdGdCatalogEntry> = index
-        .idgd_catalog()
-        .entries
-        .iter()
-        .map(|e| (e.id_gd, e))
-        .collect();
-
-    let mut card = card_v2_from_index(index, card_index, &idgd_by_id, debug_bga_trigram)
-        .map_err(map_query_error)?;
-    enrich_unique_card_v2(
-        &mut card,
-        card_index,
-        index,
-        snapshot.nonunique.as_deref(),
-        snapshot.formats.as_ref(),
-    );
-
+    let card = snapshot.card_by_reference(&reference, debug_bga_trigram)?;
     Ok(Json(card))
 }
 

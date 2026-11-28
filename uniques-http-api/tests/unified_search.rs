@@ -741,7 +741,7 @@ fn set_effect_group(idx_dir: &Path, group: usize, tco: [u16; 3]) {
 }
 
 #[tokio::test]
-async fn unique_cards_expose_abilities_nonuniques_do_not() {
+async fn unique_and_nonunique_cards_expose_abilities() {
     // minimal_index idgd catalog: 1 = TRIGGER "{R}", 2 = CONDITION, 3 = OUTPUT "[AFTER_YOU]."
     let (_tmp, state) = build_unified_test_server_patched(|dir| {
         set_effect_group(dir, 0, [1, 2, 3]);
@@ -774,14 +774,293 @@ async fn unique_cards_expose_abilities_nonuniques_do_not() {
     assert_eq!(res["cards"][0]["reference"], "ALT_TEST_B_AX_04_U_1");
     assert_eq!(res["cards"][0]["abilities"], expected);
 
-    // Non-unique prints carry no per-line idGd data in the index: no `abilities` key at all.
-    let (status, hero) = get_json(&state, "/api/v2/card/ALT_CORE_B_AX_02_C").await;
+    // Non-unique prints WITH structured positive idGd fragments now expose `abilities`.
+    let (status, alpha_c) = get_json(&state, "/api/v2/card/ALT_CORE_B_AX_02_C").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        alpha_c["abilities"],
+        serde_json::json!([
+            {
+                "kind": "main",
+                "line": 1,
+                "trigger": null,
+                "condition": null,
+                "output": { "idGd": 1, "text": { "en_US": "[FLEETING].", "fr_FR": "[FLEETING]." } }
+            }
+        ])
+    );
+
+    // Non-unique prints WITHOUT effects (e.g. Hero) omit the `abilities` key.
+    let (status, hero) = get_json(&state, "/api/v2/card/ALT_CORE_B_AX_01_C").await;
     assert_eq!(status, 200);
     assert!(hero.get("abilities").is_none());
-    let (_, commons) = get_json(&state, "/api/v2/search?rarity[]=COMMON").await;
-    for card in commons["cards"].as_array().unwrap() {
-        assert!(card.get("abilities").is_none());
+}
+
+#[tokio::test]
+async fn unified_effects_endpoint_filters_and_formats_work_across_both_branches() {
+    let root_dir = std::env::temp_dir().join(format!("unified_full_{}", uuid::Uuid::new_v4()));
+    let _guard = TempGuard(root_dir.clone());
+    let idx_dir = root_dir.join("unified_index");
+    copy_dir_recursive(Path::new(FIXTURE_INDEX), &idx_dir);
+    // Give the unique card M1 = (T=1, C=2, O=3) and populate id_gd bitmaps for unique card_index 0.
+    set_effect_group(&idx_dir, 0, [1, 2, 3]);
+    let u_id_gd_dir = idx_dir.join("id_gd");
+    fs::create_dir_all(&u_id_gd_dir).unwrap();
+    let mut b0 = roaring::RoaringBitmap::new();
+    b0.insert(0);
+    let mut b0_bytes = Vec::new();
+    b0.serialize_into(&mut b0_bytes).unwrap();
+    for name in ["1.roar", "1_m1.roar", "2.roar", "2_m1.roar", "3.roar", "3_m1.roar"] {
+        fs::write(u_id_gd_dir.join(name), &b0_bytes).unwrap();
     }
+    // Mark id_gd entries as having non-zero bitmap_bytes in unique idgd_catalog.json so loader loads them.
+    let cat_path = idx_dir.join("idgd_catalog.json");
+    let mut cat_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cat_path).unwrap()).unwrap();
+    for entry in cat_json["entries"].as_array_mut().unwrap() {
+        entry["bitmap_bytes"] = serde_json::json!(b0_bytes.len());
+        let id = entry["id_gd"].as_u64().unwrap();
+        if id == 3 {
+            // Simulate a collapsed duplicate idGd (alias 95 -> canonical 3) referenced by a non-unique!
+            entry["duplicated_id_gd"] = serde_json::json!([95]);
+        }
+        entry["m1"] = serde_json::json!({
+            "card_count": 1,
+            "bitmap_bytes": b0_bytes.len(),
+            "bitmap_file": format!("{id}_m1.roar")
+        });
+    }
+    fs::write(&cat_path, serde_json::to_string_pretty(&cat_json).unwrap()).unwrap();
+
+    // Build CardsData fixture with shared positive Trigger/Condition/Output AND non-unique-only Output 1001.
+    let cardsdata = root_dir.join("cardsdata");
+    let csv_root = cardsdata.join("data").join("csv");
+    let core_dir = csv_root.join("NonUnique").join("CORE");
+    let alize_dir = csv_root.join("NonUnique").join("ALIZE");
+    fs::create_dir_all(&core_dir).unwrap();
+    fs::create_dir_all(&alize_dir).unwrap();
+    fs::write(
+        csv_root.join("Sets.csv"),
+        "Reference,Name_en_US,Name_fr_FR,Name_es_ES,Name_de_DE,Name_it_IT\n\
+CORE,Beyond the Gates,Au-dela des Portes,,,\n\
+ALIZE,Trial by Frost,L'Epreuve du Givre,,,\n",
+    )
+    .unwrap();
+    fs::write(csv_root.join("Artists.csv"), "Id,NickName\n7,Test Artist\n").unwrap();
+    fs::write(
+        csv_root.join("CardTypes.csv"),
+        "Reference,Name_en_US,Name_fr_FR,Name_es_ES,Name_de_DE,Name_it_IT\nCHARACTER,Character,Personnage,,,\nSPELL,Spell,Sort,,,\n",
+    )
+    .unwrap();
+    fs::write(
+        csv_root.join("CardFamilies.csv"),
+        "Id,Reference,CardTypeReference,Name_en_US,Name_fr_FR,Name_es_ES,Name_de_DE,Name_it_IT\n\
+101,FAM_ALPHA,CHARACTER,Alpha Construct,Automate Alpha,,,\n\
+102,FAM_SPELL,SPELL,Frost Bolt,Eclair de Givre,,,\n",
+    )
+    .unwrap();
+    fs::write(csv_root.join("CardFamilySubTypes.csv"), "CardFamilyId,CardSubTypeReference\n").unwrap();
+    fs::write(
+        csv_root.join("Keywords.csv"),
+        "Reference,DisplayWeb_en_US,DisplayWeb_fr_FR,DisplayWeb_es_ES,DisplayWeb_de_DE,DisplayWeb_it_IT\nAFTER_YOU,After You,Après Vous,,,\n",
+    )
+    .unwrap();
+    fs::write(
+        csv_root.join("EffectFragments.csv"),
+        "IdGd,Type,KeywordReference,Slot,Text_en_US,Text_fr_FR,Text_es_ES,Text_de_DE,Text_it_IT\n\
+1,Trigger,,MAIN_EFFECT,{R},{R},,,\n\
+2,Condition,,,If you control two or more Plants:,Si vous controlez deux Plantes:,,,\n\
+3,Output,AFTER_YOU,,[AFTER_YOU].,[AFTER_YOU].,,,\n\
+95,Output,AFTER_YOU,,[AFTER_YOU].,[AFTER_YOU].,,,\n\
+192,Trigger,,ECHO_EFFECT,{D} :,{D} :,,,\n\
+1001,Output,,,Draw two cards.,Piochez deux cartes.,,,\n",
+    )
+    .unwrap();
+    fs::write(csv_root.join("Factions.csv"), "Reference,Name_en_US\nAX,Axiom\nYZ,Yzmir\n").unwrap();
+    fs::write(csv_root.join("CardSubTypes.csv"), "Reference,Name_en_US\n").unwrap();
+    fs::write(
+        core_dir.join("NonUniquePrints.csv"),
+        "Id,Reference,CardFamilyId,SetReference,FactionReference,RarityReference,ProductReference,IsSerialized,ArtistId,CollectorNumberFormatted,MAIN_COST,RECALL_COST,MOUNTAIN_POWER,OCEAN_POWER,FOREST_POWER,PERMANENT,RESERVE,IsBanned,IsErrated,IsSuspended\n\
+1,ALT_CORE_B_AX_02_C,101,CORE,AX,C,B,0,7,BTG-002-C,3,3,2,2,2,,,0,0,0\n",
+    )
+    .unwrap();
+    // Reference collapsed alias 95 (instead of canonical 3) to verify alias expansion on non-uniques!
+    fs::write(
+        core_dir.join("PrintEffectFragments.csv"),
+        "PrintId,DisplayIndex,TriggerId,ConditionId,EffectId\n\
+1,0,1,2,95\n",
+    )
+    .unwrap();
+    fs::write(
+        alize_dir.join("NonUniquePrints.csv"),
+        "Id,Reference,CardFamilyId,SetReference,FactionReference,RarityReference,ProductReference,IsSerialized,ArtistId,CollectorNumberFormatted,MAIN_COST,RECALL_COST,MOUNTAIN_POWER,OCEAN_POWER,FOREST_POWER,PERMANENT,RESERVE,IsBanned,IsErrated,IsSuspended\n\
+2,ALT_ALIZE_B_YZ_11_C,102,ALIZE,YZ,C,B,0,7,TBF-011-C,2,2,,,,,,0,0,0\n",
+    )
+    .unwrap();
+    fs::write(
+        alize_dir.join("PrintEffectFragments.csv"),
+        "PrintId,DisplayIndex,TriggerId,ConditionId,EffectId\n\
+2,0,192,,1001\n",
+    )
+    .unwrap();
+
+    build_nonunique_index(
+        &cardsdata,
+        &["CORE".to_string(), "ALIZE".to_string()],
+        &idx_dir,
+    )
+    .unwrap();
+
+    // Formats directory with an exclude format banning CORE, a mixed include format, and a
+    // unique-only include format (like Frontier) that restricts Uniques without hiding non-Uniques.
+    let formats_dir = root_dir.join("formats");
+    fs::create_dir_all(&formats_dir).unwrap();
+    fs::write(
+        formats_dir.join("manifest.json"),
+        r#"[
+  {"id":"frontier_only","path":"frontier_only.json","version":1},
+  {"id":"mixed_inc","path":"mixed_inc.json","version":1},
+  {"id":"no_core","path":"no_core.json","version":1}
+]"#,
+    )
+    .unwrap();
+    fs::write(
+        formats_dir.join("frontier_only.json"),
+        r#"{"id":"frontier_only","version":1,"included_refs":["ALT_TEST_B_AX_04_U_1"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        formats_dir.join("mixed_inc.json"),
+        r#"{"id":"mixed_inc","version":1,"included_refs":["ALT_TEST_B_AX_04_U_1","ALT_CORE_B_AX_02_C"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        formats_dir.join("no_core.json"),
+        r#"{"id":"no_core","version":1,"excluded_sets":["CORE"]}"#,
+    )
+    .unwrap();
+
+    let mut settings = ServerState::for_test(load_index(Path::new(FIXTURE_INDEX)).unwrap())
+        .settings
+        .as_ref()
+        .clone();
+    settings.index.path = Some(idx_dir.to_string_lossy().into_owned());
+    settings.formats = Some(uniques_http_api::FormatsSettings {
+        source: uniques_http_api::FormatsSourceConfig::Disk {
+            path: formats_dir.to_string_lossy().into_owned(),
+        },
+        reload_interval_secs: 0,
+    });
+    let app_state = load_app_state(&settings).expect("load unified app_state with formats");
+    let state = ServerState {
+        app: std::sync::Arc::new(app_state),
+        settings: std::sync::Arc::new(settings),
+    };
+
+    // 1. /api/v2/effects merges unique (1, 2, 3) and non-unique-only (192, 1001) entries.
+    let (status, eff_list) = get_json(&state, "/api/v2/effects").await;
+    assert_eq!(status, 200);
+    let trigger_ids: Vec<u64> = eff_list["triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["idGd"].as_u64().unwrap())
+        .collect();
+    let output_ids: Vec<u64> = eff_list["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["idGd"].as_u64().unwrap())
+        .collect();
+    assert!(trigger_ids.contains(&1) && trigger_ids.contains(&192));
+    assert!(output_ids.contains(&3) && output_ids.contains(&1001));
+    // Output 1001 & trigger 192 only appear on SPELL non-uniques -> spellOnly: true;
+    // Output 3 & trigger 1 appear on Characters/Uniques -> spellOnly omitted/false.
+    let out_1001 = eff_list["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["idGd"] == 1001)
+        .unwrap();
+    let out_3 = eff_list["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["idGd"] == 3)
+        .unwrap();
+    assert_eq!(out_1001["spellOnly"], true);
+    assert!(out_3.get("spellOnly").is_none());
+
+    // 2. Structured effect[0][t]=1&effect[0][o]=3 matches BOTH the unique AND the non-unique card!
+    let (status, res) = get_json(&state, "/api/v2/search?effect[0][t]=1&effect[0][o]=3").await;
+    assert_eq!(status, 200);
+    assert_eq!(res["iter"]["total"], 2);
+    let kinds: Vec<&str> = res["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"unique") && kinds.contains(&"nonunique"));
+
+    // 3. Support filter support[t]=192&support[o]=1001 matches the non-unique Spell with echo ability.
+    let (status, res) = get_json(&state, "/api/v2/search?support[t]=192&support[o]=1001").await;
+    assert_eq!(status, 200);
+    assert_eq!(res["iter"]["total"], 1);
+    assert_eq!(res["cards"][0]["reference"], "ALT_ALIZE_B_YZ_11_C");
+
+    // 4. /api/v2/effects/filtered respects rarity[] and cardType[] across non-uniques too.
+    let (status, filt) =
+        get_json(&state, "/api/v2/effects/filtered?editing=output:support&cardType[]=SPELL").await;
+    assert_eq!(status, 200);
+    assert_eq!(filt["idGds"], serde_json::json!([1001]));
+
+    // 5. effectText and q match UNIQUE cards via their effect text AND localized keyword expansion!
+    let (status, res) = get_json(&state, "/api/v2/search?effectText=plants").await;
+    assert_eq!(status, 200);
+    assert_eq!(res["iter"]["total"], 2);
+    let (status, res) = get_json(&state, "/api/v2/search?effectText=apres%20vous").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        res["iter"]["total"], 2,
+        "French keyword display 'Après Vous' must match both unique and non-unique cards"
+    );
+    let (status, res) = get_json(&state, "/api/v2/search?q=plants&rarity[]=UNIQUE").await;
+    assert_eq!(status, 200);
+    assert_eq!(res["iter"]["total"], 1);
+    assert_eq!(res["cards"][0]["reference"], "ALT_TEST_B_AX_04_U_1");
+
+    // 6. format= applies to BOTH uniques and non-uniques, except unique-only Include formats
+    // (like Frontier) which restrict Uniques while keeping non-Uniques available normally!
+    let (status, res) = get_json(&state, "/api/v2/search?format=frontier_only").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        res["iter"]["total"], 3,
+        "unique-only include format (frontier) must keep non-unique cards available normally"
+    );
+    let (status, res) = get_json(&state, "/api/v2/search?format=frontier_only&rarity[]=COMMON").await;
+    assert_eq!(status, 200);
+    assert_eq!(res["iter"]["total"], 2);
+    let (status, res) = get_json(&state, "/api/v2/search?format=mixed_inc").await;
+    assert_eq!(status, 200);
+    assert_eq!(res["iter"]["total"], 2);
+    let (status, res) = get_json(&state, "/api/v2/search?format=no_core&rarity[]=COMMON").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        res["iter"]["total"], 1,
+        "CORE non-uniques excluded by no_core format while ALIZE remains"
+    );
+    assert_eq!(res["cards"][0]["reference"], "ALT_ALIZE_B_YZ_11_C");
+    let (status, card) = get_json(&state, "/api/v2/card/ALT_CORE_B_AX_02_C").await;
+    assert_eq!(status, 200);
+    assert_eq!(card["legalFormats"], serde_json::json!(["frontier_only", "mixed_inc"]));
+    assert_eq!(
+        card["abilities"][0]["output"]["idGd"], 3,
+        "non-unique ability referencing collapsed alias 95 must expose canonical idGd 3"
+    );
+    let (status, card_alize) = get_json(&state, "/api/v2/card/ALT_ALIZE_B_YZ_11_C").await;
+    assert_eq!(status, 200);
+    assert_eq!(card_alize["legalFormats"], serde_json::json!(["frontier_only", "no_core"]));
 }
 
 #[tokio::test]

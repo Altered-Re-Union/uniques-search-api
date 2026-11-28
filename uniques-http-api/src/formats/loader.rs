@@ -4,6 +4,7 @@ use std::path::Path;
 use roaring::RoaringBitmap;
 
 use crate::config::FormatsSettings;
+use crate::index::loader::NonUniqueQueryIndex;
 use crate::index::UniquesIndex;
 
 use super::build::{load_single_format, load_single_format_from_text};
@@ -15,8 +16,24 @@ pub enum FormatLoadStatus {
     Ready {
         negated: bool,
         bitmap: RoaringBitmap,
+        nonunique_bitmap: RoaringBitmap,
     },
     Failed,
+}
+
+impl FormatLoadStatus {
+    /// True when an Include format (`negated == false`) lists only Uniques (e.g. `frontier`),
+    /// meaning it restricts Uniques while non-Unique cards remain available normally.
+    pub fn is_unique_only_include(&self) -> bool {
+        matches!(
+            self,
+            FormatLoadStatus::Ready {
+                negated: false,
+                bitmap,
+                nonunique_bitmap,
+            } if nonunique_bitmap.is_empty() && !bitmap.is_empty()
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +48,12 @@ pub struct FormatIndex {
     pub manifest_versions: BTreeMap<String, u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatResolveError {
+    Unknown(String),
+    Failed,
+}
+
 impl FormatIndex {
     pub fn empty() -> Self {
         Self::default()
@@ -39,22 +62,134 @@ impl FormatIndex {
     pub fn get(&self, id: &str) -> Option<&LoadedFormat> {
         self.by_id.get(id)
     }
+
+    /// Validate that `id` is a loaded, ready format when formats are enabled.
+    pub fn validate(&self, id: &str, enabled: bool) -> Result<(), FormatResolveError> {
+        if !enabled {
+            return Err(FormatResolveError::Unknown(id.to_string()));
+        }
+        let Some(loaded) = self.by_id.get(id) else {
+            return Err(FormatResolveError::Unknown(id.to_string()));
+        };
+        match &loaded.status {
+            FormatLoadStatus::Ready { .. } => Ok(()),
+            FormatLoadStatus::Failed => Err(FormatResolveError::Failed),
+        }
+    }
+
+    /// Apply format `id` in-place to a unique-branch result bitmap.
+    pub fn apply_to_unique(&self, id: &str, bitmap: &mut RoaringBitmap) {
+        let Some(loaded) = self.by_id.get(id) else {
+            return;
+        };
+        match &loaded.status {
+            FormatLoadStatus::Ready {
+                negated: true,
+                bitmap: excluded,
+                ..
+            } => *bitmap -= excluded,
+            FormatLoadStatus::Ready {
+                negated: false,
+                bitmap: allowed,
+                ..
+            } => *bitmap &= allowed,
+            FormatLoadStatus::Failed => {}
+        }
+    }
+
+    /// Apply format `id` in-place to a non-unique-branch result bitmap. Unique-only Include
+    /// formats (e.g. `frontier`) leave non-unique prints unfiltered.
+    pub fn apply_to_nonunique(&self, id: &str, bitmap: &mut RoaringBitmap) {
+        let Some(loaded) = self.by_id.get(id) else {
+            return;
+        };
+        if loaded.status.is_unique_only_include() {
+            return;
+        }
+        match &loaded.status {
+            FormatLoadStatus::Ready {
+                negated: true,
+                nonunique_bitmap,
+                ..
+            } => *bitmap -= nonunique_bitmap,
+            FormatLoadStatus::Ready {
+                negated: false,
+                nonunique_bitmap,
+                ..
+            } => *bitmap &= nonunique_bitmap,
+            FormatLoadStatus::Failed => {}
+        }
+    }
+
+    /// Legal format IDs for a unique card index, or `None` when no formats are configured.
+    pub fn unique_legal_formats(&self, card_index: u32) -> Option<Vec<String>> {
+        if self.by_id.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (id, loaded) in &self.by_id {
+            if let FormatLoadStatus::Ready {
+                negated, bitmap, ..
+            } = &loaded.status
+            {
+                let matches = bitmap.contains(card_index);
+                if (*negated && !matches) || (!*negated && matches) {
+                    out.push(id.clone());
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Legal format IDs for a non-unique print index, or `None` when no formats are configured.
+    pub fn nonunique_legal_formats(&self, print_index: u32) -> Option<Vec<String>> {
+        if self.by_id.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (id, loaded) in &self.by_id {
+            if loaded.status.is_unique_only_include() {
+                out.push(id.clone());
+                continue;
+            }
+            if let FormatLoadStatus::Ready {
+                negated,
+                nonunique_bitmap,
+                ..
+            } = &loaded.status
+            {
+                let matches = nonunique_bitmap.contains(print_index);
+                if (*negated && !matches) || (!*negated && matches) {
+                    out.push(id.clone());
+                }
+            }
+        }
+        Some(out)
+    }
 }
 
 struct LoadedEntryResult {
     id: String,
     version: u64,
-    outcome: Result<(bool, RoaringBitmap), String>,
+    outcome: Result<(bool, RoaringBitmap, RoaringBitmap), String>,
 }
 
-pub fn load_format_index(index: &UniquesIndex, settings: &FormatsSettings) -> FormatIndex {
-    load_format_index_from_source(index, &FormatsSource::from_config(&settings.source))
+pub fn load_format_index(
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+    settings: &FormatsSettings,
+) -> FormatIndex {
+    load_format_index_from_source(index, nonunique, &FormatsSource::from_config(&settings.source))
 }
 
-fn load_format_index_from_source(index: &UniquesIndex, source: &FormatsSource) -> FormatIndex {
+fn load_format_index_from_source(
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+    source: &FormatsSource,
+) -> FormatIndex {
     match source {
-        FormatsSource::Disk(disk) => load_format_index_from_root(index, disk.root()),
-        FormatsSource::Http(http) => load_format_index_from_http(index, http),
+        FormatsSource::Disk(disk) => load_format_index_from_root(index, nonunique, disk.root()),
+        FormatsSource::Http(http) => load_format_index_from_http(index, nonunique, http),
     }
 }
 
@@ -75,7 +210,11 @@ fn read_manifest_entries_from_disk(root: &Path) -> Option<Vec<FormatsManifestEnt
     serde_json::from_str(&text).ok()
 }
 
-fn load_format_index_from_root(index: &UniquesIndex, root: &Path) -> FormatIndex {
+fn load_format_index_from_root(
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+    root: &Path,
+) -> FormatIndex {
     let manifest_path = root.join(MANIFEST_FILE);
     let entries: Vec<FormatsManifestEntry> = match std::fs::read_to_string(&manifest_path) {
         Ok(text) => match serde_json::from_str(&text) {
@@ -105,7 +244,7 @@ fn load_format_index_from_root(index: &UniquesIndex, root: &Path) -> FormatIndex
                 let root = root.to_path_buf();
                 s.spawn(move || {
                     let file_path = root.join(&entry.path);
-                    let outcome = load_single_format(index, &entry, &file_path)
+                    let outcome = load_single_format(index, nonunique, &entry, &file_path)
                         .map_err(|e| e.to_string());
                     LoadedEntryResult {
                         id: entry.id,
@@ -150,7 +289,11 @@ fn fetch_manifest(
     serde_json::from_str(&text).map_err(|e| format!("parse {url}: {e}"))
 }
 
-fn load_format_index_from_http(index: &UniquesIndex, http: &HttpFormatsSource) -> FormatIndex {
+fn load_format_index_from_http(
+    index: &UniquesIndex,
+    nonunique: Option<&NonUniqueQueryIndex>,
+    http: &HttpFormatsSource,
+) -> FormatIndex {
     let client = match http_client() {
         Ok(client) => client,
         Err(e) => {
@@ -176,7 +319,7 @@ fn load_format_index_from_http(index: &UniquesIndex, http: &HttpFormatsSource) -
                 let url = http.file_url(&entry.path);
                 s.spawn(move || {
                     let outcome = fetch_text(&client, &url).and_then(|text| {
-                        load_single_format_from_text(index, &entry, &text, &url)
+                        load_single_format_from_text(index, nonunique, &entry, &text, &url)
                             .map_err(|e| e.to_string())
                     });
                     LoadedEntryResult {
@@ -218,12 +361,16 @@ fn merge_loaded_results(results: Vec<LoadedEntryResult>) -> FormatIndex {
         }
 
         match result.outcome {
-            Ok((negated, bitmap)) => {
+            Ok((negated, bitmap, nonunique_bitmap)) => {
                 by_id.insert(
                     result.id.clone(),
                     LoadedFormat {
                         id: result.id,
-                        status: FormatLoadStatus::Ready { negated, bitmap },
+                        status: FormatLoadStatus::Ready {
+                            negated,
+                            bitmap,
+                            nonunique_bitmap,
+                        },
                     },
                 );
             }
@@ -248,22 +395,11 @@ fn merge_loaded_results(results: Vec<LoadedEntryResult>) -> FormatIndex {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use axum::body::Bytes;
     use index_core::catalog::{Catalog, FamilyEntry, FamilySet};
-    use index_core::idgd_catalog::IdGdCatalog;
-    use index_core::idgd_collapse::IdGdAliasMap;
 
     use crate::config::{FormatsSettings, FormatsSourceConfig};
-    use crate::index::loader::{
-        build_collector_number_lookup_index, build_family_lookup_index, build_family_span_groups,
-        build_name_search_index, build_set_bitmaps, FactionsSummary, IndexManifest, StatsSummary,
-        SET_CORE,
-    };
+    use crate::index::loader::SET_CORE;
     use crate::index::UniquesIndex;
 
     use super::*;
@@ -294,61 +430,9 @@ mod tests {
             }],
             total_bit_span: 2,
         };
-        let set_bitmaps = build_set_bitmaps(&catalog);
-        UniquesIndex {
-            index_dir: PathBuf::from("/test"),
-            catalog: catalog.clone(),
-            manifest: IndexManifest {
-                version: 1,
-                set: "TEST".to_string(),
-                kind: None,
-                built_at_secs: 0,
-                card_count: 2,
-                id_gd_count: 0,
-                total_bit_span: 2,
-                family_count: 1,
-            },
-            idgd_catalog: IdGdCatalog {
-                set: "TEST".to_string(),
-                entries: vec![],
-            },
-            id_gd_aliases: IdGdAliasMap::default(),
-            stats_summary: StatsSummary {
-                version: 1,
-                set: "TEST".to_string(),
-                total_cards_indexed: 2,
-                fields: vec![],
-            },
-            factions_summary: FactionsSummary {
-                version: 1,
-                set: "TEST".to_string(),
-                total_cards_indexed: 2,
-                source: String::new(),
-                factions: vec![],
-                unknown_count: 0,
-                bitmap_dir: String::new(),
-            },
-            cards: vec![],
-            id_gd_whole: BTreeMap::new(),
-            id_gd_per_line: BTreeMap::new(),
-            stats: BTreeMap::new(),
-            factions: BTreeMap::new(),
-            set_bitmaps,
-            cost_relations: Default::default(),
-            subtype_bitmaps: BTreeMap::new(),
-            no_effect_bitmap: Default::default(),
-            banned: RoaringBitmap::new(),
-            errated: RoaringBitmap::new(),
-            suspended: RoaringBitmap::new(),
-            name_search_index: build_name_search_index(&catalog),
-            family_lookup_index: build_family_lookup_index(&catalog),
-            family_span_groups: build_family_span_groups(&catalog),
-            family_sort_index: Default::default(),
-            collector_number_lookup_index: build_collector_number_lookup_index(&catalog),
-            present_cards: RoaringBitmap::from_iter(0..catalog.total_bit_span),
-            effects_body: Arc::new(Bytes::from_static(b"[]")),
-            artist_credits: Default::default(),
-        }
+        let mut idx = UniquesIndex::minimal_for_test(catalog, 0);
+        idx.present_cards = RoaringBitmap::from_iter(0..idx.catalog.total_bit_span);
+        idx
     }
 
     fn formats_settings(root: &std::path::Path) -> FormatsSettings {
@@ -384,7 +468,7 @@ mod tests {
         .unwrap();
 
         let index = test_index();
-        let loaded = load_format_index(&index, &formats_settings(&dir));
+        let loaded = load_format_index(&index, None, &formats_settings(&dir));
         assert_eq!(loaded.by_id.len(), 2);
         assert!(matches!(
             loaded.get("std").unwrap().status,
@@ -411,7 +495,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_format_index(&test_index(), &formats_settings(&dir));
+        let loaded = load_format_index(&test_index(), None, &formats_settings(&dir));
         assert!(matches!(
             loaded.get("std").unwrap().status,
             FormatLoadStatus::Failed
@@ -433,7 +517,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_format_index(&test_index(), &formats_settings(&dir));
+        let loaded = load_format_index(&test_index(), None, &formats_settings(&dir));
         assert!(matches!(
             loaded.get("std").unwrap().status,
             FormatLoadStatus::Failed
@@ -463,7 +547,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_format_index(&test_index(), &formats_settings(&dir));
+        let loaded = load_format_index(&test_index(), None, &formats_settings(&dir));
         assert!(matches!(
             loaded.get("std").unwrap().status,
             FormatLoadStatus::Failed
@@ -476,7 +560,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("manifest.json"), "not json").unwrap();
 
-        let loaded = load_format_index(&test_index(), &formats_settings(&dir));
+        let loaded = load_format_index(&test_index(), None, &formats_settings(&dir));
         assert!(loaded.by_id.is_empty());
     }
 }

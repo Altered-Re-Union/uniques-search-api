@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Fixed-size compact representation of a card, matching the 32-byte record layout.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactCardFields {
     pub faction_code: u8,           // 0..=6
     pub main_cost: u8,              // 0..=15

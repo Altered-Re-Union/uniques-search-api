@@ -5,7 +5,7 @@ use url::form_urlencoded;
 use index_core::faction_index::Faction;
 
 use crate::collections::CollectionStore;
-use crate::formats::{FormatIndex, FormatLoadStatus};
+use crate::formats::{FormatIndex, FormatResolveError};
 use crate::http::api::error::{bad_request, collection_not_loaded, internal_server_error, ApiResult};
 use crate::collections::validate_collection_id;
 use crate::index::UniquesIndex;
@@ -96,19 +96,11 @@ pub(crate) fn resolve_format_filter(
     let Some(id) = format_id else {
         return Ok(None);
     };
-
-    if !formats_enabled {
-        return Err(bad_request(format!("unknown format '{id}'")));
-    }
-
-    let Some(loaded) = format_index.get(&id) else {
-        return Err(bad_request(format!("unknown format '{id}'")));
-    };
-
-    match &loaded.status {
-        FormatLoadStatus::Ready { .. } => Ok(Some(id)),
-        FormatLoadStatus::Failed => Err(internal_server_error("format failed to load")),
-    }
+    format_index.validate(&id, formats_enabled).map_err(|e| match e {
+        FormatResolveError::Unknown(u) => bad_request(format!("unknown format '{u}'")),
+        FormatResolveError::Failed => internal_server_error("format failed to load"),
+    })?;
+    Ok(Some(id))
 }
 
 pub(crate) fn parse_request(
@@ -751,11 +743,6 @@ pub(crate) fn parse_artists(params: &QueryMultiMap) -> Vec<String> {
 }
 
 pub(crate) fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters) -> ApiResult<()> {
-    let mut types: BTreeMap<u32, &str> = BTreeMap::new();
-    for entry in &state.idgd_catalog().entries {
-        types.insert(entry.id_gd, entry.element_type.as_str());
-    }
-
     for slot in &filters.effects {
         for (key_suffix, selector, ids) in [
             ("[t]", IdGdSelector::T, &slot.t),
@@ -763,20 +750,7 @@ pub(crate) fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters
             ("[o]", IdGdSelector::O, &slot.o),
         ] {
             let key = format!("effect[{}]{key_suffix}", slot.index);
-            for &id in ids.iter() {
-                let resolved = state.resolve_id_gd(id);
-                let Some(actual) = types.get(&resolved).copied() else {
-                    return Err(bad_request(format!(
-                        "{key} contains unknown idGd {id} (not present in idgd_catalog)"
-                    )));
-                };
-                let expected = selector.expected_type();
-                if actual != expected {
-                    return Err(bad_request(format!(
-                        "{key} contains idGd {id} of type {actual}, expected {expected}"
-                    )));
-                }
-            }
+            validate_idgd_bucket(state, &key, selector, ids)?;
         }
     }
 
@@ -785,22 +759,32 @@ pub(crate) fn validate_idgd_types(state: &UniquesIndex, filters: &AbilityFilters
         ("support[c]", IdGdSelector::C, &filters.support_c),
         ("support[o]", IdGdSelector::O, &filters.support_o),
     ] {
-        for &id in ids.iter() {
-            let resolved = state.resolve_id_gd(id);
-            let Some(actual) = types.get(&resolved).copied() else {
-                return Err(bad_request(format!(
-                    "{key} contains unknown idGd {id} (not present in idgd_catalog)"
-                )));
-            };
-            let expected = selector.expected_type();
-            if actual != expected {
-                return Err(bad_request(format!(
-                    "{key} contains idGd {id} of type {actual}, expected {expected}"
-                )));
-            }
-        }
+        validate_idgd_bucket(state, key, selector, ids)?;
     }
 
+    Ok(())
+}
+
+fn validate_idgd_bucket(
+    state: &UniquesIndex,
+    key: &str,
+    selector: IdGdSelector,
+    ids: &[u32],
+) -> ApiResult<()> {
+    let expected = selector.expected_type();
+    for &id in ids {
+        let resolved = state.resolve_id_gd(id);
+        let Some(actual) = state.idgd_entry(resolved).map(|e| e.element_type.as_str()) else {
+            return Err(bad_request(format!(
+                "{key} contains unknown idGd {id} (not present in idgd_catalog)"
+            )));
+        };
+        if actual != expected {
+            return Err(bad_request(format!(
+                "{key} contains idGd {id} of type {actual}, expected {expected}"
+            )));
+        }
+    }
     Ok(())
 }
 pub(crate) fn parse_u32(field: &str, s: &str) -> ApiResult<u32> {
@@ -1222,6 +1206,7 @@ mod tests {
             FormatLoadStatus::Ready {
                 negated: false,
                 bitmap: RoaringBitmap::new(),
+                nonunique_bitmap: RoaringBitmap::new(),
             },
         );
         let mut params: QueryMultiMap = HashMap::new();

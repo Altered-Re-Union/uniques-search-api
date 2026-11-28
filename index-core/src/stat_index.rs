@@ -1,7 +1,6 @@
 use crate::compact::CompactCardFields;
 use anyhow::{Context, Result};
 use roaring::RoaringBitmap;
-use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -162,21 +161,7 @@ impl StatIndex {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct StatsSummary {
-    pub version: u32,
-    pub set: String,
-    pub total_cards_indexed: u32,
-    pub fields: Vec<StatFieldSummary>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StatFieldSummary {
-    pub field: String,
-    pub element_reference: String,
-    pub counts: BTreeMap<u8, u64>,
-    pub bitmap_dir: String,
-}
+pub use crate::schema::{StatFieldSummary, StatsSummary};
 
 fn empty_buckets() -> [RoaringBitmap; VALUE_BUCKETS] {
     std::array::from_fn(|_| RoaringBitmap::new())

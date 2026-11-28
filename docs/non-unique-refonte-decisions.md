@@ -479,6 +479,15 @@ non-unique ref (`ALT_CORE_B_AX_04_U_1` + `ALT_CORE_B_LY_30_R1`) resolves with `c
 `kind:"unique"`); a unique-only collection still behaves exactly as before (regression-checked); a
 still-unparseable reference (`totally_bogus_ref`) still 400s the whole POST, preserving strictness.
 
+### D21 — Unified positive-`idGd` effects, `spellOnly` ordering, Frontier unique-only semantics, and deep runtime seams
+
+Following CardsData's full non-unique effect decomposition (zero negative `IdGd`s, all triggers/conditions/outputs mapped to positive shared IDs in C# `AlteredCards.Importer.Core`), Lot 4 moved past D6's text-only interim onto unified structured effect filtering across both branches:
+
+- **Shared `index_core::effect_text` module:** Single bracket-token `[KEYWORD]` parser, canonicalizer (handling space-separated tokens like `[AFTER YOU]` / `[TOUGH 1]`, `$[TAG]`, and `$[BB]`), localized expander, and rules-reminder filter shared between build-time non-unique indexing and runtime unique indexing (including load-time precomputed `UniquesIndex.keyword_bitmaps`, eliminating per-request catalog text scans).
+- **`spellOnly` effect ordering:** `NonUniqueIdGdEntry.spell_only` and `/api/v2/effects` `spellOnly: true` mark fragments that appear exclusively on `SPELL` non-unique prints (never on Uniques or non-Spell prints) so client filter UIs sort Spell-only effects last.
+- **Unique-only Include formats (`frontier`):** `FormatIndex` encapsulates format validation, polarity, and unique-only-include semantics (`!negated && nonunique_bitmap.is_empty() && !unique_bitmap.is_empty()`) so allowlist formats targeting only Uniques restrict the Unique branch while keeping non-Unique prints available normally and reporting the format consistently in `legalFormats`.
+- **Single-seam `UnifiedEffectIndex` & `QuerySnapshot::assemble`:** Non-unique per-line bitmaps are canonicalized onto collapsed `idGd`s once at snapshot assembly, `QuerySnapshot::assemble` guarantees every cross-index binding (`artist_credits`, `families`, `effect_text_keywords`, `formats`, `UnifiedEffectIndex`, `subtype_names`) runs on both startup and hot-reload, and `AppState::swap_formats_if_same_index` prevents a formats hot-reload from overwriting a concurrent index reload.
+
 ## Open questions
 
 - ~~**Q1**: Is `TriggerId` guaranteed non-null on every `PrintEffectFragments` row?~~ Answered by D9:

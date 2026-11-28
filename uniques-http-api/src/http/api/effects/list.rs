@@ -1,36 +1,102 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use index_core::card::LocaleText;
 use index_core::idgd_catalog::{IdGdCatalog, IdGdCatalogEntry};
+use index_core::nonunique::NonUniqueIdGdEntry;
 use anyhow::Context;
 use axum::body::Bytes;
 
 use super::models::{EffectPartWithRegion, EffectsListResponse};
 
-/// Build the effects list from `idgd_catalog.json` entries.
+/// Build the effects list from `idgd_catalog.json` entries (uniques only).
 pub fn build_effects_list(catalog: &IdGdCatalog) -> EffectsListResponse {
-    let mut triggers = Vec::new();
-    let mut conditions = Vec::new();
-    let mut output = Vec::new();
+    build_unified_effects_list(catalog, None, None)
+}
 
-    for entry in &catalog.entries {
-        match entry.element_type.as_str() {
-            "TRIGGER" => triggers.push(effect_part_with_region(entry)),
-            "CONDITION" => conditions.push(effect_part_with_region(entry)),
-            "OUTPUT" => output.push(effect_part_with_region(entry)),
-            _ => {}
+/// Build the unified effects list merging unique `idgd_catalog.json` with optional non-unique
+/// `nonunique/idgd_catalog.json` entries. Shared canonical `idGd`s merge `is_main`/`is_echo`
+/// region flags and `card_types`; non-unique-only `idGd`s are appended and sorted by `id_gd`.
+///
+/// `nu_card_types_by_raw_id` provides bitmap-derived card types for prebuilt indexes whose
+/// `nonunique/idgd_catalog.json` does not yet persist `card_types`.
+pub fn build_unified_effects_list(
+    unique_catalog: &IdGdCatalog,
+    nonunique_entries: Option<&[NonUniqueIdGdEntry]>,
+    nu_card_types_by_raw_id: Option<&BTreeMap<u32, Vec<String>>>,
+) -> EffectsListResponse {
+    let mut triggers: BTreeMap<u32, EffectPartWithRegion> = BTreeMap::new();
+    let mut conditions: BTreeMap<u32, EffectPartWithRegion> = BTreeMap::new();
+    let mut output: BTreeMap<u32, EffectPartWithRegion> = BTreeMap::new();
+
+    for entry in &unique_catalog.entries {
+        let target = match entry.element_type.as_str() {
+            "TRIGGER" => &mut triggers,
+            "CONDITION" => &mut conditions,
+            "OUTPUT" => &mut output,
+            _ => continue,
+        };
+        target.insert(entry.id_gd, effect_part_with_region(entry));
+    }
+
+    if let Some(nu_entries) = nonunique_entries {
+        let aliases = index_core::idgd_collapse::IdGdAliasMap::from_catalog(unique_catalog);
+        for entry in nu_entries {
+            let canon_id = aliases.resolve(entry.id_gd);
+            let target = match entry.element_type.as_str() {
+                "TRIGGER" => &mut triggers,
+                "CONDITION" => &mut conditions,
+                "OUTPUT" => &mut output,
+                _ => continue,
+            };
+            let entry_types: Vec<String> = if !entry.card_types.is_empty() {
+                entry.card_types.clone()
+            } else if let Some(derived) = nu_card_types_by_raw_id.and_then(|m| m.get(&entry.id_gd)) {
+                derived.clone()
+            } else {
+                Vec::new()
+            };
+            if let Some(existing) = target.get_mut(&canon_id) {
+                existing.is_main |= entry.is_main;
+                existing.is_echo |= entry.is_echo;
+                existing.spell_only &= entry.spell_only;
+                merge_card_types(&mut existing.card_types, &entry_types);
+            } else {
+                let mut card_types = Vec::new();
+                merge_card_types(&mut card_types, &entry_types);
+                target.insert(
+                    canon_id,
+                    EffectPartWithRegion {
+                        id_gd: canon_id,
+                        text: entry.translations.clone(),
+                        is_echo: entry.is_echo,
+                        is_main: entry.is_main,
+                        duplicated_id_gd: Vec::new(),
+                        spell_only: entry.spell_only,
+                        card_types,
+                    },
+                );
+            }
         }
     }
 
-    triggers.sort_by_key(|e| e.id_gd);
-    conditions.sort_by_key(|e| e.id_gd);
-    output.sort_by_key(|e| e.id_gd);
-
     EffectsListResponse {
-        triggers,
-        conditions,
-        output,
+        triggers: triggers.into_values().collect(),
+        conditions: conditions.into_values().collect(),
+        output: output.into_values().collect(),
     }
+}
+
+fn merge_card_types(dst: &mut Vec<String>, extra: &[String]) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut set: BTreeSet<String> = dst.iter().cloned().collect();
+    for ct in extra {
+        if !ct.is_empty() {
+            set.insert(ct.clone());
+        }
+    }
+    *dst = set.into_iter().collect();
 }
 
 /// Serialize [`EffectsListResponse`] once at startup for a static endpoint body.
@@ -46,6 +112,9 @@ fn effect_part_with_region(entry: &IdGdCatalogEntry) -> EffectPartWithRegion {
         is_echo: entry.is_echo,
         is_main: entry.is_main,
         duplicated_id_gd: entry.duplicated_id_gd.clone(),
+        spell_only: false,
+        // Every unique card in Altered is a Character.
+        card_types: vec!["CHARACTER".to_string()],
     }
 }
 
@@ -132,7 +201,69 @@ mod tests {
         assert_eq!(value["triggers"][0]["idGd"], 1);
         assert_eq!(value["triggers"][0]["text"]["en_US"], "{R}");
         assert_eq!(value["triggers"][0]["isMain"], true);
+        assert_eq!(value["triggers"][0]["cardTypes"], serde_json::json!(["CHARACTER"]));
         assert_eq!(value["conditions"].as_array().unwrap().len(), 0);
         assert_eq!(value["output"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn unified_list_merges_card_types_across_unique_and_nonunique_with_bitmap_fallback() {
+        let unique = IdGdCatalog {
+            set: "TEST".to_string(),
+            entries: vec![entry(10, "OUTPUT", "shared out", true, false)],
+        };
+        let nu = vec![
+            NonUniqueIdGdEntry {
+                id_gd: 10,
+                element_type: "OUTPUT".to_string(),
+                translations: BTreeMap::from([("en_US".to_string(), "shared out".to_string())]),
+                is_main: true,
+                is_echo: false,
+                main_lines: vec![1],
+                has_ec: false,
+                spell_only: true,
+                card_types: vec!["SPELL".to_string()],
+            },
+            NonUniqueIdGdEntry {
+                id_gd: 20,
+                element_type: "OUTPUT".to_string(),
+                translations: BTreeMap::from([("en_US".to_string(), "spell only".to_string())]),
+                is_main: true,
+                is_echo: false,
+                main_lines: vec![1],
+                has_ec: false,
+                spell_only: true,
+                card_types: Vec::new(), // simulates prebuilt index lacking persisted card_types
+            },
+            NonUniqueIdGdEntry {
+                id_gd: 30,
+                element_type: "OUTPUT".to_string(),
+                translations: BTreeMap::from([("en_US".to_string(), "landmark only".to_string())]),
+                is_main: true,
+                is_echo: false,
+                main_lines: vec![1],
+                has_ec: false,
+                spell_only: false,
+                card_types: Vec::new(),
+            },
+        ];
+        let fallback = BTreeMap::from([
+            (20, vec!["SPELL".to_string()]),
+            (30, vec!["LANDMARK_PERMANENT".to_string()]),
+        ]);
+
+        let list = build_unified_effects_list(&unique, Some(&nu), Some(&fallback));
+        assert_eq!(list.output.len(), 3);
+        assert_eq!(list.output[0].id_gd, 10);
+        assert_eq!(list.output[0].card_types, vec!["CHARACTER", "SPELL"]);
+        assert!(!list.output[0].spell_only);
+
+        assert_eq!(list.output[1].id_gd, 20);
+        assert_eq!(list.output[1].card_types, vec!["SPELL"]);
+        assert!(list.output[1].spell_only);
+
+        assert_eq!(list.output[2].id_gd, 30);
+        assert_eq!(list.output[2].card_types, vec!["LANDMARK_PERMANENT"]);
+        assert!(!list.output[2].spell_only);
     }
 }

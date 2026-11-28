@@ -27,33 +27,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const VALUE_BUCKETS: usize = 16;
 const LOCALES: [&str; 5] = ["en_US", "fr_FR", "es_ES", "de_DE", "it_IT"];
 
-/// Canonicalize `EffectFragments.KeywordReference` variants (`FLEETING_CHAR` -> `FLEETING`,
-/// `RESUPPLIES` / `RESUPPLY_INF` / `EXHAUSTED_RESUPPLY` -> `RESUPPLY`, etc.) so keyword filtering
-/// matches what users pick in the UI filter panel.
-pub fn canonical_keyword(raw: &str) -> Option<String> {
-    let k = raw.trim().to_ascii_uppercase();
-    if k.is_empty() || k == "BB" {
-        return None;
-    }
-    let mapped = match k.as_str() {
-        s if s.starts_with("ANCHORED") => "ANCHORED",
-        s if s.starts_with("ASLEEP") => "ASLEEP",
-        s if s.starts_with("ASCEND") || s == "DUE_TO_ASCENSION" => "ASCEND",
-        s if s.starts_with("BOOSTED") => "BOOSTED",
-        s if s.starts_with("COOLDOWN") => "COOLDOWN",
-        s if s.starts_with("DEFENDER") => "DEFENDER",
-        s if s.starts_with("ETERNAL") => "ETERNAL",
-        s if s.starts_with("FLEETING") => "FLEETING",
-        s if s.starts_with("GIGANTIC") => "GIGANTIC",
-        s if s.starts_with("RESUPPL") || s.starts_with("EXHAUSTED_RESUPPL") => "RESUPPLY",
-        s if s.starts_with("SABOTAGE") => "SABOTAGE",
-        s if s.starts_with("SCOUT") => "SCOUT",
-        s if s.starts_with("SEASONED") => "SEASONED",
-        s if s.starts_with("TOUGH") => "TOUGH",
-        other => other,
-    };
-    Some(mapped.to_string())
-}
+pub use crate::effect_text::{
+    canonical_keyword, expand_keyword_tokens, is_pure_reminder_text, strip_trailing_reminder,
+};
 
 /// Map `RarityReference` to an on-disk code (`0` = unknown/unmapped). `U` (Unique) isn't expected
 /// on a non-unique row but isn't rejected here either — see `load_nonunique_prints`.
@@ -235,7 +211,57 @@ impl NonUniqueCatalog {
     }
 }
 
-// --- Bitmaps: faction / rarity / product / serialized / stats ---
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NonUniqueAbilityLine {
+    pub is_echo: bool,
+    /// 1-based line number within `main` (`1..=N`) or `echo` (`1..=N`).
+    pub line: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u32>,
+}
+
+/// One positive `IdGd` fragment referenced by at least one non-unique print.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NonUniqueIdGdEntry {
+    pub id_gd: u32,
+    /// `"TRIGGER"`, `"CONDITION"`, or `"OUTPUT"`.
+    pub element_type: String,
+    pub translations: BTreeMap<String, String>,
+    pub is_main: bool,
+    pub is_echo: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub main_lines: Vec<u8>,
+    #[serde(default)]
+    pub has_ec: bool,
+    /// True when every non-unique print referencing this fragment is a `SPELL`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spell_only: bool,
+    /// Distinct card type references (e.g. `CHARACTER`, `SPELL`, `LANDMARK_PERMANENT`) of
+    /// non-unique prints carrying this fragment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub card_types: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct IdGdMeta {
+    is_main: bool,
+    is_echo: bool,
+    main_lines: BTreeSet<u8>,
+    has_ec: bool,
+    has_non_spell: bool,
+    card_types: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NonUniqueIdGdCatalog {
+    pub entries: Vec<NonUniqueIdGdEntry>,
+}
+
+// --- Bitmaps: faction / rarity / product / serialized / stats / id_gd ---
 
 #[derive(Debug, Default)]
 pub struct NonUniqueIndexBuilder {
@@ -256,6 +282,9 @@ pub struct NonUniqueIndexBuilder {
     banned: RoaringBitmap,
     errated: RoaringBitmap,
     suspended: RoaringBitmap,
+    id_gd_whole: BTreeMap<u32, RoaringBitmap>,
+    id_gd_per_line: BTreeMap<(u32, String), RoaringBitmap>,
+    id_gd_meta: BTreeMap<u32, IdGdMeta>,
 }
 
 impl NonUniqueIndexBuilder {
@@ -352,6 +381,43 @@ impl NonUniqueIndexBuilder {
         if record.is_suspended {
             self.suspended.insert(print_index);
         }
+
+        for ability in &record.abilities {
+            let line_suffix = if ability.is_echo {
+                "ec".to_string()
+            } else {
+                format!("m{}", ability.line)
+            };
+            for id in [ability.trigger, ability.condition, ability.output]
+                .into_iter()
+                .flatten()
+            {
+                self.id_gd_whole
+                    .entry(id)
+                    .or_default()
+                    .insert(print_index);
+                self.id_gd_per_line
+                    .entry((id, line_suffix.clone()))
+                    .or_default()
+                    .insert(print_index);
+                let meta = self.id_gd_meta.entry(id).or_default();
+                if ability.is_echo {
+                    meta.is_echo = true;
+                    meta.has_ec = true;
+                } else {
+                    meta.is_main = true;
+                    meta.main_lines.insert(ability.line);
+                }
+                if record.card_type.as_deref() != Some("SPELL") {
+                    meta.has_non_spell = true;
+                }
+                if let Some(ct) = record.card_type.as_deref() {
+                    if !ct.is_empty() {
+                        meta.card_types.insert(ct.to_string());
+                    }
+                }
+            }
+        }
     }
 
     pub fn into_index(self) -> NonUniqueIndex {
@@ -373,6 +439,9 @@ impl NonUniqueIndexBuilder {
             banned: self.banned,
             errated: self.errated,
             suspended: self.suspended,
+            id_gd_whole: self.id_gd_whole,
+            id_gd_per_line: self.id_gd_per_line,
+            id_gd_meta: self.id_gd_meta,
         }
     }
 }
@@ -395,6 +464,9 @@ pub struct NonUniqueIndex {
     banned: RoaringBitmap,
     errated: RoaringBitmap,
     suspended: RoaringBitmap,
+    id_gd_whole: BTreeMap<u32, RoaringBitmap>,
+    id_gd_per_line: BTreeMap<(u32, String), RoaringBitmap>,
+    id_gd_meta: BTreeMap<u32, IdGdMeta>,
 }
 
 impl NonUniqueIndex {
@@ -461,7 +533,64 @@ impl NonUniqueIndex {
             }
         }
 
+        let id_gd_dir = nonunique_root.join("id_gd");
+        if id_gd_dir.exists() {
+            fs::remove_dir_all(&id_gd_dir)?;
+        }
+        if !self.id_gd_whole.is_empty() {
+            fs::create_dir_all(&id_gd_dir)?;
+            for (id_gd, bitmap) in &self.id_gd_whole {
+                write_single_bitmap(&id_gd_dir.join(format!("{id_gd}.roar")), bitmap)?;
+            }
+            for ((id_gd, suffix), bitmap) in &self.id_gd_per_line {
+                write_single_bitmap(&id_gd_dir.join(format!("{id_gd}_{suffix}.roar")), bitmap)?;
+            }
+        }
+
         Ok(())
+    }
+
+    pub fn build_idgd_catalog(
+        &self,
+        fragments: &BTreeMap<i64, EffectFragmentTextRow>,
+    ) -> NonUniqueIdGdCatalog {
+        let mut entries = Vec::with_capacity(self.id_gd_meta.len());
+        for (&id_gd, meta) in &self.id_gd_meta {
+            let Some(frag) = fragments.get(&(id_gd as i64)) else {
+                continue;
+            };
+            let element_type = match frag.fragment_type.trim().to_ascii_uppercase().as_str() {
+                "TRIGGER" => "TRIGGER".to_string(),
+                "CONDITION" => "CONDITION".to_string(),
+                "OUTPUT" => "OUTPUT".to_string(),
+                other if !other.is_empty() => other.to_string(),
+                _ => "OUTPUT".to_string(),
+            };
+            let mut translations = BTreeMap::new();
+            for locale in LOCALES {
+                let raw = fragment_text_for_locale(frag, locale);
+                let text = if id_gd >= 1000 && element_type == "OUTPUT" {
+                    strip_trailing_reminder(raw)
+                } else {
+                    raw
+                };
+                if !text.is_empty() {
+                    translations.insert(locale.to_string(), text.to_string());
+                }
+            }
+            entries.push(NonUniqueIdGdEntry {
+                id_gd,
+                element_type,
+                translations,
+                is_main: meta.is_main,
+                is_echo: meta.is_echo,
+                main_lines: meta.main_lines.iter().copied().collect(),
+                has_ec: meta.has_ec,
+                spell_only: !meta.has_non_spell,
+                card_types: meta.card_types.iter().cloned().collect(),
+            });
+        }
+        NonUniqueIdGdCatalog { entries }
     }
 }
 
@@ -651,11 +780,13 @@ struct PrintEffectFragmentRow {
     effect_id: Option<i64>,
 }
 
-/// Full text + keyword + slot row from shared `EffectFragments.csv`.
+/// Full text + type + keyword + slot row from shared `EffectFragments.csv`.
 #[derive(Debug, Deserialize)]
-struct EffectFragmentTextRow {
+pub struct EffectFragmentTextRow {
     #[serde(rename = "IdGd")]
     id_gd: i64,
+    #[serde(rename = "Type", default)]
+    fragment_type: String,
     #[serde(rename = "KeywordReference", default)]
     keyword_reference: String,
     #[serde(rename = "Slot", default)]
@@ -701,6 +832,8 @@ pub struct NonUniquePrintRecord {
     pub echo_effect: BTreeMap<String, String>,
     /// Locale -> space-joined combined text for full-text search.
     pub effect_text: BTreeMap<String, String>,
+    /// Structured positive-`idGd` ability lines (main + echo) for unified effect filtering & `CardV2.abilities`.
+    pub abilities: Vec<NonUniqueAbilityLine>,
 }
 
 /// Serializable per-print metadata stored at `nonunique/prints.json`, parallel to
@@ -746,6 +879,8 @@ pub struct NonUniquePrintMeta {
     pub main_effect: BTreeMap<String, String>,
     #[serde(default)]
     pub echo_effect: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub abilities: Vec<NonUniqueAbilityLine>,
 }
 
 impl From<&NonUniquePrintRecord> for NonUniquePrintMeta {
@@ -777,6 +912,7 @@ impl From<&NonUniquePrintRecord> for NonUniquePrintMeta {
             reserve: r.reserve,
             main_effect: r.main_effect.clone(),
             echo_effect: r.echo_effect.clone(),
+            abilities: r.abilities.clone(),
         }
     }
 }
@@ -800,70 +936,78 @@ fn parse_optional_u8(raw: &str) -> Option<u8> {
 fn substitute_keywords(
     raw: &str,
     locale: &str,
-    keywords: &BTreeMap<String, KeywordCsvRow>,
+    keywords: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> String {
-    if !raw.contains('[') {
-        return raw.to_string();
-    }
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(open) = rest.find('[') {
-        out.push_str(&rest[..open]);
-        let after_open = &rest[open + 1..];
-        if let Some(close) = after_open.find(']') {
-            let token = &after_open[..close];
-            if let Some(kw) = keywords.get(token) {
-                let localized = match locale {
-                    "fr_FR" => &kw.display_web_fr_fr,
-                    "es_ES" => &kw.display_web_es_es,
-                    "de_DE" => &kw.display_web_de_de,
-                    "it_IT" => &kw.display_web_it_it,
-                    _ => &kw.display_web_en_us,
-                };
-                let replacement = if !localized.is_empty() {
-                    localized.as_str()
-                } else if !kw.display_web_en_us.is_empty() {
-                    kw.display_web_en_us.as_str()
-                } else {
-                    token
-                };
-                out.push_str(replacement);
-            } else {
-                out.push('[');
-                out.push_str(token);
-                out.push(']');
-            }
-            rest = &after_open[close + 1..];
-        } else {
-            out.push('[');
-            out.push_str(after_open);
-            rest = "";
-            break;
-        }
-    }
-    out.push_str(rest);
-    out
+    expand_keyword_tokens(raw, locale, keywords)
 }
 
 fn extract_bracket_keywords(raw: &str, out: &mut BTreeSet<String>) {
-    let mut rest = raw;
-    while let Some(open) = rest.find('[') {
-        let after = &rest[open + 1..];
-        if let Some(close) = after.find(']') {
-            let token = &after[..close];
-            if !token.is_empty()
-                && token
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-            {
-                if let Some(canon) = canonical_keyword(token) {
-                    out.insert(canon);
+    crate::effect_text::extract_canonical_keywords(raw, out);
+}
+
+/// Shared CardsData CSV referentials loaded ONCE per non-unique index build (eliminates
+/// N+2 redundant reads of `CardFamilies`, `CardFamilySubTypes`, `Artists`, `Sets`, `Keywords`,
+/// `EffectFragments`, and `CardTypes` when indexing 20+ sets).
+struct NonUniqueReferentials {
+    card_types: BTreeMap<i64, String>,
+    subtypes_by_family: BTreeMap<i64, Vec<String>>,
+    artists: BTreeMap<i64, String>,
+    sets: BTreeMap<String, String>,
+    keywords_map: BTreeMap<String, BTreeMap<String, String>>,
+    effect_texts: BTreeMap<i64, EffectFragmentTextRow>,
+    card_types_i18n: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl NonUniqueReferentials {
+    fn load(cardsdata_root: &Path) -> Result<Self> {
+        let csv_root = cardsdata_root.join("data").join("csv");
+
+        let card_types: BTreeMap<i64, String> =
+            read_all::<CardFamilyTypeRow>(&csv_root.join("CardFamilies.csv"))?
+                .into_iter()
+                .map(|r| (r.id, r.card_type_reference))
+                .collect();
+
+        let mut subtypes_by_family: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+        for row in read_all::<CardFamilySubTypeRow>(&csv_root.join("CardFamilySubTypes.csv"))? {
+            let norm = row.card_sub_type_reference.trim().to_ascii_uppercase();
+            if !norm.is_empty() {
+                let list = subtypes_by_family.entry(row.card_family_id).or_default();
+                if !list.contains(&norm) {
+                    list.push(norm);
                 }
             }
-            rest = &after[close + 1..];
-        } else {
-            break;
         }
+
+        let artists: BTreeMap<i64, String> =
+            read_optional_all::<ArtistCsvRow>(&csv_root.join("Artists.csv"))?
+                .into_iter()
+                .map(|r| (r.id, r.nick_name))
+                .collect();
+
+        let sets: BTreeMap<String, String> =
+            read_optional_all::<SetCsvRow>(&csv_root.join("Sets.csv"))?
+                .into_iter()
+                .map(|r| (r.reference, r.name_en_us))
+                .collect();
+
+        let keywords_map = load_keywords_localized(&csv_root)?;
+        let effect_texts: BTreeMap<i64, EffectFragmentTextRow> =
+            read_all::<EffectFragmentTextRow>(&csv_root.join("EffectFragments.csv"))?
+                .into_iter()
+                .map(|r| (r.id_gd, r))
+                .collect();
+        let card_types_i18n = load_card_types_localized(&csv_root)?;
+
+        Ok(Self {
+            card_types,
+            subtypes_by_family,
+            artists,
+            sets,
+            keywords_map,
+            effect_texts,
+            card_types_i18n,
+        })
     }
 }
 
@@ -873,50 +1017,16 @@ pub fn load_nonunique_prints(
     cardsdata_root: &Path,
     set: &str,
 ) -> Result<Vec<NonUniquePrintRecord>> {
+    let refs = NonUniqueReferentials::load(cardsdata_root)?;
+    load_nonunique_prints_with_refs(cardsdata_root, set, &refs)
+}
+
+fn load_nonunique_prints_with_refs(
+    cardsdata_root: &Path,
+    set: &str,
+    refs: &NonUniqueReferentials,
+) -> Result<Vec<NonUniquePrintRecord>> {
     let csv_root = cardsdata_root.join("data").join("csv");
-
-    let card_types: BTreeMap<i64, String> = read_all::<CardFamilyTypeRow>(
-        &csv_root.join("CardFamilies.csv"),
-    )?
-    .into_iter()
-    .map(|r| (r.id, r.card_type_reference))
-    .collect();
-
-    let mut subtypes_by_family: BTreeMap<i64, Vec<String>> = BTreeMap::new();
-    for row in read_all::<CardFamilySubTypeRow>(&csv_root.join("CardFamilySubTypes.csv"))? {
-        let norm = row.card_sub_type_reference.trim().to_ascii_uppercase();
-        if !norm.is_empty() {
-            let list = subtypes_by_family.entry(row.card_family_id).or_default();
-            if !list.contains(&norm) {
-                list.push(norm);
-            }
-        }
-    }
-
-    let artists: BTreeMap<i64, String> =
-        read_optional_all::<ArtistCsvRow>(&csv_root.join("Artists.csv"))?
-            .into_iter()
-            .map(|r| (r.id, r.nick_name))
-            .collect();
-
-    let sets: BTreeMap<String, String> =
-        read_optional_all::<SetCsvRow>(&csv_root.join("Sets.csv"))?
-            .into_iter()
-            .map(|r| (r.reference, r.name_en_us))
-            .collect();
-
-    let keywords_map: BTreeMap<String, KeywordCsvRow> =
-        read_optional_all::<KeywordCsvRow>(&csv_root.join("Keywords.csv"))?
-            .into_iter()
-            .map(|r| (r.reference.clone(), r))
-            .collect();
-
-    let effect_texts: BTreeMap<i64, EffectFragmentTextRow> =
-        read_all::<EffectFragmentTextRow>(&csv_root.join("EffectFragments.csv"))?
-            .into_iter()
-            .map(|r| (r.id_gd, r))
-            .collect();
-
     let set_dir = csv_root.join("NonUnique").join(set);
     let mut effect_rows_by_print: BTreeMap<i64, Vec<PrintEffectFragmentRow>> = BTreeMap::new();
     for row in read_all::<PrintEffectFragmentRow>(&set_dir.join("PrintEffectFragments.csv"))? {
@@ -938,7 +1048,7 @@ pub fn load_nonunique_prints(
         .map(|row| {
             let effects = effect_rows_by_print
                 .get(&row.id)
-                .map(|r| build_print_effects(r, &effect_texts, &keywords_map))
+                .map(|r| build_print_effects(r, &refs.effect_texts, &refs.keywords_map))
                 .unwrap_or_default();
             let main_cost = parse_optional_u8(&row.main_cost);
             let recall_cost = parse_optional_u8(&row.recall_cost);
@@ -949,9 +1059,10 @@ pub fn load_nonunique_prints(
             let reserve = parse_optional_u8(&row.reserve);
             let artist = row
                 .artist_id
-                .and_then(|id| artists.get(&id).cloned())
+                .and_then(|id| refs.artists.get(&id).cloned())
                 .unwrap_or_default();
-            let set_name = sets
+            let set_name = refs
+                .sets
                 .get(&row.set_reference)
                 .cloned()
                 .unwrap_or_else(|| row.set_reference.clone());
@@ -966,8 +1077,9 @@ pub fn load_nonunique_prints(
             };
 
             NonUniquePrintRecord {
-                card_type: card_types.get(&row.card_family_id).cloned(),
-                subtypes: subtypes_by_family
+                card_type: refs.card_types.get(&row.card_family_id).cloned(),
+                subtypes: refs
+                    .subtypes_by_family
                     .get(&row.card_family_id)
                     .cloned()
                     .unwrap_or_default(),
@@ -975,6 +1087,7 @@ pub fn load_nonunique_prints(
                 main_effect: effects.main_effect,
                 echo_effect: effects.echo_effect,
                 effect_text: effects.combined_text,
+                abilities: effects.abilities,
                 set_name,
                 set_code,
                 set_reference: row.set_reference.clone(),
@@ -1024,6 +1137,7 @@ struct BuiltPrintEffects {
     echo_effect: BTreeMap<String, String>,
     combined_text: BTreeMap<String, String>,
     keywords: Vec<String>,
+    abilities: Vec<NonUniqueAbilityLine>,
 }
 
 fn fragment_text_for_locale<'a>(frag: &'a EffectFragmentTextRow, locale: &str) -> &'a str {
@@ -1036,15 +1150,22 @@ fn fragment_text_for_locale<'a>(frag: &'a EffectFragmentTextRow, locale: &str) -
     }
 }
 
+fn positive_id(id: Option<i64>) -> Option<u32> {
+    id.and_then(|v| (v > 0).then(|| u32::try_from(v).ok()).flatten())
+}
+
 fn build_print_effects(
     rows: &[PrintEffectFragmentRow],
     texts: &BTreeMap<i64, EffectFragmentTextRow>,
-    keywords_map: &BTreeMap<String, KeywordCsvRow>,
+    keywords_map: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> BuiltPrintEffects {
     let mut main_lines: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut echo_lines: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut combined_parts: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut kw_set: BTreeSet<String> = BTreeSet::new();
+    let mut abilities: Vec<NonUniqueAbilityLine> = Vec::new();
+    let mut main_line_idx: u8 = 0;
+    let mut echo_line_idx: u8 = 0;
 
     for row in rows {
         let trigger_slot = row
@@ -1071,6 +1192,32 @@ fn build_print_effects(
             kw_set.insert("ECHO".to_string());
         }
 
+        let pos_t = positive_id(row.trigger_id);
+        let pos_c = positive_id(row.condition_id);
+        let pos_o = positive_id(row.effect_id);
+        let is_pure_reminder = matches!(pos_t, None | Some(23))
+            && matches!(pos_c, None | Some(191))
+            && row
+                .effect_id
+                .and_then(|id| texts.get(&id))
+                .is_some_and(|f| is_pure_reminder_text(&f.text_en_us));
+        if !is_pure_reminder && (pos_t.is_some() || pos_c.is_some() || pos_o.is_some()) {
+            let line = if is_echo {
+                echo_line_idx = echo_line_idx.saturating_add(1);
+                echo_line_idx
+            } else {
+                main_line_idx = main_line_idx.saturating_add(1);
+                main_line_idx
+            };
+            abilities.push(NonUniqueAbilityLine {
+                is_echo,
+                line,
+                trigger: pos_t,
+                condition: pos_c,
+                output: pos_o,
+            });
+        }
+
         for locale in LOCALES {
             let mut row_parts = Vec::new();
             for id in &ids {
@@ -1083,7 +1230,7 @@ fn build_print_effects(
                     }
                 }
                 let raw_t = fragment_text_for_locale(frag, locale);
-                if raw_t.is_empty() {
+                if raw_t.is_empty() || raw_t.trim() == "[]" {
                     continue;
                 }
                 if locale == "en_US" {
@@ -1118,6 +1265,7 @@ fn build_print_effects(
             .map(|(l, parts)| (l.to_string(), parts.join(" ")))
             .collect(),
         keywords: kw_set.into_iter().collect(),
+        abilities,
     }
 }
 
@@ -1140,6 +1288,34 @@ fn load_card_types_localized(
             }
         }
         out.insert(row.reference, names);
+    }
+    Ok(out)
+}
+
+/// Load `Keywords.csv` into `keyword_ref -> locale -> display_text` (excluding empty displays such
+/// as `BB`) for persisting `nonunique/keywords.json` and localized effect-text search expansion.
+pub fn load_keywords_localized(
+    csv_root: &Path,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+    let rows = read_optional_all::<KeywordCsvRow>(&csv_root.join("Keywords.csv"))?;
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let mut names = BTreeMap::new();
+        for (locale, val) in [
+            ("en_US", &row.display_web_en_us),
+            ("fr_FR", &row.display_web_fr_fr),
+            ("es_ES", &row.display_web_es_es),
+            ("de_DE", &row.display_web_de_de),
+            ("it_IT", &row.display_web_it_it),
+        ] {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                names.insert(locale.to_string(), trimmed.to_string());
+            }
+        }
+        if !names.is_empty() {
+            out.insert(row.reference, names);
+        }
     }
     Ok(out)
 }
@@ -1174,9 +1350,10 @@ pub fn build_nonunique_index(
         anyhow::bail!("build_nonunique_index requires at least one set");
     }
 
+    let refs = NonUniqueReferentials::load(cardsdata_root)?;
     let mut records = Vec::new();
     for set in sets {
-        records.extend(load_nonunique_prints(cardsdata_root, set)?);
+        records.extend(load_nonunique_prints_with_refs(cardsdata_root, set, &refs)?);
     }
     records.sort_by(|a, b| (a.card_family_id, &a.reference).cmp(&(b.card_family_id, &b.reference)));
 
@@ -1215,7 +1392,19 @@ pub fn build_nonunique_index(
 
     catalog.save(&nonunique_out.join("catalog.json"))?;
     write_compact_records(&nonunique_out.join("cards.bin"), &compact_records)?;
-    index_builder.into_index().write_dir(&set_out)?;
+    let built_index = index_builder.into_index();
+    built_index.write_dir(&set_out)?;
+
+    let idgd_catalog = built_index.build_idgd_catalog(&refs.effect_texts);
+    if !idgd_catalog.entries.is_empty() {
+        let idgd_json = serde_json::to_string(&idgd_catalog)?;
+        fs::write(nonunique_out.join("idgd_catalog.json"), idgd_json).with_context(|| {
+            format!(
+                "write {}",
+                nonunique_out.join("idgd_catalog.json").display()
+            )
+        })?;
+    }
 
     let effect_text_json = serde_json::to_string(&effect_texts)?;
     fs::write(nonunique_out.join("effect_text.json"), effect_text_json)
@@ -1225,10 +1414,15 @@ pub fn build_nonunique_index(
     fs::write(nonunique_out.join("prints.json"), prints_json)
         .with_context(|| format!("write {}", nonunique_out.join("prints.json").display()))?;
 
-    let card_types_map = load_card_types_localized(&cardsdata_root.join("data").join("csv"))?;
-    let card_types_json = serde_json::to_string(&card_types_map)?;
+    let card_types_json = serde_json::to_string(&refs.card_types_i18n)?;
     fs::write(nonunique_out.join("card_types.json"), card_types_json)
         .with_context(|| format!("write {}", nonunique_out.join("card_types.json").display()))?;
+
+    if !refs.keywords_map.is_empty() {
+        let keywords_json = serde_json::to_string(&refs.keywords_map)?;
+        fs::write(nonunique_out.join("keywords.json"), keywords_json)
+            .with_context(|| format!("write {}", nonunique_out.join("keywords.json").display()))?;
+    }
 
     let built_at_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1395,6 +1589,44 @@ mod tests {
         assert_eq!(
             card_types.get("HERO").and_then(|m| m.get("fr_FR")).map(String::as_str),
             Some("Heros")
+        );
+    }
+
+    #[test]
+    fn pure_and_trailing_reminder_helpers_distinguish_reminders_from_qualifiers() {
+        assert!(is_pure_reminder_text(
+            "(If I leave the Expedition zone, remove me from the game.)"
+        ));
+        assert!(is_pure_reminder_text(
+            "(An Anchored Character doesn't go to Reserve during Rest and loses Anchored.)"
+        ));
+        assert!(!is_pure_reminder_text(
+            "Target Character gains [ANCHORED]. (During Rest, it doesn't go to Reserve.)"
+        ));
+        assert!(!is_pure_reminder_text("Draw a card."));
+
+        assert_eq!(
+            strip_trailing_reminder(
+                "Target Character loses [FLEETING]. (Discard me from Reserve to do this.)"
+            ),
+            "Target Character loses [FLEETING]."
+        );
+        assert_eq!(
+            strip_trailing_reminder(
+                "Target Character gains [ANCHORED]. (At Rest, it doesn't go to Reserve)."
+            ),
+            "Target Character gains [ANCHORED]."
+        );
+        // Integrated qualifiers (period after closing paren, no sentence inside) stay intact.
+        assert_eq!(
+            strip_trailing_reminder(
+                "Put target Permanent in its owner's Mana zone (as an exhausted Mana Orb)."
+            ),
+            "Put target Permanent in its owner's Mana zone (as an exhausted Mana Orb)."
+        );
+        assert_eq!(
+            strip_trailing_reminder("Send target Character to Reserve, then exhaust it ({T})."),
+            "Send target Character to Reserve, then exhaust it ({T})."
         );
     }
 }

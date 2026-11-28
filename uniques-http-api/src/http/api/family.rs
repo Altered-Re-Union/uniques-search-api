@@ -16,8 +16,6 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
-use index_core::family_catalog::FamilyCatalogEntry;
-
 use crate::http::ServerState;
 
 use super::error::{bad_request, not_found, ApiResult};
@@ -77,72 +75,17 @@ async fn get_family(
 ) -> ApiResult<Json<FamilyResponse>> {
     let (page, limit) = parse_page_limit(query.as_deref())?;
     let snapshot = server.app.snapshot();
-    let catalog_entry: Option<&FamilyCatalogEntry> = snapshot.families.get(&id);
-
-    // A merged multi-set index can have multiple `FamilyEntry` rows sharing a `card_family_id`
-    // (e.g. CORE and COREKS editions of the same family); aggregate prints across all of them and
-    // filter out unindexed/gap slots inside each family span.
-    let matching_families: Vec<_> = snapshot
-        .index
-        .catalog()
-        .families
-        .iter()
-        .filter(|f| f.card_family_id == Some(id))
-        .collect();
-
-    let default_set = &snapshot.index.catalog().set;
-    let present = snapshot.index.present_cards();
-    let all_unique_prints: Vec<String> = matching_families
-        .iter()
-        .copied()
-        .flat_map(|f| {
-            let set = f.source_set.as_deref().unwrap_or(default_set);
-            (1..=f.max_unique_id).filter_map(move |uid| {
-                let idx = f.start_bit + uid - 1;
-                if present.contains(idx) {
-                    Some(format!(
-                        "ALT_{set}_B_{}_{}_U_{uid}",
-                        f.faction, f.family_number
-                    ))
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
-
-    let unique_print_total = all_unique_prints.len() as u32;
-    let start = (page.saturating_sub(1) as usize).saturating_mul(limit);
-    let end = start.saturating_add(limit).min(all_unique_prints.len());
-    let unique_prints = if start >= all_unique_prints.len() {
-        Vec::new()
-    } else {
-        all_unique_prints[start..end].to_vec()
-    };
-
-    let non_unique_prints: Vec<String> = snapshot
-        .nonunique
-        .as_ref()
-        .and_then(|nu| {
-            nu.family
-                .get(&id.to_string())
-                .map(|bitmap| bitmap.iter().filter_map(|idx| nu.reference_for(idx).map(str::to_string)).collect())
-        })
-        .unwrap_or_default();
-
-    if catalog_entry.is_none() && matching_families.is_empty() && non_unique_prints.is_empty() {
-        return Err(not_found(format!("family {id} not found")));
-    }
+    let family = snapshot
+        .family_page(id, page, limit)
+        .ok_or_else(|| not_found(format!("family {id} not found")))?;
 
     Ok(Json(FamilyResponse {
-        family_id: id,
-        name: catalog_entry.map(|e| e.name.clone()).unwrap_or_default(),
-        card_type: catalog_entry
-            .map(|e| e.card_type.clone())
-            .unwrap_or_default(),
-        subtypes: catalog_entry.map(|e| e.subtypes.clone()).unwrap_or_default(),
-        unique_print_total,
-        unique_prints,
-        non_unique_prints,
+        family_id: family.family_id,
+        name: family.name,
+        card_type: family.card_type,
+        subtypes: family.subtypes,
+        unique_print_total: family.unique_print_total,
+        unique_prints: family.unique_prints,
+        non_unique_prints: family.non_unique_prints,
     }))
 }

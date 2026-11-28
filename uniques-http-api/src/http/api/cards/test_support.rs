@@ -245,13 +245,23 @@ pub(crate) fn test_state() -> AppState {
     let no_effect_bitmap =
         build_no_effect_bitmap(&present_cards, &cards, &BTreeMap::new(), &id_gd_per_line);
 
+    let idgd_by_id = idgd_catalog
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(idx, e)| (e.id_gd, idx))
+        .collect();
+
     let index = UniquesIndex {
         index_dir: "C:\\tmp\\index".into(),
         catalog,
         manifest,
         idgd_catalog,
+        idgd_by_id,
         id_gd_aliases,
         effects_body,
+        effect_text_search_keys: Vec::new(),
+        keyword_bitmaps: BTreeMap::new(),
         artist_credits: Default::default(),
         stats_summary,
         factions_summary,
@@ -356,8 +366,11 @@ pub(crate) fn test_state_with_sets() -> AppState {
             set: "ALL_SETS".to_string(),
             entries: vec![],
         },
+        idgd_by_id: Default::default(),
         id_gd_aliases: IdGdAliasMap::default(),
         effects_body: Arc::new(Bytes::from_static(b"{}")),
+        effect_text_search_keys: Vec::new(),
+        keyword_bitmaps: BTreeMap::new(),
         artist_credits: Default::default(),
         stats_summary: StatsSummary {
             version: 1,

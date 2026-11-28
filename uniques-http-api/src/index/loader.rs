@@ -14,12 +14,9 @@ use index_core::idgd_catalog::IdGdCatalog;
 use index_core::path::ParsedCardPath;
 use index_core::stat_index::StatField;
 use roaring::RoaringBitmap;
-use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::collections::CollectionStore;
 use crate::config::{ArtistsSettings, Settings};
-use crate::formats::{load_format_index, FormatIndex};
 use crate::http::api::effects::{build_effects_list, serialize_effects_list};
 use crate::http::state::{AppState, QuerySnapshot};
 use crate::index::text_search::{search_key, SearchQuery};
@@ -35,7 +32,7 @@ pub mod storage;
 pub use archive::TarZstIndexStorage;
 pub use disk::DiskIndexStorage;
 pub use http::{load_app_state_from_http, load_index_from_http, HttpIndexClient};
-pub use nonunique::{load_nonunique_index, NonUniqueQueryIndex};
+pub use nonunique::{load_nonunique_index, NonUniqueEffectLine, NonUniqueQueryIndex};
 pub use object_store::{
     load_app_state_from_object_store, load_bundle_from_object_store, load_index_from_object_store,
     ObjectStoreIndexClient,
@@ -44,52 +41,8 @@ pub use storage::IndexStorage;
 
 use storage::{read_json, read_roar, read_roar_id_gd};
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct IndexManifest {
-    pub version: u32,
-    pub set: String,
-    #[serde(default)]
-    pub kind: Option<String>,
-    pub built_at_secs: u64,
-    pub card_count: u32,
-    pub id_gd_count: u64,
-    pub total_bit_span: u32,
-    pub family_count: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct StatsSummary {
-    pub version: u32,
-    pub set: String,
-    pub total_cards_indexed: u32,
-    pub fields: Vec<StatFieldSummary>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct StatFieldSummary {
-    pub field: String,
-    pub element_reference: String,
-    pub counts: BTreeMap<u8, u64>,
-    pub bitmap_dir: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FactionsSummary {
-    pub version: u32,
-    pub set: String,
-    pub total_cards_indexed: u32,
-    pub source: String,
-    pub factions: Vec<FactionSummary>,
-    pub unknown_count: u64,
-    pub bitmap_dir: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FactionSummary {
-    pub reference: String,
-    pub card_count: u64,
-    pub bitmap_file: String,
-}
+pub use index_core::schema::{FactionsSummary, IndexManifest, StatsSummary};
+pub(crate) use index_core::set_code::set_release_rank;
 
 pub const SET_CORE: &str = "CORE";
 pub const SET_COREKS: &str = "COREKS";
@@ -99,6 +52,37 @@ pub struct SetBitmaps {
     pub by_set: BTreeMap<String, RoaringBitmap>,
     /// `CORE | COREKS` when both sets exist in `by_set`; built once at load.
     pub core_and_coreks: Option<RoaringBitmap>,
+}
+
+impl SetBitmaps {
+    pub fn union_requested(&self, sets: &[String]) -> RoaringBitmap {
+        let has_core = sets.iter().any(|s| s == SET_CORE);
+        let has_coreks = sets.iter().any(|s| s == SET_COREKS);
+        let use_combined = has_core && has_coreks;
+
+        let mut out = RoaringBitmap::new();
+        if use_combined {
+            if let Some(combined) = &self.core_and_coreks {
+                out = combined.clone();
+            } else {
+                if let Some(b) = self.by_set.get(SET_CORE) {
+                    out |= b.clone();
+                }
+                if let Some(b) = self.by_set.get(SET_COREKS) {
+                    out |= b.clone();
+                }
+            }
+        }
+        for code in sets {
+            if use_combined && (code == SET_CORE || code == SET_COREKS) {
+                continue;
+            }
+            if let Some(b) = self.by_set.get(code) {
+                out |= b.clone();
+            }
+        }
+        out
+    }
 }
 
 pub fn build_set_bitmaps(catalog: &Catalog) -> SetBitmaps {
@@ -274,34 +258,6 @@ pub struct FamilySortIndex {
 
 fn family_set_code<'a>(catalog: &'a Catalog, family: &'a index_core::catalog::FamilyEntry) -> &'a str {
     family.source_set.as_deref().unwrap_or(&catalog.set)
-}
-
-pub(crate) fn set_release_rank(set_ref: &str) -> (usize, &str) {
-    let rank = match set_ref {
-        "CORE" => 0,
-        "COREKS" => 1,
-        "ALIZE" => 2,
-        "BISE" => 3,
-        "JUDGE" => 4,
-        "WCQ25" => 5,
-        "WCF25" => 6,
-        "WCS25" => 7,
-        "CYCLONE" => 8,
-        "DUSTER" => 9,
-        "DUSTERCB" => 10,
-        "DUSTEROP" => 11,
-        "DUSTERTOP" => 12,
-        "TCS3" => 13,
-        "MUSUBI" => 14,
-        "EOLE" => 15,
-        "EOLECB" => 16,
-        "EOLEOP" => 17,
-        "EOLETOP" => 18,
-        "FUGUE" => 19,
-        "WCS26" => 20,
-        _ => usize::MAX,
-    };
-    (rank, set_ref)
 }
 
 pub(crate) fn faction_sort_rank(faction: &str) -> (usize, &str) {
@@ -769,11 +725,6 @@ pub fn read_manifest_from(storage: &impl IndexStorage) -> Result<IndexManifest> 
     read_json(storage, "manifest.json")
 }
 
-/// Read only `manifest.json` from an on-disk index directory.
-pub fn read_manifest(index_dir: &Path) -> Result<IndexManifest> {
-    read_manifest_from(&DiskIndexStorage::new(index_dir)?)
-}
-
 /// Eagerly load the full index from storage into memory.
 pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesIndex> {
     let index_dir = storage.source_path().to_path_buf();
@@ -880,6 +831,8 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
     );
 
     let id_gd_aliases = IdGdAliasMap::from_catalog(&idgd_catalog);
+    let effect_text_search_keys =
+        crate::index::uniques_index::build_effect_text_search_keys(&idgd_catalog, None);
 
     let effects_list = build_effects_list(&idgd_catalog);
     let effects_body = Arc::new(serialize_effects_list(&effects_list)?);
@@ -893,11 +846,25 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
 
     eprintln!("index load complete");
 
+    let keyword_bitmaps = crate::index::uniques_index::build_unique_keyword_bitmaps(
+        &idgd_catalog,
+        &id_gd_whole,
+        &id_gd_per_line,
+    );
+
+    let idgd_by_id: HashMap<u32, usize> = idgd_catalog
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(idx, e)| (e.id_gd, idx))
+        .collect();
+
     Ok(UniquesIndex {
         index_dir,
         catalog,
         manifest,
         idgd_catalog,
+        idgd_by_id,
         id_gd_aliases,
         stats_summary,
         factions_summary,
@@ -920,13 +887,10 @@ pub fn load_uniques_index_from(storage: &impl IndexStorage) -> Result<UniquesInd
         collector_number_lookup_index,
         present_cards,
         effects_body,
+        effect_text_search_keys,
+        keyword_bitmaps,
         artist_credits: Default::default(),
     })
-}
-
-/// Eagerly load the full merged index directory into memory.
-pub fn load_uniques_index(index_dir: &Path) -> Result<UniquesIndex> {
-    load_uniques_index_from(&DiskIndexStorage::new(index_dir)?)
 }
 
 /// `Ok(empty)` when this storage root has no `families.json` — older build, or nothing built via
@@ -1034,29 +998,36 @@ pub fn load_bundle_from_storage(storage: &impl IndexStorage) -> Result<LoadedInd
     })
 }
 
+/// Load a full bundle from a local directory or `.tar.zst` archive, falling back to sibling
+/// files next to a `.tar.zst` archive for optional `nonunique/`, `families.json`, and
+/// `artist_credits.json`. Shared by startup (`load_app_state`) and hot-reload (`DiskIndexSource`).
+pub fn load_bundle_from_local_path(index_path: &Path) -> Result<LoadedIndexBundle> {
+    let storage = open_index_storage(index_path)?;
+    let mut bundle = load_bundle_from_storage(&storage)?;
+    if index_path.is_file() {
+        if let Some(parent_dir) = index_path.parent().filter(|p| p.is_dir()) {
+            if let Ok(disk_storage) = DiskIndexStorage::new(parent_dir) {
+                if bundle.nonunique.is_none() {
+                    bundle.nonunique = load_nonunique_index(&disk_storage)?;
+                }
+                if bundle.families.is_empty() {
+                    bundle.families = load_family_catalog(&disk_storage)?;
+                }
+                if bundle.artist_credits.is_none() {
+                    bundle.artist_credits = load_artist_credits_file(&disk_storage)?;
+                }
+            }
+        }
+    }
+    Ok(bundle)
+}
+
 /// Load index and format filters; wrap in [`AppState`].
 pub fn load_app_state(settings: &Settings) -> Result<AppState> {
     let bundle = match settings.index.source {
         crate::config::IndexSourceKind::Disk | crate::config::IndexSourceKind::Archive => {
             let index_path = settings.index_path()?;
-            let storage = open_index_storage(&index_path)?;
-            let mut bundle = load_bundle_from_storage(&storage)?;
-            if index_path.is_file() {
-                if let Some(parent_dir) = index_path.parent().filter(|p| p.is_dir()) {
-                    if let Ok(disk_storage) = DiskIndexStorage::new(parent_dir) {
-                        if bundle.nonunique.is_none() {
-                            bundle.nonunique = load_nonunique_index(&disk_storage)?;
-                        }
-                        if bundle.families.is_empty() {
-                            bundle.families = load_family_catalog(&disk_storage)?;
-                        }
-                        if bundle.artist_credits.is_none() {
-                            bundle.artist_credits = load_artist_credits_file(&disk_storage)?;
-                        }
-                    }
-                }
-            }
-            bundle
+            load_bundle_from_local_path(&index_path)?
         }
         crate::config::IndexSourceKind::ObjectStore => {
             bail!("load_app_state for object_store: use load_index_from_object_store in main")
@@ -1068,28 +1039,14 @@ pub fn load_app_state(settings: &Settings) -> Result<AppState> {
     build_app_state(bundle, settings)
 }
 
-pub fn build_app_state(mut bundle: LoadedIndexBundle, settings: &Settings) -> Result<AppState> {
-    bundle.bind_artist_credits(&settings.artists)?;
-    let LoadedIndexBundle {
-        index,
-        mut nonunique,
-        families,
-        ..
-    } = bundle;
-    if let Some(ref mut nu) = nonunique {
-        nu.bind_families(&families);
-    }
-    let formats = match settings.formats.as_ref().filter(|f| f.is_enabled()) {
-        Some(formats_settings) => Arc::new(load_format_index(&index, formats_settings)),
-        None => Arc::new(FormatIndex::empty()),
-    };
-    Ok(AppState::new(QuerySnapshot {
-        index: Arc::new(index),
-        families: Arc::new(families),
-        nonunique: nonunique.map(Arc::new),
-        formats,
-        collections: CollectionStore::new(&settings.collections),
-    }))
+pub fn build_app_state(bundle: LoadedIndexBundle, settings: &Settings) -> Result<AppState> {
+    let snapshot = QuerySnapshot::assemble(
+        bundle,
+        Some(&settings.artists),
+        settings.formats.as_ref(),
+        &settings.collections,
+    )?;
+    Ok(AppState::new(snapshot))
 }
 
 /// Load index only (empty format catalog) for tests.

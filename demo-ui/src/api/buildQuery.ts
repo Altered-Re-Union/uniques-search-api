@@ -248,6 +248,7 @@ export function buildFilteredEffectsQuery(
 ): URLSearchParams {
   const params = new URLSearchParams();
   appendFilterParams(params, state);
+  params.append('rarity[]', 'UNIQUE');
 
   const slot =
     target.region === 'echo'
