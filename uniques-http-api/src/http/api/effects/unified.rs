@@ -77,7 +77,28 @@ impl UnifiedEffectIndex {
 
         let effects_body = match nonunique.filter(|nu| !nu.idgd_catalog.is_empty()) {
             Some(nu) => {
-                let list = build_unified_effects_list(unique.idgd_catalog(), Some(&nu.idgd_catalog));
+                // Derive card_types per raw non-unique idGd directly from the loaded bitmaps so
+                // prebuilt indexes without persisted `card_types` still report exact card types.
+                let mut nu_card_types: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+                if !nu.card_type.is_empty() {
+                    for (&raw_id, id_bmp) in &nu.id_gd_whole {
+                        let types: Vec<String> = nu
+                            .card_type
+                            .iter()
+                            .filter_map(|(ct, ct_bmp)| {
+                                (!id_bmp.is_disjoint(ct_bmp)).then(|| ct.clone())
+                            })
+                            .collect();
+                        if !types.is_empty() {
+                            nu_card_types.insert(raw_id, types);
+                        }
+                    }
+                }
+                let list = build_unified_effects_list(
+                    unique.idgd_catalog(),
+                    Some(&nu.idgd_catalog),
+                    Some(&nu_card_types),
+                );
                 match serialize_effects_list(&list) {
                     Ok(bytes) => Arc::new(bytes),
                     Err(e) => {

@@ -240,6 +240,10 @@ pub struct NonUniqueIdGdEntry {
     /// True when every non-unique print referencing this fragment is a `SPELL`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spell_only: bool,
+    /// Distinct card type references (e.g. `CHARACTER`, `SPELL`, `LANDMARK_PERMANENT`) of
+    /// non-unique prints carrying this fragment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub card_types: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -249,6 +253,7 @@ struct IdGdMeta {
     main_lines: BTreeSet<u8>,
     has_ec: bool,
     has_non_spell: bool,
+    card_types: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -405,6 +410,11 @@ impl NonUniqueIndexBuilder {
                 }
                 if record.card_type.as_deref() != Some("SPELL") {
                     meta.has_non_spell = true;
+                }
+                if let Some(ct) = record.card_type.as_deref() {
+                    if !ct.is_empty() {
+                        meta.card_types.insert(ct.to_string());
+                    }
                 }
             }
         }
@@ -577,6 +587,7 @@ impl NonUniqueIndex {
                 main_lines: meta.main_lines.iter().copied().collect(),
                 has_ec: meta.has_ec,
                 spell_only: !meta.has_non_spell,
+                card_types: meta.card_types.iter().cloned().collect(),
             });
         }
         NonUniqueIdGdCatalog { entries }
