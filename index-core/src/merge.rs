@@ -593,8 +593,7 @@ fn merge_id_gd(
 }
 
 fn load_bitmap(path: &Path) -> Result<RoaringBitmap> {
-    let bytes = fs::read(path)?;
-    Ok(RoaringBitmap::deserialize_from(&bytes[..])?)
+    crate::roar_io::read_roar(path)
 }
 
 fn insert_remapped_bitmap(merged: &mut RoaringBitmap, bmp: &RoaringBitmap, mapping: &Mapping) {
@@ -615,29 +614,28 @@ fn insert_remapped_bitmap(merged: &mut RoaringBitmap, bmp: &RoaringBitmap, mappi
     }
 }
 
+fn merge_bitmap_files(plan: &MergePlan, sources: &[SourceIndex], rel_path: &Path) -> Result<RoaringBitmap> {
+    let mut merged = RoaringBitmap::new();
+    for src in sources {
+        let src_path = src.dir.join(rel_path);
+        if !src_path.exists() {
+            continue;
+        }
+        let bmp = load_bitmap(&src_path)?;
+        let mapping = plan.mapping.get(&src.set).expect("mapping exists");
+        insert_remapped_bitmap(&mut merged, &bmp, mapping);
+    }
+    Ok(merged)
+}
+
 fn merge_status(out: &Path, plan: &MergePlan, sources: &[SourceIndex]) -> Result<()> {
     let status_out = out.join("status");
     fs::create_dir_all(&status_out)?;
 
     for name in ["banned", "errated", "suspended"] {
-        let mut merged = RoaringBitmap::new();
-        for src in sources {
-            let src_path = src.dir.join("status").join(format!("{name}.roar"));
-            if !src_path.exists() {
-                continue;
-            }
-            let bmp = load_bitmap(&src_path).with_context(|| format!("load {}", src_path.display()))?;
-            let mapping = plan.mapping.get(&src.set).expect("mapping exists");
-            insert_remapped_bitmap(&mut merged, &bmp, mapping);
-        }
-
-        if merged.is_empty() {
-            continue;
-        }
-
-        let mut bytes = Vec::new();
-        merged.serialize_into(&mut bytes)?;
-        fs::write(status_out.join(format!("{name}.roar")), bytes)?;
+        let rel = Path::new("status").join(format!("{name}.roar"));
+        let merged = merge_bitmap_files(plan, sources, &rel)?;
+        crate::roar_io::write_roar_if_nonempty(&status_out.join(format!("{name}.roar")), &merged)?;
     }
 
     Ok(())
@@ -683,21 +681,10 @@ fn copy_artist_credits(out: &Path, sources: &[SourceIndex]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
-struct StatsSummaryOut {
-    version: u32,
-    set: String,
-    total_cards_indexed: u32,
-    fields: Vec<StatFieldSummaryOut>,
-}
-
-#[derive(Debug, Serialize)]
-struct StatFieldSummaryOut {
-    field: String,
-    element_reference: String,
-    counts: BTreeMap<u8, u64>,
-    bitmap_dir: String,
-}
+use crate::schema::{
+    FactionSummary as FactionSummaryOut, FactionsSummary as FactionsSummaryOut,
+    StatFieldSummary as StatFieldSummaryOut, StatsSummary as StatsSummaryOut,
+};
 
 fn merge_stats(out: &Path, plan: &MergePlan, sources: &[SourceIndex]) -> Result<()> {
     use crate::stat_index::StatField;
@@ -758,29 +745,6 @@ fn merge_stats(out: &Path, plan: &MergePlan, sources: &[SourceIndex]) -> Result<
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct FactionsSummaryIn {
-    unknown_count: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct FactionsSummaryOut {
-    version: u32,
-    set: String,
-    total_cards_indexed: u32,
-    source: String,
-    factions: Vec<FactionSummaryOut>,
-    unknown_count: u64,
-    bitmap_dir: String,
-}
-
-#[derive(Debug, Serialize)]
-struct FactionSummaryOut {
-    reference: String,
-    card_count: u64,
-    bitmap_file: String,
-}
-
 fn merge_factions(out: &Path, plan: &MergePlan, sources: &[SourceIndex]) -> Result<()> {
     use crate::faction_index::Faction;
     let out_dir = out.join("factions");
@@ -793,7 +757,7 @@ fn merge_factions(out: &Path, plan: &MergePlan, sources: &[SourceIndex]) -> Resu
         let sum_path = src.dir.join("factions_summary.json");
         if sum_path.exists() {
             let text = fs::read_to_string(&sum_path)?;
-            let sum: FactionsSummaryIn = serde_json::from_str(&text)?;
+            let sum: FactionsSummaryOut = serde_json::from_str(&text)?;
             unknown_count += sum.unknown_count;
         }
     }
@@ -801,36 +765,9 @@ fn merge_factions(out: &Path, plan: &MergePlan, sources: &[SourceIndex]) -> Resu
     let mut factions_out = Vec::with_capacity(Faction::ALL.len());
     for faction in Faction::ALL {
         let code = faction.reference();
-        let mut merged = RoaringBitmap::new();
-        for src in sources {
-            let src_path = src.dir.join("factions").join(format!("{code}.roar"));
-            if !src_path.exists() {
-                continue;
-            }
-            let bmp = load_bitmap(&src_path)?;
-            match plan.mapping.get(&src.set).expect("mapping exists") {
-                Mapping::Offset { base } => {
-                    for b in bmp.iter() {
-                        merged.insert(base + b);
-                    }
-                }
-                Mapping::RemapVec { map } => {
-                    for b in bmp.iter() {
-                        let dst = map[b as usize];
-                        if dst != u32::MAX {
-                            merged.insert(dst);
-                        }
-                    }
-                }
-            }
-        }
-
-        if !merged.is_empty() {
-            let out_path = out_dir.join(format!("{code}.roar"));
-            let mut bytes = Vec::new();
-            merged.serialize_into(&mut bytes)?;
-            fs::write(&out_path, bytes)?;
-        }
+        let rel = Path::new("factions").join(format!("{code}.roar"));
+        let merged = merge_bitmap_files(plan, sources, &rel)?;
+        crate::roar_io::write_roar_if_nonempty(&out_dir.join(format!("{code}.roar")), &merged)?;
 
         factions_out.push(FactionSummaryOut {
             reference: code.to_string(),

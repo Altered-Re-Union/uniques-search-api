@@ -1,7 +1,6 @@
 use crate::compact::CompactCardFields;
 use anyhow::{Context, Result};
 use roaring::RoaringBitmap;
-use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -140,20 +139,4 @@ impl FactionIndex {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct FactionsSummary {
-    pub version: u32,
-    pub set: String,
-    pub total_cards_indexed: u32,
-    pub source: String,
-    pub factions: Vec<FactionSummary>,
-    pub unknown_count: u64,
-    pub bitmap_dir: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct FactionSummary {
-    pub reference: String,
-    pub card_count: u64,
-    pub bitmap_file: String,
-}
+pub use crate::schema::{FactionSummary, FactionsSummary};

@@ -395,22 +395,11 @@ fn merge_loaded_results(results: Vec<LoadedEntryResult>) -> FormatIndex {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use axum::body::Bytes;
     use index_core::catalog::{Catalog, FamilyEntry, FamilySet};
-    use index_core::idgd_catalog::IdGdCatalog;
-    use index_core::idgd_collapse::IdGdAliasMap;
 
     use crate::config::{FormatsSettings, FormatsSourceConfig};
-    use crate::index::loader::{
-        build_collector_number_lookup_index, build_family_lookup_index, build_family_span_groups,
-        build_name_search_index, build_set_bitmaps, FactionsSummary, IndexManifest, StatsSummary,
-        SET_CORE,
-    };
+    use crate::index::loader::SET_CORE;
     use crate::index::UniquesIndex;
 
     use super::*;

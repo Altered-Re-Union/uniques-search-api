@@ -24,6 +24,8 @@ pub mod profile;
 pub mod progress;
 pub mod query;
 pub mod refs_bitmap;
+pub mod roar_io;
+pub mod schema;
 pub mod set_code;
 pub mod stat_index;
 pub mod status_index;

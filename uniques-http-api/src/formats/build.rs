@@ -80,20 +80,9 @@ pub fn load_single_format_from_text(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use axum::body::Bytes;
     use index_core::catalog::{Catalog, FamilyEntry, FamilySet};
-    use index_core::idgd_catalog::IdGdCatalog;
-    use index_core::idgd_collapse::IdGdAliasMap;
 
-    use crate::index::loader::{
-        build_collector_number_lookup_index, build_family_lookup_index, build_family_span_groups,
-        build_name_search_index, build_set_bitmaps, FactionsSummary, IndexManifest, StatsSummary,
-        SET_CORE, SET_COREKS,
-    };
+    use crate::index::loader::{SET_CORE, SET_COREKS};
     use crate::index::UniquesIndex;
 
     use super::*;

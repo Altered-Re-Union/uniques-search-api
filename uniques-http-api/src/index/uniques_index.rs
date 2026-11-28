@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,7 +8,7 @@ use index_core::bitmap::EffectLine;
 use index_core::catalog::Catalog;
 use index_core::compact::{CompactCardView, RECORD_SIZE};
 use index_core::faction_index::Faction;
-use index_core::idgd_catalog::IdGdCatalog;
+use index_core::idgd_catalog::{IdGdCatalog, IdGdCatalogEntry};
 use index_core::idgd_collapse::IdGdAliasMap;
 use index_core::path::parse_card_reference;
 use index_core::stat_index::StatField;
@@ -25,6 +25,8 @@ pub struct UniquesIndex {
     pub catalog: Catalog,
     pub manifest: IndexManifest,
     pub idgd_catalog: IdGdCatalog,
+    /// O(1) lookup from `id_gd` to entry index in `idgd_catalog.entries` (built once at load).
+    pub idgd_by_id: HashMap<u32, usize>,
     pub id_gd_aliases: IdGdAliasMap,
     pub stats_summary: StatsSummary,
     pub factions_summary: FactionsSummary,
@@ -93,6 +95,12 @@ impl UniquesIndex {
 
     pub fn idgd_catalog(&self) -> &IdGdCatalog {
         &self.idgd_catalog
+    }
+
+    pub fn idgd_entry(&self, id_gd: u32) -> Option<&IdGdCatalogEntry> {
+        self.idgd_by_id
+            .get(&id_gd)
+            .and_then(|&idx| self.idgd_catalog.entries.get(idx))
     }
 
     pub fn id_gd_aliases(&self) -> &IdGdAliasMap {
@@ -281,6 +289,7 @@ impl UniquesIndex {
                 set: catalog.set.clone(),
                 entries: vec![],
             },
+            idgd_by_id: HashMap::new(),
             id_gd_aliases: IdGdAliasMap::default(),
             catalog,
             cards: vec![],

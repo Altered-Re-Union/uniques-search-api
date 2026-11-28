@@ -14,8 +14,9 @@ use axum::extract::{DefaultBodyLimit, RawQuery, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use index_core::effect_text::canonical_keyword;
-use index_core::idgd_catalog::IdGdCatalogEntry;
+use index_core::faction_index::Faction;
 use index_core::nonunique::NonUniquePrintMeta;
+use index_core::set_code::references_for_display_code;
 use index_core::stat_index::StatField;
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -24,7 +25,7 @@ use crate::collections::CollectionStore;
 use crate::config::CardsSettings;
 use crate::formats::FormatIndex;
 use crate::http::api::cards::models::{
-    AbilityFilters, CardV2, CardsRequest, CardsSort, CompareOp, CostPredicate, CostRelation,
+    AbilityFilters, CardV2, CardsRequest, CardsSort, CostPredicate, CostRelation,
     EffectCombineMode, EffectSlotFilter, SortDir, SortField,
 };
 use crate::http::api::cards::parse::{
@@ -39,10 +40,7 @@ use crate::http::api::error::{bad_request, map_query_error, ApiResult};
 use crate::http::state::QuerySnapshot;
 use crate::http::ServerState;
 use crate::index::loader::{faction_sort_rank, normalize_name_for_search, set_release_rank};
-use crate::index::{
-    build_bitmap, card_v2_from_index, combine_effect_bitmaps, enrich_unique_card_v2,
-    nonunique_card_v2, NonUniqueQueryIndex, UniquesIndex,
-};
+use crate::index::{build_bitmap, combine_effect_bitmaps, NonUniqueQueryIndex, UniquesIndex};
 
 pub fn router(cards: &CardsSettings) -> Router<ServerState> {
     let route = Router::new()
@@ -173,18 +171,10 @@ impl SearchRequest {
     }
 
     fn to_cards_request(&self) -> Option<CardsRequest> {
-        let factions: Vec<index_core::faction_index::Faction> = self
+        let factions: Vec<Faction> = self
             .factions
             .iter()
-            .filter_map(|f| match f.as_str() {
-                "AX" => Some(index_core::faction_index::Faction::Ax),
-                "BR" => Some(index_core::faction_index::Faction::Br),
-                "LY" => Some(index_core::faction_index::Faction::Ly),
-                "MU" => Some(index_core::faction_index::Faction::Mu),
-                "OR" => Some(index_core::faction_index::Faction::Or),
-                "YZ" => Some(index_core::faction_index::Faction::Yz),
-                _ => None,
-            })
+            .filter_map(|f| Faction::ALL.into_iter().find(|fac| fac.reference() == f.as_str()))
             .collect();
         if !self.factions.is_empty() && factions.is_empty() {
             return None;
@@ -192,21 +182,13 @@ impl SearchRequest {
         let sets: Vec<String> = self
             .sets
             .iter()
-            .flat_map(|s| match s.to_ascii_uppercase().as_str() {
-                "BTG" => vec!["CORE".to_string(), "COREKS".to_string()],
-                "TBF" => vec!["ALIZE".to_string()],
-                "WFM" => vec!["BISE".to_string()],
-                "SKY" => vec!["CYCLONE".to_string()],
-                "SDU" => vec!["DUSTER".to_string()],
-                "SDUCB" => vec!["DUSTERCB".to_string()],
-                "SDUOP" => vec!["DUSTEROP".to_string()],
-                "SDUTOP" => vec!["DUSTERTOP".to_string()],
-                "ROC" => vec!["EOLE".to_string()],
-                "ROCCB" => vec!["EOLECB".to_string()],
-                "ROCOP" => vec!["EOLEOP".to_string()],
-                "ROCTOP" => vec!["EOLETOP".to_string()],
-                "NEJ" => vec!["FUGUE".to_string()],
-                other => vec![other.to_string()],
+            .flat_map(|s| {
+                let refs = references_for_display_code(s);
+                if refs.is_empty() {
+                    vec![s.to_ascii_uppercase()]
+                } else {
+                    refs.into_iter().map(str::to_string).collect()
+                }
             })
             .collect();
         Some(CardsRequest {
@@ -327,46 +309,18 @@ fn respond_search(server: &ServerState, params: &QueryMultiMap) -> ApiResult<Jso
         req.limit,
     );
 
-    let need_unique_idgd = picked.iter().any(|item| matches!(item, PickedCard::Unique(_)));
-    let idgd_by_id: BTreeMap<u32, &IdGdCatalogEntry> = if need_unique_idgd {
-        unique
-            .idgd_catalog()
-            .entries
-            .iter()
-            .map(|e| (e.id_gd, e))
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
-
     let mut cards = Vec::with_capacity(picked.len());
     for item in picked {
         match item {
             PickedCard::NonUnique(print_index) => {
-                if let Some(nu) = nonunique {
-                    if let Some(card) = nonunique_card_v2(
-                        nu,
-                        print_index,
-                        &snapshot.families,
-                        &snapshot.subtype_names,
-                        snapshot.formats.as_ref(),
-                        snapshot.index.id_gd_aliases(),
-                    ) {
-                        cards.push(SearchCard::NonUnique { card });
-                    }
+                if let Some(card) = snapshot.hydrate_nonunique(print_index) {
+                    cards.push(SearchCard::NonUnique { card });
                 }
             }
             PickedCard::Unique(card_index) => {
-                let mut card =
-                    card_v2_from_index(unique, card_index, &idgd_by_id, req.debug_bga_trigram)
-                        .map_err(map_query_error)?;
-                enrich_unique_card_v2(
-                    &mut card,
-                    card_index,
-                    unique,
-                    nonunique,
-                    &snapshot.formats,
-                );
+                let card = snapshot
+                    .hydrate_unique(card_index, true, req.debug_bga_trigram)
+                    .map_err(map_query_error)?;
                 cards.push(SearchCard::Unique { card });
             }
         }
@@ -1680,12 +1634,7 @@ fn build_nonunique_bitmap(
     ] {
         if let Some(predicate) = predicate {
             let buckets = nu.stats.get(field);
-            let bitmap = apply_cost_predicate(predicate, |value| {
-                buckets
-                    .and_then(|b| b.get(&value))
-                    .cloned()
-                    .unwrap_or_default()
-            });
+            let bitmap = predicate.evaluate(|value| buckets.and_then(|b| b.get(&value)).cloned());
             intersect(&mut acc, bitmap);
         }
     }
@@ -1786,37 +1735,6 @@ fn bool_bitmap(value: bool, flag_bitmap: &RoaringBitmap, total: u32) -> RoaringB
         let mut all = RoaringBitmap::new();
         all.insert_range(0..total);
         all - flag_bitmap
-    }
-}
-
-fn apply_cost_predicate(
-    predicate: &CostPredicate,
-    get_bucket: impl Fn(u8) -> RoaringBitmap,
-) -> RoaringBitmap {
-    match predicate {
-        CostPredicate::Exact(value) => get_bucket(*value),
-        CostPredicate::AnyOf(values) => {
-            let mut acc = RoaringBitmap::new();
-            for value in values {
-                acc |= get_bucket(*value);
-            }
-            acc
-        }
-        CostPredicate::RangeBounds(bounds) => {
-            let mut acc = RoaringBitmap::new();
-            for candidate in 0u8..16 {
-                let matches = bounds.iter().all(|(op, value)| match op {
-                    CompareOp::Gt => candidate > *value,
-                    CompareOp::Gte => candidate >= *value,
-                    CompareOp::Lt => candidate < *value,
-                    CompareOp::Lte => candidate <= *value,
-                });
-                if matches {
-                    acc |= get_bucket(candidate);
-                }
-            }
-            acc
-        }
     }
 }
 

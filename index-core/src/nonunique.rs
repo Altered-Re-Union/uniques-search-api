@@ -934,52 +934,88 @@ fn extract_bracket_keywords(raw: &str, out: &mut BTreeSet<String>) {
     crate::effect_text::extract_canonical_keywords(raw, out);
 }
 
+/// Shared CardsData CSV referentials loaded ONCE per non-unique index build (eliminates
+/// N+2 redundant reads of `CardFamilies`, `CardFamilySubTypes`, `Artists`, `Sets`, `Keywords`,
+/// `EffectFragments`, and `CardTypes` when indexing 20+ sets).
+struct NonUniqueReferentials {
+    card_types: BTreeMap<i64, String>,
+    subtypes_by_family: BTreeMap<i64, Vec<String>>,
+    artists: BTreeMap<i64, String>,
+    sets: BTreeMap<String, String>,
+    keywords_map: BTreeMap<String, BTreeMap<String, String>>,
+    effect_texts: BTreeMap<i64, EffectFragmentTextRow>,
+    card_types_i18n: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl NonUniqueReferentials {
+    fn load(cardsdata_root: &Path) -> Result<Self> {
+        let csv_root = cardsdata_root.join("data").join("csv");
+
+        let card_types: BTreeMap<i64, String> =
+            read_all::<CardFamilyTypeRow>(&csv_root.join("CardFamilies.csv"))?
+                .into_iter()
+                .map(|r| (r.id, r.card_type_reference))
+                .collect();
+
+        let mut subtypes_by_family: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+        for row in read_all::<CardFamilySubTypeRow>(&csv_root.join("CardFamilySubTypes.csv"))? {
+            let norm = row.card_sub_type_reference.trim().to_ascii_uppercase();
+            if !norm.is_empty() {
+                let list = subtypes_by_family.entry(row.card_family_id).or_default();
+                if !list.contains(&norm) {
+                    list.push(norm);
+                }
+            }
+        }
+
+        let artists: BTreeMap<i64, String> =
+            read_optional_all::<ArtistCsvRow>(&csv_root.join("Artists.csv"))?
+                .into_iter()
+                .map(|r| (r.id, r.nick_name))
+                .collect();
+
+        let sets: BTreeMap<String, String> =
+            read_optional_all::<SetCsvRow>(&csv_root.join("Sets.csv"))?
+                .into_iter()
+                .map(|r| (r.reference, r.name_en_us))
+                .collect();
+
+        let keywords_map = load_keywords_localized(&csv_root)?;
+        let effect_texts: BTreeMap<i64, EffectFragmentTextRow> =
+            read_all::<EffectFragmentTextRow>(&csv_root.join("EffectFragments.csv"))?
+                .into_iter()
+                .map(|r| (r.id_gd, r))
+                .collect();
+        let card_types_i18n = load_card_types_localized(&csv_root)?;
+
+        Ok(Self {
+            card_types,
+            subtypes_by_family,
+            artists,
+            sets,
+            keywords_map,
+            effect_texts,
+            card_types_i18n,
+        })
+    }
+}
+
 /// Reads `<cardsdata_root>/data/csv/NonUnique/<set>/NonUniquePrints.csv` plus shared referentials.
 /// Skips placeholder `FOILER` rows and sorts by `(card_family_id, reference)`.
 pub fn load_nonunique_prints(
     cardsdata_root: &Path,
     set: &str,
 ) -> Result<Vec<NonUniquePrintRecord>> {
+    let refs = NonUniqueReferentials::load(cardsdata_root)?;
+    load_nonunique_prints_with_refs(cardsdata_root, set, &refs)
+}
+
+fn load_nonunique_prints_with_refs(
+    cardsdata_root: &Path,
+    set: &str,
+    refs: &NonUniqueReferentials,
+) -> Result<Vec<NonUniquePrintRecord>> {
     let csv_root = cardsdata_root.join("data").join("csv");
-
-    let card_types: BTreeMap<i64, String> = read_all::<CardFamilyTypeRow>(
-        &csv_root.join("CardFamilies.csv"),
-    )?
-    .into_iter()
-    .map(|r| (r.id, r.card_type_reference))
-    .collect();
-
-    let mut subtypes_by_family: BTreeMap<i64, Vec<String>> = BTreeMap::new();
-    for row in read_all::<CardFamilySubTypeRow>(&csv_root.join("CardFamilySubTypes.csv"))? {
-        let norm = row.card_sub_type_reference.trim().to_ascii_uppercase();
-        if !norm.is_empty() {
-            let list = subtypes_by_family.entry(row.card_family_id).or_default();
-            if !list.contains(&norm) {
-                list.push(norm);
-            }
-        }
-    }
-
-    let artists: BTreeMap<i64, String> =
-        read_optional_all::<ArtistCsvRow>(&csv_root.join("Artists.csv"))?
-            .into_iter()
-            .map(|r| (r.id, r.nick_name))
-            .collect();
-
-    let sets: BTreeMap<String, String> =
-        read_optional_all::<SetCsvRow>(&csv_root.join("Sets.csv"))?
-            .into_iter()
-            .map(|r| (r.reference, r.name_en_us))
-            .collect();
-
-    let keywords_map = load_keywords_localized(&csv_root)?;
-
-    let effect_texts: BTreeMap<i64, EffectFragmentTextRow> =
-        read_all::<EffectFragmentTextRow>(&csv_root.join("EffectFragments.csv"))?
-            .into_iter()
-            .map(|r| (r.id_gd, r))
-            .collect();
-
     let set_dir = csv_root.join("NonUnique").join(set);
     let mut effect_rows_by_print: BTreeMap<i64, Vec<PrintEffectFragmentRow>> = BTreeMap::new();
     for row in read_all::<PrintEffectFragmentRow>(&set_dir.join("PrintEffectFragments.csv"))? {
@@ -1001,7 +1037,7 @@ pub fn load_nonunique_prints(
         .map(|row| {
             let effects = effect_rows_by_print
                 .get(&row.id)
-                .map(|r| build_print_effects(r, &effect_texts, &keywords_map))
+                .map(|r| build_print_effects(r, &refs.effect_texts, &refs.keywords_map))
                 .unwrap_or_default();
             let main_cost = parse_optional_u8(&row.main_cost);
             let recall_cost = parse_optional_u8(&row.recall_cost);
@@ -1012,9 +1048,10 @@ pub fn load_nonunique_prints(
             let reserve = parse_optional_u8(&row.reserve);
             let artist = row
                 .artist_id
-                .and_then(|id| artists.get(&id).cloned())
+                .and_then(|id| refs.artists.get(&id).cloned())
                 .unwrap_or_default();
-            let set_name = sets
+            let set_name = refs
+                .sets
                 .get(&row.set_reference)
                 .cloned()
                 .unwrap_or_else(|| row.set_reference.clone());
@@ -1029,8 +1066,9 @@ pub fn load_nonunique_prints(
             };
 
             NonUniquePrintRecord {
-                card_type: card_types.get(&row.card_family_id).cloned(),
-                subtypes: subtypes_by_family
+                card_type: refs.card_types.get(&row.card_family_id).cloned(),
+                subtypes: refs
+                    .subtypes_by_family
                     .get(&row.card_family_id)
                     .cloned()
                     .unwrap_or_default(),
@@ -1301,9 +1339,10 @@ pub fn build_nonunique_index(
         anyhow::bail!("build_nonunique_index requires at least one set");
     }
 
+    let refs = NonUniqueReferentials::load(cardsdata_root)?;
     let mut records = Vec::new();
     for set in sets {
-        records.extend(load_nonunique_prints(cardsdata_root, set)?);
+        records.extend(load_nonunique_prints_with_refs(cardsdata_root, set, &refs)?);
     }
     records.sort_by(|a, b| (a.card_family_id, &a.reference).cmp(&(b.card_family_id, &b.reference)));
 
@@ -1345,12 +1384,7 @@ pub fn build_nonunique_index(
     let built_index = index_builder.into_index();
     built_index.write_dir(&set_out)?;
 
-    let effect_fragments: BTreeMap<i64, EffectFragmentTextRow> =
-        read_all::<EffectFragmentTextRow>(&cardsdata_root.join("data").join("csv").join("EffectFragments.csv"))?
-            .into_iter()
-            .map(|r| (r.id_gd, r))
-            .collect();
-    let idgd_catalog = built_index.build_idgd_catalog(&effect_fragments);
+    let idgd_catalog = built_index.build_idgd_catalog(&refs.effect_texts);
     if !idgd_catalog.entries.is_empty() {
         let idgd_json = serde_json::to_string(&idgd_catalog)?;
         fs::write(nonunique_out.join("idgd_catalog.json"), idgd_json).with_context(|| {
@@ -1369,14 +1403,12 @@ pub fn build_nonunique_index(
     fs::write(nonunique_out.join("prints.json"), prints_json)
         .with_context(|| format!("write {}", nonunique_out.join("prints.json").display()))?;
 
-    let card_types_map = load_card_types_localized(&cardsdata_root.join("data").join("csv"))?;
-    let card_types_json = serde_json::to_string(&card_types_map)?;
+    let card_types_json = serde_json::to_string(&refs.card_types_i18n)?;
     fs::write(nonunique_out.join("card_types.json"), card_types_json)
         .with_context(|| format!("write {}", nonunique_out.join("card_types.json").display()))?;
 
-    let keywords_map = load_keywords_localized(&cardsdata_root.join("data").join("csv"))?;
-    if !keywords_map.is_empty() {
-        let keywords_json = serde_json::to_string(&keywords_map)?;
+    if !refs.keywords_map.is_empty() {
+        let keywords_json = serde_json::to_string(&refs.keywords_map)?;
         fs::write(nonunique_out.join("keywords.json"), keywords_json)
             .with_context(|| format!("write {}", nonunique_out.join("keywords.json").display()))?;
     }

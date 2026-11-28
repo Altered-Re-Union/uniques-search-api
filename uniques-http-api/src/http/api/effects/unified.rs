@@ -106,7 +106,11 @@ impl UnifiedEffectIndex {
 
     /// Validate that every `idGd` in `filters` exists in the merged catalog and matches its slot
     /// (`TRIGGER` / `CONDITION` / `OUTPUT`).
-    pub fn validate_filters(&self, aliases: &IdGdAliasMap, filters: &AbilityFilters) -> ApiResult<()> {
+    pub(crate) fn validate_filters(
+        &self,
+        aliases: &IdGdAliasMap,
+        filters: &AbilityFilters,
+    ) -> ApiResult<()> {
         for slot in &filters.effects {
             for (key_suffix, selector, ids) in [
                 ("[t]", IdGdSelector::T, &slot.t),
@@ -217,7 +221,7 @@ impl UnifiedEffectIndex {
     /// Compute canonical `idGd`s of `part` reachable in `region` given the already-filtered base
     /// bitmaps and the edited slot's other two co-constraint buckets (`co1`, `co2`).
     #[allow(clippy::too_many_arguments)]
-    pub fn reachable_id_gds(
+    pub(crate) fn reachable_id_gds(
         &self,
         unique: &UniquesIndex,
         unique_base: &RoaringBitmap,

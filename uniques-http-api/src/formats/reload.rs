@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{FormatsSettings, Settings};
-use crate::formats::loader::{load_format_index, read_manifest_versions, FormatIndex};
+use crate::config::Settings;
+use crate::formats::loader::{load_format_index, read_manifest_versions};
 use crate::formats::source::FormatsSource;
 use crate::http::state::AppState;
 use tokio::time::MissedTickBehavior;
@@ -61,15 +61,4 @@ async fn formats_reload_tick(state: &Arc<AppState>, settings: &Settings) -> anyh
         eprintln!("formats hot-reload skipped: index reloaded concurrently");
     }
     Ok(())
-}
-
-pub fn rebuild_formats_for_index(
-    index: Arc<crate::index::UniquesIndex>,
-    nonunique: Option<&crate::index::NonUniqueQueryIndex>,
-    formats_settings: Option<&FormatsSettings>,
-) -> Arc<FormatIndex> {
-    match formats_settings.filter(|f| f.is_enabled()) {
-        Some(settings) => Arc::new(load_format_index(index.as_ref(), nonunique, settings)),
-        None => Arc::new(FormatIndex::empty()),
-    }
 }
